@@ -500,9 +500,12 @@ impl Workspace {
                 }
             }
             SidebarEvent::TabMenu(id, position) => tabs::tab_menu(self, *id, *position, cx),
-            SidebarEvent::MoveTab(id, target) => {
-                if let Some(to) = self.tabs.iter().position(|tab| tab.id == *target) {
-                    self.move_tab(*id, to, cx);
+            SidebarEvent::MoveTab(id, target, after) => {
+                let at = |wanted: u64| self.tabs.iter().position(|tab| tab.id == wanted);
+                if let (Some(from), Some(target)) = (at(*id), at(*target)) {
+                    let place = target + usize::from(*after);
+                    // Once the tab is out, what follows it is one place back.
+                    self.move_tab(*id, if from < place { place - 1 } else { place }, cx);
                 }
             }
         }

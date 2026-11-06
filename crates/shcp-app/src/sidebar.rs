@@ -16,9 +16,9 @@ use crate::widgets::status::badge;
 use crate::widgets::tooltip::tooltip;
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, ClickEvent, ClipboardItem, Context, Div, Entity, EventEmitter, FocusHandle,
-    Focusable, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, SharedString,
-    Stateful, Subscription, Window, WindowControlArea, div, px,
+    AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, Div, DragMoveEvent, Entity,
+    EventEmitter, FocusHandle, Focusable, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Pixels,
+    Point, SharedString, Stateful, Subscription, Window, WindowControlArea, div, px,
 };
 use shcp_core::{HostConfig, HostId, HostSource, SessionState};
 use std::rc::Rc;
@@ -46,7 +46,8 @@ pub enum SidebarEvent {
     CloseTab(u64),
     TabMenu(u64, Point<Pixels>),
     /// Puts a tab where another one is.
-    MoveTab(u64, u64),
+    /// A tab goes right before another one of its host, or right after it with `true`.
+    MoveTab(u64, u64, bool),
 }
 
 /// What the sidebar needs to know of an open tab. The workspace owns the tabs.
@@ -113,15 +114,72 @@ fn section_label(text: &'static str, theme: &crate::theme::Theme) -> Div {
 struct HostDrag {
     id: HostId,
     alias: String,
-    /// Where it is in the list, to tell where the line goes on the row under the pointer.
-    position: usize,
 }
 
 /// A group on its way to another place.
 #[derive(Clone)]
 struct GroupDrag {
     name: String,
-    position: usize,
+}
+
+/// The row a drag would land next to.
+#[derive(Clone, PartialEq)]
+enum DropRow {
+    Host(HostId),
+    Tab(u64),
+    Group(String),
+}
+
+/// What can be dragged along the list: each comes from a row of its own.
+trait Dragged: 'static {
+    fn row(&self) -> DropRow;
+}
+
+impl Dragged for HostDrag {
+    fn row(&self) -> DropRow {
+        DropRow::Host(self.id.clone())
+    }
+}
+
+impl Dragged for TabDrag {
+    fn row(&self) -> DropRow {
+        DropRow::Tab(self.id)
+    }
+}
+
+impl Dragged for GroupDrag {
+    fn row(&self) -> DropRow {
+        DropRow::Group(self.name.clone())
+    }
+}
+
+/// Where a drag would land if let go now.
+#[derive(Clone, PartialEq)]
+struct DropLine {
+    row: DropRow,
+    after: bool,
+    /// The row under the pointer: the line stays while the pointer does.
+    over: Bounds<Pixels>,
+}
+
+/// The space between the rows of the list, where the line goes.
+const ROW_GAP: Pixels = px(2.);
+
+/// A straight line in the gap above or below a row.
+fn insertion_line(after: bool, color: Hsla) -> Div {
+    div()
+        .absolute()
+        .left_0()
+        .right_0()
+        .h(ROW_GAP)
+        .map(|this| {
+            if after {
+                this.bottom(-ROW_GAP)
+            } else {
+                this.top(-ROW_GAP)
+            }
+        })
+        .bg(color)
 }
 
 impl Render for GroupDrag {
@@ -175,6 +233,7 @@ pub struct Sidebar {
     /// What the mouse last opened: its rows come in instead of being there at once.
     opening_host: Option<HostId>,
     opening_group: Option<String>,
+    drop_line: Option<DropLine>,
     focus: FocusHandle,
     menu: Option<OpenMenu>,
     _subscription: Subscription,
@@ -205,6 +264,7 @@ impl Sidebar {
             opened_by_click: None,
             opening_host: None,
             opening_group: None,
+            drop_line: None,
             state,
             focus: cx.focus_handle(),
             menu: None,
@@ -277,26 +337,147 @@ impl Sidebar {
         cx.notify();
     }
 
-    /// Makes an element take a dragged host into a group, or out of any with `None`.
-    fn drop_target(
+    /// Whether a row let go on this side of `target` would stay exactly where it is on screen: right
+    /// next to itself, or on itself. A move between sections always changes something.
+    fn lands_where_it_is(
         &self,
+        dragged: &DropRow,
+        target: &DropRow,
+        after: bool,
+        cx: &App,
+    ) -> bool {
+        let siblings: Vec<DropRow> = match target {
+            DropRow::Host(id) => self
+                .sections(cx)
+                .into_iter()
+                .map(|(_, hosts)| hosts)
+                .find(|hosts| hosts.iter().any(|host| host.id == *id))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|host| DropRow::Host(host.id))
+                .collect(),
+            DropRow::Tab(id) => {
+                let host = self
+                    .open
+                    .iter()
+                    .find(|tab| tab.id == *id)
+                    .map(|tab| &tab.host);
+                self.open
+                    .iter()
+                    .filter(|tab| Some(&tab.host) == host)
+                    .map(|tab| DropRow::Tab(tab.id))
+                    .collect()
+            }
+            DropRow::Group(_) => self
+                .sections(cx)
+                .into_iter()
+                .filter_map(|(group, _)| group.map(DropRow::Group))
+                .collect(),
+        };
+        let at = |row: &DropRow| siblings.iter().position(|sibling| sibling == row);
+        let (Some(from), Some(to)) = (at(dragged), at(target)) else {
+            return false;
+        };
+        let place = to + usize::from(after);
+        place == from || place == from + 1
+    }
+
+    /// Moves the line to this row while a drag of `T` is over it. `side` gets what is dragged and
+    /// whether the pointer is on the lower half, and says where it would land, if anywhere.
+    fn track_row<T: Dragged>(
         element: Stateful<Div>,
-        group: Option<String>,
+        side: impl Fn(&T, bool) -> Option<(DropRow, bool)> + 'static,
         cx: &Context<Self>,
     ) -> Stateful<Div> {
-        let highlight = Hsla {
-            a: 0.35,
-            ..cx.theme().accent
-        };
-        element
-            .drag_over::<HostDrag>(move |style, _, _, _| style.bg(highlight))
-            .on_drop(cx.listener(move |this, drag: &HostDrag, _, cx| {
-                this.state.update(cx, |state, cx| {
-                    state.set_host_group(&drag.id, group.clone(), cx)
+        element.on_drag_move(cx.listener(move |this, event: &DragMoveEvent<T>, _, cx| {
+            let pointer = event.event.position;
+            // Half the gap each: no spot between two rows is without a line.
+            if !event.bounds.dilate(ROW_GAP / 2.).contains(&pointer) {
+                return;
+            }
+            let lower = pointer.y > event.bounds.center().y;
+            let dragged = event.drag(cx);
+            let line = side(dragged, lower)
+                .filter(|(row, after)| !this.lands_where_it_is(&dragged.row(), row, *after, cx))
+                .map(|(row, after)| {
+                    let (row, after) = this.one_spot_between_groups(row, after, cx);
+                    DropLine {
+                        row,
+                        after,
+                        over: event.bounds,
+                    }
                 });
-                this.keep_selection_listed(cx);
+            if this.drop_line != line {
+                this.drop_line = line;
                 cx.notify();
-            }))
+            }
+        }))
+    }
+
+    /// Past a group and before the next one are the same place: it gets one line, above the next.
+    fn one_spot_between_groups(&self, row: DropRow, after: bool, cx: &App) -> (DropRow, bool) {
+        let next = match &row {
+            DropRow::Group(name) if after => {
+                let sections = self.sections(cx);
+                let mut groups = sections.iter().filter_map(|(group, _)| group.as_ref());
+                groups.find(|group| *group == name);
+                groups.next().cloned()
+            }
+            _ => None,
+        };
+        match next {
+            Some(next) => (DropRow::Group(next), false),
+            None => (row, after),
+        }
+    }
+
+    /// The line goes once the pointer is off its row, and not onto another one.
+    fn leave_row<T: 'static>(
+        &mut self,
+        event: &DragMoveEvent<T>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pointer = event.event.position;
+        let left = self
+            .drop_line
+            .as_ref()
+            .is_some_and(|line| !line.over.dilate(ROW_GAP / 2.).contains(&pointer));
+        if left {
+            self.drop_line = None;
+            cx.notify();
+        }
+    }
+
+    /// A group dragged over a row of another one lands past that one, whichever row it is.
+    fn track_past_group(
+        &self,
+        element: Stateful<Div>,
+        host: &HostId,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let state = self.state.read(cx);
+        let group = state
+            .host(host)
+            .and_then(|_| state.host_group(host))
+            .map(str::to_string);
+        Self::track_row(
+            element,
+            move |_: &GroupDrag, _| group.clone().map(|group| (DropRow::Group(group), true)),
+            cx,
+        )
+    }
+
+    /// Whether the line past the group of this host is up, for the last row of that group.
+    fn line_past_group(&self, host: &HostId, cx: &App) -> Option<bool> {
+        let group = self.state.read(cx).host_group(host)?.to_string();
+        self.line_on(&DropRow::Group(group)).filter(|after| *after)
+    }
+
+    /// Whether the line is on this row and, if so, on which side.
+    fn line_on(&self, row: &DropRow) -> Option<bool> {
+        let line = self.drop_line.as_ref()?;
+        (line.row == *row).then_some(line.after)
     }
 
     /// The selection cannot stay on a row that is gone.
@@ -307,35 +488,11 @@ impl Sidebar {
         }
     }
 
-    /// Where a dragged host goes to leave its group. There only during the drag.
-    fn render_ungrouped_header(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        self.drop_target(div().id("group-ungrouped").rounded(px(6.)), None, cx)
-            .flex()
-            .flex_none()
-            .items_center()
-            .h(px(26.))
-            .mt(px(10.))
-            .px(px(6.))
-            .text_size(crate::theme::ui_px(13.))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(theme.text_disabled)
-            .child("Ungrouped")
-            .into_any_element()
-    }
-
-    fn render_group_header(
-        &self,
-        group: &str,
-        position: usize,
-        count: usize,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_group_header(&self, group: &str, count: usize, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let accent = theme.accent;
         let dragged = GroupDrag {
             name: group.to_string(),
-            position,
         };
         let target = group.to_string();
         let collapsed = self
@@ -344,81 +501,79 @@ impl Sidebar {
             .settings
             .collapsed_groups
             .contains(group);
+        // Past an open group is under its last row.
+        let line = self
+            .line_on(&DropRow::Group(target.clone()))
+            .filter(|after| !after || collapsed);
         let name = group.to_string();
         let menu_group = group.to_string();
         let brighter = theme.text_muted;
-        self.drop_target(
-            div().id(SharedString::from(format!("group-{group}"))),
-            Some(group.to_string()),
-            cx,
-        )
-        .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
-        .drag_over::<GroupDrag>(move |style, dragged, _, _| {
-            // The line shows where it lands: past this group, coming from the other side.
-            if dragged.position < position {
-                style.border_b_2().border_color(accent)
-            } else if dragged.position > position {
-                style.border_t_2().border_color(accent)
-            } else {
-                style
-            }
-        })
-        .on_drop(cx.listener(move |this, dragged: &GroupDrag, _, cx| {
-            this.state.update(cx, |state, cx| {
-                state.place_group(&dragged.name, &target, cx)
-            });
-        }))
-        .flex()
-        .flex_none()
-        .items_center()
-        .gap(px(5.))
-        .h(px(26.))
-        .mt(px(10.))
-        .px(px(6.))
-        .rounded(px(6.))
-        .cursor_pointer()
-        .text_size(crate::theme::ui_px(13.))
-        .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(theme.text_disabled)
-        .hover(move |style| style.text_color(brighter))
-        .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(&name, cx)))
-        .on_mouse_down(
-            MouseButton::Right,
-            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                cx.stop_propagation();
-                let renamed = menu_group.clone();
-                let view = cx.entity().downgrade();
-                let entries = vec![
-                    MenuEntry::item(
-                        "Rename group",
-                        handler(view, move |_, _, cx| {
-                            cx.emit(SidebarEvent::RenameGroup(renamed.clone()))
-                        }),
-                    )
-                    .icon(IconName::Pencil),
-                ];
-                this.menu = Some(OpenMenu::at(event.position, entries));
-                cx.notify();
-            }),
-        )
-        .child(
-            Icon::new(if collapsed {
-                IconName::ChevronRight
-            } else {
-                IconName::ChevronDown
+        div()
+            .id(SharedString::from(format!("group-{group}")))
+            .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+            .map(|this| {
+                Self::track_row(
+                    this,
+                    // An open group goes on past its title: the rows under it take that side.
+                    move |_: &GroupDrag, lower| {
+                        Some((DropRow::Group(target.clone()), lower && collapsed))
+                    },
+                    cx,
+                )
             })
-            .size(px(12.)),
-        )
-        .child(div().flex_1().min_w_0().truncate().child(group.to_string()))
-        .child(
-            div()
-                .flex_none()
-                .font_family(crate::theme::mono_font())
-                .font_weight(gpui::FontWeight::NORMAL)
-                .text_size(crate::theme::ui_px(12.))
-                .child(count.to_string()),
-        )
-        .into_any_element()
+            .relative()
+            .children(line.map(|after| insertion_line(after, accent)))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(5.))
+            .h(px(26.))
+            .mt(px(10.))
+            .px(px(6.))
+            .rounded(px(6.))
+            .cursor_pointer()
+            .text_size(crate::theme::ui_px(13.))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(theme.text_disabled)
+            .hover(move |style| style.text_color(brighter))
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(&name, cx)))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    let renamed = menu_group.clone();
+                    let view = cx.entity().downgrade();
+                    let entries = vec![
+                        MenuEntry::item(
+                            "Rename group",
+                            handler(view, move |_, _, cx| {
+                                cx.emit(SidebarEvent::RenameGroup(renamed.clone()))
+                            }),
+                        )
+                        .icon(IconName::Pencil),
+                    ];
+                    this.menu = Some(OpenMenu::at(event.position, entries));
+                    cx.notify();
+                }),
+            )
+            .child(
+                Icon::new(if collapsed {
+                    IconName::ChevronRight
+                } else {
+                    IconName::ChevronDown
+                })
+                .size(px(12.)),
+            )
+            .child(div().flex_1().min_w_0().truncate().child(group.to_string()))
+            .child(
+                div()
+                    .flex_none()
+                    .font_family(crate::theme::mono_font())
+                    .font_weight(gpui::FontWeight::NORMAL)
+                    .text_size(crate::theme::ui_px(12.))
+                    .child(count.to_string()),
+            )
+            .into_any_element()
     }
 
     fn toggle_hidden(&mut self, host: &HostId, cx: &mut Context<Self>) {
@@ -527,15 +682,15 @@ impl Sidebar {
         );
         entries.push(MenuEntry::Separator);
         let current = state.host_group(&host.id).map(str::to_string);
+        let mut places = Vec::new();
         for group in state.groups() {
             if Some(&group) == current.as_ref() {
                 continue;
             }
             let target = host.id.clone();
-            let label = format!("Move to {group}");
-            entries.push(
+            places.push(
                 MenuEntry::item(
-                    label,
+                    group.clone(),
                     handler(this.clone(), move |view, _, cx| {
                         view.state.update(cx, |state, cx| {
                             state.set_host_group(&target, Some(group.clone()), cx)
@@ -545,27 +700,28 @@ impl Sidebar {
                 .icon(IconName::Folder),
             );
         }
-        entries.push(
-            MenuEntry::item("New group", emit(SidebarEvent::NewGroup, id.clone()))
-                .icon(IconName::FolderPlus),
-        );
         if current.is_some() {
             let target = host.id.clone();
-            entries.push(
+            places.push(
                 MenuEntry::item(
-                    "Move to Ungrouped",
+                    "Ungrouped",
                     handler(this.clone(), move |view, _, cx| {
                         view.state
                             .update(cx, |state, cx| state.set_host_group(&target, None, cx));
-                        let listed = view.listed_hosts(cx);
-                        if !listed.iter().any(|h| Some(&h.id) == view.selected.as_ref()) {
-                            view.selected = listed.first().map(|h| h.id.clone());
-                        }
+                        view.keep_selection_listed(cx);
                     }),
                 )
-                .icon(IconName::Close),
+                .icon(IconName::FolderUp),
             );
         }
+        if !places.is_empty() {
+            places.push(MenuEntry::Separator);
+        }
+        places.push(
+            MenuEntry::item("New group", emit(SidebarEvent::NewGroup, id.clone()))
+                .icon(IconName::FolderPlus),
+        );
+        entries.push(MenuEntry::submenu("Move to", places).icon(IconName::Folder));
         entries.push(MenuEntry::Separator);
         entries.push(
             MenuEntry::item("Commands", emit(SidebarEvent::EditCommands, id.clone()))
@@ -674,10 +830,11 @@ impl Sidebar {
     }
 
     /// A host's row, at its place in the list. Its tabs go right under it.
+    /// `ends_section` is the last host of its section: a group dropped past it lands under it.
     fn render_host(
         &self,
         host: &HostConfig,
-        position: usize,
+        ends_section: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme().clone();
@@ -706,10 +863,18 @@ impl Sidebar {
         let dragged = HostDrag {
             id: id.clone(),
             alias: host.alias.clone(),
-            position,
         };
         let (click, add, target) = (id.clone(), id.clone(), id.clone());
         let collapsed = state.settings.collapsed_hosts.contains(&id.0);
+        // Its open tabs follow it: past this host is under the last of them, not right here.
+        let tabs_follow = has_tabs && !collapsed;
+        let line = self
+            .line_on(&DropRow::Host(id.clone()))
+            .filter(|after| !after || !tabs_follow)
+            .or_else(|| {
+                self.line_past_group(&id, cx)
+                    .filter(|_| ends_section && !tabs_follow)
+            });
         let group = SharedString::from(format!("host-row-{}", id.0));
         let menu = host.clone();
         let on_add = self.over_add.as_ref() == Some(&id);
@@ -719,22 +884,17 @@ impl Sidebar {
             .group(group.clone())
             .relative()
             .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
-            // The line shows where it lands: past this host, coming from the other side.
-            .drag_over::<HostDrag>(move |style, dragged, _, _| {
-                if dragged.position < position {
-                    style.border_b_2().border_color(accent)
-                } else if dragged.position > position {
-                    style.border_t_2().border_color(accent)
-                } else {
-                    style
-                }
+            .map(|this| {
+                Self::track_row(
+                    this,
+                    move |_: &HostDrag, lower| {
+                        Some((DropRow::Host(target.clone()), lower && !tabs_follow))
+                    },
+                    cx,
+                )
             })
-            .on_drop(cx.listener(move |this, dragged: &HostDrag, _, cx| {
-                this.state
-                    .update(cx, |state, cx| state.place_host(&dragged.id, &target, cx));
-                this.keep_selection_listed(cx);
-                cx.notify();
-            }))
+            .map(|this| self.track_past_group(this, &id, cx))
+            .children(line.map(|after| insertion_line(after, accent)))
             .flex()
             .flex_none()
             .items_center()
@@ -869,15 +1029,35 @@ impl Sidebar {
             .into_any_element()
     }
 
-    fn render_tab(&self, tab: &OpenTab, cx: &mut Context<Self>) -> AnyElement {
+    /// `last` is the last open row of its host: a host dropped past that host lands under it. With
+    /// `ends_section` too, so does a group dropped past the group of that host.
+    fn render_tab(
+        &self,
+        tab: &OpenTab,
+        last: bool,
+        ends_section: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme().clone();
         let look = self.state.read(cx).host_look(&tab.host);
+        let listed = self.state.read(cx).host(&tab.host).is_some();
         let id = tab.id;
         let group = SharedString::from(format!("sidebar-tab-{id}"));
         let hover = theme.hover;
         let press = theme.active;
-        let line = theme.strong_border;
+        let accent = theme.accent;
         let same_host = tab.host.clone();
+        let owner = tab.host.clone();
+        let line = self
+            .line_on(&DropRow::Tab(id))
+            .or_else(|| {
+                self.line_on(&DropRow::Host(tab.host.clone()))
+                    .filter(|after| *after && last)
+            })
+            .or_else(|| {
+                self.line_past_group(&tab.host, cx)
+                    .filter(|_| last && ends_section)
+            });
         let dragged = TabDrag {
             id,
             host: tab.host.clone(),
@@ -908,16 +1088,25 @@ impl Sidebar {
             })
             .tooltip(tooltip(tab.detail.clone()))
             .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
-            .drag_over::<TabDrag>(move |style, dragged, _, _| {
-                if dragged.host == same_host && dragged.id != id {
-                    style.border_t_1().border_color(line)
-                } else {
-                    style
-                }
+            .map(|this| {
+                Self::track_row(
+                    this,
+                    move |dragged: &TabDrag, lower| {
+                        (dragged.host == same_host).then_some((DropRow::Tab(id), lower))
+                    },
+                    cx,
+                )
             })
-            .on_drop(cx.listener(move |_, dragged: &TabDrag, _, cx| {
-                cx.emit(SidebarEvent::MoveTab(dragged.id, id));
-            }))
+            // A host dragged over the tabs of another one lands past them all.
+            .map(|this| {
+                Self::track_row(
+                    this,
+                    move |_: &HostDrag, _| listed.then(|| (DropRow::Host(owner.clone()), true)),
+                    cx,
+                )
+            })
+            .map(|this| self.track_past_group(this, &tab.host, cx))
+            .children(line.map(|after| insertion_line(after, accent)))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.pill.arm(&this.state.read(cx).settings);
                 cx.emit(SidebarEvent::ActivateTab(id));
@@ -1085,6 +1274,10 @@ impl Sidebar {
 
 impl Render for Sidebar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A drag let go anywhere ends here too, with or without a drop.
+        if !cx.has_active_drag() {
+            self.drop_line = None;
+        }
         let theme = cx.theme().clone();
         let state = self.state.read(cx);
         let width = state.settings.sidebar_width;
@@ -1102,21 +1295,18 @@ impl Render for Sidebar {
         let show_hidden = self.show_hidden;
         let mut rows: Vec<AnyElement> = Vec::new();
         let mut current_child = None;
-        // A host being dragged needs somewhere to leave its group for.
-        if cx.has_active_drag() && sections.iter().any(|(group, _)| group.is_some()) {
-            rows.push(self.render_ungrouped_header(cx));
-        }
         let mut position = 0;
-        for (index, (group, hosts)) in sections.iter().enumerate() {
+        for (group, hosts) in &sections {
             if let Some(group) = group {
-                rows.push(self.render_group_header(group, index, hosts.len(), cx));
+                rows.push(self.render_group_header(group, hosts.len(), cx));
             }
-            for host in hosts {
+            for (at_host, host) in hosts.iter().enumerate() {
                 position += 1;
                 if !self.shows_host(group, cx) {
                     continue;
                 }
-                let row = self.render_host(host, position, cx);
+                let ends_section = at_host + 1 == hosts.len();
+                let row = self.render_host(host, ends_section, cx);
                 let entering = group.is_some() && *group == self.opening_group;
                 rows.push(if entering {
                     motion::enter(
@@ -1137,12 +1327,13 @@ impl Render for Sidebar {
                 {
                     continue;
                 }
-                for tab in open.iter().filter(|tab| tab.host == host.id) {
+                let tabs: Vec<&OpenTab> = open.iter().filter(|tab| tab.host == host.id).collect();
+                for (at, tab) in tabs.iter().enumerate() {
                     // Among the children of the list, the pill comes first.
                     if tab.active {
                         current_child = Some(rows.len() + 1);
                     }
-                    let row = self.render_tab(tab, cx);
+                    let row = self.render_tab(tab, at + 1 == tabs.len(), ends_section, cx);
                     let entering = self.opening_host.as_ref() == Some(&host.id)
                         || (group.is_some() && *group == self.opening_group);
                     rows.push(if entering {
@@ -1171,7 +1362,7 @@ impl Render for Sidebar {
                 if tab.active {
                     current_child = Some(rows.len() + 1);
                 }
-                rows.push(self.render_tab(tab, cx));
+                rows.push(self.render_tab(tab, false, false, cx));
             }
         }
         let update = self.update_button(cx);
@@ -1242,12 +1433,54 @@ impl Render for Sidebar {
                     .relative()
                     .flex_1()
                     .min_h_0()
-                    .when(starts_with_host, |this| this.mt(px(8.)))
-                    .mb(px(8.))
+                    // The drop line of the first and of the last row needs a gap there too.
+                    .when(starts_with_host, |this| this.mt(px(8.) - ROW_GAP).pt(ROW_GAP))
+                    .mb(px(8.) - ROW_GAP)
+                    .pb(ROW_GAP)
                     .overflow_y_scroll()
                     .flex()
                     .flex_col()
-                    .gap(px(2.))
+                    .gap(ROW_GAP)
+                    .on_drag_move(cx.listener(Self::leave_row::<HostDrag>))
+                    .on_drag_move(cx.listener(Self::leave_row::<TabDrag>))
+                    .on_drag_move(cx.listener(Self::leave_row::<GroupDrag>))
+                    // Here and not on the rows: the line can also be in the gap between two.
+                    .on_drop(cx.listener(|this, dragged: &HostDrag, _, cx| {
+                        if let Some(DropLine {
+                            row: DropRow::Host(target),
+                            after,
+                            ..
+                        }) = this.drop_line.take()
+                        {
+                            this.state.update(cx, |state, cx| {
+                                state.place_host(&dragged.id, &target, after, cx)
+                            });
+                            this.keep_selection_listed(cx);
+                            cx.notify();
+                        }
+                    }))
+                    .on_drop(cx.listener(|this, dragged: &TabDrag, _, cx| {
+                        if let Some(DropLine {
+                            row: DropRow::Tab(target),
+                            after,
+                            ..
+                        }) = this.drop_line.take()
+                        {
+                            cx.emit(SidebarEvent::MoveTab(dragged.id, target, after));
+                        }
+                    }))
+                    .on_drop(cx.listener(|this, dragged: &GroupDrag, _, cx| {
+                        if let Some(DropLine {
+                            row: DropRow::Group(target),
+                            after,
+                            ..
+                        }) = this.drop_line.take()
+                        {
+                            this.state.update(cx, |state, cx| {
+                                state.place_group(&dragged.name, &target, after, cx)
+                            });
+                        }
+                    }))
                     .child(self.pill.element(&theme, 9.))
                     .children(rows)
                     .when(hosts_empty, |this| {

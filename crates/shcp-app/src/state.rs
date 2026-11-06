@@ -108,18 +108,16 @@ fn saved_position(order: &[String], name: &str) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-/// The list with `item` taking the place of `target`, so a move works in both directions and can
-/// reach either end.
-fn moved(list: &[String], item: &String, target: &String) -> Vec<String> {
+/// The list with `item` right before `target`, or right after it, wherever it came from.
+fn moved(list: &[String], item: &String, target: &String, after: bool) -> Vec<String> {
+    if item == target || !list.contains(item) {
+        return list.to_vec();
+    }
     let mut result: Vec<String> = list.iter().filter(|name| *name != item).cloned().collect();
-    let (Some(from), Some(to)) = (
-        list.iter().position(|name| name == item),
-        list.iter().position(|name| name == target),
-    ) else {
+    let Some(at) = result.iter().position(|name| name == target) else {
         return list.to_vec();
     };
-    let _ = from;
-    result.insert(to.min(result.len()), item.clone());
+    result.insert(at + usize::from(after), item.clone());
     result
 }
 
@@ -175,7 +173,13 @@ impl AppState {
     }
 
     /// Puts a host where another one is, in its group.
-    pub fn place_host(&mut self, host: &HostId, target: &HostId, cx: &mut Context<Self>) {
+    pub fn place_host(
+        &mut self,
+        host: &HostId,
+        target: &HostId,
+        after: bool,
+        cx: &mut Context<Self>,
+    ) {
         if host == target {
             return;
         }
@@ -184,16 +188,16 @@ impl AppState {
             .into_iter()
             .map(|host| host.id.0)
             .collect();
-        self.settings.host_order = moved(&order, &host.0, &target.0);
+        self.settings.host_order = moved(&order, &host.0, &target.0, after);
         let group = self.host_group(target).map(str::to_string);
         // Saves the order as well.
         self.set_host_group(host, group, cx);
     }
 
-    /// Puts a group where another one is.
-    pub fn place_group(&mut self, group: &str, target: &str, cx: &mut Context<Self>) {
+    /// Puts a group right before another one, or right after it.
+    pub fn place_group(&mut self, group: &str, target: &str, after: bool, cx: &mut Context<Self>) {
         let order = self.groups();
-        self.settings.group_order = moved(&order, &group.to_string(), &target.to_string());
+        self.settings.group_order = moved(&order, &group.to_string(), &target.to_string(), after);
         self.persist_settings(cx);
         cx.notify();
     }
@@ -1085,16 +1089,22 @@ mod order_tests {
     }
 
     #[test]
-    fn a_move_takes_the_place_of_the_target_in_both_directions() {
+    fn a_move_lands_on_the_chosen_side_of_the_target_in_both_directions() {
         let list = names(&["a", "b", "c", "d"]);
-        let move_to =
-            |item: &str, target: &str| moved(&list, &item.to_string(), &target.to_string());
-        assert_eq!(move_to("a", "c"), names(&["b", "c", "a", "d"]));
-        assert_eq!(move_to("d", "b"), names(&["a", "d", "b", "c"]));
-        assert_eq!(move_to("a", "d"), names(&["b", "c", "d", "a"]));
-        assert_eq!(move_to("d", "a"), names(&["d", "a", "b", "c"]));
-        assert_eq!(move_to("b", "b"), list);
-        assert_eq!(move_to("x", "b"), list);
+        let before =
+            |item: &str, target: &str| moved(&list, &item.to_string(), &target.to_string(), false);
+        let after =
+            |item: &str, target: &str| moved(&list, &item.to_string(), &target.to_string(), true);
+        assert_eq!(before("a", "c"), names(&["b", "a", "c", "d"]));
+        assert_eq!(after("a", "c"), names(&["b", "c", "a", "d"]));
+        assert_eq!(before("d", "b"), names(&["a", "d", "b", "c"]));
+        assert_eq!(after("d", "b"), names(&["a", "b", "d", "c"]));
+        assert_eq!(after("a", "d"), names(&["b", "c", "d", "a"]));
+        assert_eq!(before("d", "a"), names(&["d", "a", "b", "c"]));
+        assert_eq!(before("b", "c"), list);
+        assert_eq!(after("b", "a"), list);
+        assert_eq!(after("b", "b"), list);
+        assert_eq!(before("x", "b"), list);
     }
 
     #[test]
