@@ -1,0 +1,2 @@
+// Resource 1 is the icon gpui loads for the window and taskbar; Explorer uses it for the exe.
+1 ICON "assets/shcp.ico"
