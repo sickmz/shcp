@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The release notes need the history back to the previous tag.
+          fetch-depth: 0
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Check tag matches the crate version
+        run: |
+          $package = cargo +stable metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($package.packages | Where-Object name -eq "shcp-app").version
+          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+            throw "Tag $env:GITHUB_REF_NAME does not match shcp-app version $version"
+          }
+          "VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Build
+        run: cargo +stable build --release --locked -p shcp-app
+
+      - name: Package
+        run: |
+          $name = "shcp-$env:VERSION-x86_64.exe"
+          Copy-Item target\release\shcp.exe $name
+          $hash = (Get-FileHash $name -Algorithm SHA256).Hash.ToLower()
+          [IO.File]::WriteAllText("$PWD\$name.sha256", "$hash  $name`n")
+          "ASSET=$name" >> $env:GITHUB_ENV
+
+      - name: Write release notes
+        run: |
+          $previous = git describe --tags --abbrev=0 "$env:GITHUB_REF_NAME^" 2>$null
+          $global:LASTEXITCODE = 0
+          $range = if ($previous) { "$previous..$env:GITHUB_REF_NAME" } else { $env:GITHUB_REF_NAME }
+          $notes = @(git log $range --no-merges --invert-grep --grep='^chore' --format='- %s (%h)')
+          if ($previous) {
+            $notes += ""
+            $notes += "**Full Changelog**: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/compare/$previous...$env:GITHUB_REF_NAME"
+          }
+          $notes | Set-Content notes.md
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create $env:GITHUB_REF_NAME $env:ASSET "$env:ASSET.sha256" --verify-tag --notes-file notes.md
