@@ -148,7 +148,7 @@ pub fn tab_menu(
     let (h1, h2) = (host.clone(), host);
     let mut entries = vec![
         MenuEntry::item(
-            "New terminal on this host",
+            "New terminal",
             handler(this.clone(), move |w, window, cx| {
                 w.open_terminal(h1.clone(), window, cx)
             }),
@@ -156,7 +156,7 @@ pub fn tab_menu(
         .icon(IconName::Terminal)
         .shortcut("Ctrl+Shift+T"),
         MenuEntry::item(
-            "Browse files on this host",
+            "Browse files",
             handler(this.clone(), move |w, window, cx| {
                 w.open_files(h2.clone(), window, cx)
             }),
