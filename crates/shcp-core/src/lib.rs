@@ -1,0 +1,34 @@
+//! Runtime-independent interface for the shcp desktop client.
+mod auth;
+mod check;
+mod config;
+mod edit;
+mod engine;
+mod files;
+mod forward;
+mod host_key;
+mod key_setup;
+mod known_hosts;
+mod logging;
+mod paste;
+mod proxy;
+mod secrets;
+mod session;
+mod session_log;
+mod socks;
+mod ssh_command;
+mod ssh_keys;
+mod terminal;
+mod transfer;
+mod types;
+
+pub use check::{CheckOutcome, CheckQuestion, CheckUpdate, ConnectionCheck};
+pub use engine::{EngineHandle, start};
+pub use files::{archive_stem, shell_quote};
+pub use known_hosts::KnownHost;
+pub use logging::CRASH_LOG;
+pub use shcp_term as term;
+pub use shcp_term::{TerminalHandle, TerminalId};
+pub use ssh_command::{SshCommand, address_text, is_ssh_command, suggested_host_name};
+pub use ssh_keys::find_ssh_keys;
+pub use types::*;
