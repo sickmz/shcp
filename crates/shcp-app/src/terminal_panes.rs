@@ -460,6 +460,11 @@ impl TerminalPanes {
     }
 
     fn drag_to(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.dragging = None;
+            cx.notify();
+            return;
+        }
         let Some(path) = self.dragging.clone() else {
             return;
         };
@@ -686,6 +691,14 @@ impl Render for TerminalPanes {
                     cx.listener(|this, event: &MouseMoveEvent, _, cx| this.drag_to(event, cx)),
                 )
                 .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                        this.dragging = None;
+                        cx.notify();
+                    }),
+                )
+                // The divider occludes this container, so its releases count as "out" too.
+                .on_mouse_up_out(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseUpEvent, _, cx| {
                         this.dragging = None;
