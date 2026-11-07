@@ -294,6 +294,8 @@ mod tests {
             known_hosts_lock: Arc::new(Mutex::new(())),
             use_agent: false,
             open_forwards: false,
+            persist_terminals: false,
+            tmux: Default::default(),
         };
         start(&Handle::current(), context, receiver, 1)
     }

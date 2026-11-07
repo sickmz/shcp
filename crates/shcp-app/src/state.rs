@@ -759,6 +759,43 @@ impl AppState {
         cx.notify();
     }
 
+    /// New terminals of this host go on on the server after shcp closes.
+    pub fn keeps_terminals(&self, host: &HostId) -> bool {
+        self.settings.keeps_terminals(&host.0)
+    }
+
+    /// Whether new terminals of a host stay on the server, or end with the connection.
+    pub fn toggle_keep_terminals(&mut self, host: &HostId, cx: &mut Context<Self>) {
+        let keep = self.settings.plain_terminal_hosts.remove(&host.0);
+        if !keep {
+            self.settings.plain_terminal_hosts.insert(host.0.clone());
+        }
+        if let Err(error) = self.engine.save_settings(self.settings.clone()) {
+            self.push_notice(
+                NoticeLevel::Error,
+                format!("Could not save settings: {error:#}"),
+                cx,
+            );
+        } else if !keep {
+            let message = format!("New terminals on {} end when shcp closes", host.0);
+            self.push_notice(NoticeLevel::Info, message, cx);
+        } else if let Some(session) = self.host_session_id(host).filter(|id| {
+            self.session(*id)
+                .is_some_and(|info| matches!(info.state, SessionState::Connected))
+        }) {
+            // Only the server knows if it can, and it answers with a notice of its own.
+            self.engine.report_keeping_terminals(session);
+        } else {
+            let message = format!(
+                "New terminals on {} keep running when shcp closes, if the server has tmux 3.2 \
+                 or newer",
+                host.0
+            );
+            self.push_notice(NoticeLevel::Info, message, cx);
+        }
+        cx.notify();
+    }
+
     /// Remembers where the window is, for the next start.
     pub fn remember_window(&mut self, window: shcp_core::SavedWindow, cx: &mut Context<Self>) {
         if self.settings.window == Some(window) {
@@ -873,6 +910,9 @@ impl AppState {
                 | Event::TerminalTitle { .. }
                 | Event::TerminalCopy { .. }
                 | Event::TerminalExited { .. }
+                | Event::TerminalClosed { .. }
+                | Event::SharedServer { .. }
+                | Event::SharedTabsChanged { .. }
                 | Event::RemotePath { .. }
                 | Event::RemoteKind { .. }
                 | Event::DirListing { .. }
@@ -935,12 +975,31 @@ impl AppState {
                 self.persist_settings(cx);
             }
             Event::Notice { level, message } => self.push_notice(*level, message.clone(), cx),
+            // The option goes back off: it never worked, and the server would say so at every
+            // connection. Installing tmux, the user can ask for it again.
+            Event::TmuxMissing { host } => {
+                if self.settings.plain_terminal_hosts.insert(host.0.clone()) {
+                    self.persist_settings(cx);
+                    let alias = self.host(host).map_or(host.0.clone(), |h| h.alias.clone());
+                    self.push_notice(
+                        NoticeLevel::Important,
+                        format!(
+                            "Terminals on {alias} end when shcp closes: the server needs tmux \
+                             3.2 or newer. Install it, then choose Keep terminals via tmux"
+                        ),
+                        cx,
+                    );
+                }
+            }
             Event::TerminalCopy { text } => {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
             }
             Event::TerminalChanged(_)
             | Event::TerminalTitle { .. }
             | Event::TerminalExited { .. }
+            | Event::TerminalClosed { .. }
+            | Event::SharedServer { .. }
+            | Event::SharedTabsChanged { .. }
             | Event::RemotePath { .. }
             | Event::RemoteKind { .. }
             | Event::DirListing { .. }

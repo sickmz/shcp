@@ -23,7 +23,8 @@ use gpui::{
 };
 use shcp_core::term::{self, GridPoint, MouseAction, MouseInput, SelectKind, TerminalLink};
 use shcp_core::{
-    Event, HostId, NoticeLevel, PasteFile, RequestId, SessionId, SessionState, TerminalHandle,
+    Event, HostId, NoticeLevel, PasteFile, Persistence, RequestId, SessionId, SessionState,
+    TerminalHandle, TerminalId,
 };
 use std::{cell::Cell, collections::HashSet, rc::Rc, time::Duration};
 
@@ -35,6 +36,10 @@ struct Selecting {
 pub struct TerminalView {
     state: Entity<AppState>,
     host: HostId,
+    /// Its name on the server, when its shell should outlive the app.
+    key: Option<String>,
+    /// Its shell should be there on the server already: it comes from the last run.
+    known: bool,
     session: SessionId,
     terminal: TerminalHandle,
     focus: FocusHandle,
@@ -97,16 +102,30 @@ impl Focusable for TerminalView {
 }
 
 impl TerminalView {
+    /// `key` names a shell on the server. If `known`, it is from the last run, and a terminal
+    /// whose shell is not there any more was closed in the meantime.
     pub fn new(
         state: Entity<AppState>,
         host: HostId,
+        key: Option<String>,
+        known: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let configured_font = state.read(cx).settings.terminal_font_family.clone();
         let font_family = resolve_font(&configured_font, cx);
         let session = state.update(cx, |s, cx| s.connect_host(&host, cx));
-        let terminal = state.read(cx).engine.open_terminal(session, 80, 24);
+        let known = known && key.is_some();
+        // Tabs that do not come back have no use for a shell left running.
+        let key = state
+            .read(cx)
+            .keeps_terminals(&host)
+            .then(|| key.unwrap_or_else(shcp_core::new_terminal_key));
+        let persist = key.clone().map(|key| Persistence { key, known });
+        let terminal = state
+            .read(cx)
+            .engine
+            .open_terminal(session, 80, 24, persist);
         let search_input = cx.new(|cx| TextInput::new("Find", false, cx));
         let focus = cx.focus_handle();
         let subscriptions = vec![
@@ -133,7 +152,8 @@ impl TerminalView {
                     && *id != this.session
                     && this.session_is_gone(cx)
                 {
-                    this.attach(*id, cx);
+                    let known = this.expects_shell();
+                    this.attach(*id, known, cx);
                     return;
                 }
                 let relevant = match event {
@@ -162,9 +182,11 @@ impl TerminalView {
                 },
             ),
         ];
-        let this = Self {
+        Self {
             state,
             host,
+            key,
+            known,
             session,
             terminal,
             focus,
@@ -188,9 +210,25 @@ impl TerminalView {
             link_armed: false,
             had_session: false,
             _subscriptions: subscriptions,
-        };
-        this.send_startup_command(cx);
-        this
+        }
+    }
+
+    /// Its name on the server, to find its shell again at the next start.
+    pub fn key(&self) -> Option<String> {
+        self.key.clone()
+    }
+
+    pub fn terminal_id(&self) -> TerminalId {
+        self.terminal.id()
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.terminal.is_alive()
+    }
+
+    /// Its shell should be on the server, so if it is not, it was closed in the meantime.
+    pub fn expects_shell(&self) -> bool {
+        self.known || self.terminal.shell_started()
     }
 
     pub fn area(&self) -> Option<Bounds<Pixels>> {
@@ -221,14 +259,6 @@ impl TerminalView {
         cx.notify();
     }
 
-    fn send_startup_command(&self, cx: &App) {
-        let settings = &self.state.read(cx).settings;
-        if let Some(command) = settings.startup_commands.get(&self.host.0) {
-            // It waits in the queue until the shell is up.
-            self.terminal.text(&format!("{command}\r"));
-        }
-    }
-
     fn session_is_gone(&self, cx: &App) -> bool {
         self.state.read(cx).session(self.session).is_none_or(|s| {
             matches!(
@@ -244,13 +274,13 @@ impl TerminalView {
     }
 
     /// A new shell on `session`, in the same terminal: what it showed stays in the scrollback.
-    fn attach(&mut self, session: SessionId, cx: &mut Context<Self>) {
+    fn attach(&mut self, session: SessionId, known: bool, cx: &mut Context<Self>) {
         self.session = session;
         let engine = self.state.read(cx).engine.clone();
-        engine.reopen_terminal(session, &self.terminal, "reconnected");
+        let persist = self.key.clone().map(|key| Persistence { key, known });
+        engine.reopen_terminal(session, &self.terminal, "reconnected", persist);
         self.composing.clear();
         self.reported_button = None;
-        self.send_startup_command(cx);
         cx.notify();
     }
 
@@ -271,13 +301,23 @@ impl TerminalView {
             .close_terminal(self.terminal.id());
     }
 
+    /// Lets go of the terminal, leaving its shell to whoever else has it.
+    pub fn detach(&self, cx: &App) {
+        self.state
+            .read(cx)
+            .engine
+            .detach_terminal(self.terminal.id());
+    }
+
     fn retry(&mut self, cx: &mut Context<Self>) {
+        // The user asks for a shell after the last one ended: a new one, not a closed one.
+        let known = !self.shell_gone(cx) && self.expects_shell();
         // Still connecting from an automatic attempt: this terminal is already queued on it.
         let session = self
             .state
             .update(cx, |s, cx| s.connect_host(&self.host, cx));
         if session != self.session || !self.terminal.is_alive() {
-            self.attach(session, cx);
+            self.attach(session, known, cx);
         }
     }
 

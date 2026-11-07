@@ -194,6 +194,8 @@ pub struct Settings {
     pub group_order: Vec<String>,
     /// Hosts whose new terminals write what they show to a file.
     pub session_logs: BTreeSet<String>,
+    /// Hosts whose terminals end with the connection, instead of going on with tmux on the server.
+    pub plain_terminal_hosts: BTreeSet<String>,
     /// Hosts already told that a key could replace their password.
     pub key_login_offered: BTreeSet<String>,
     /// Where the window was when the app closed. Among the last fields, being a table.
@@ -217,6 +219,11 @@ pub struct Settings {
 pub const STYLE_VERSION: u32 = 1;
 
 impl Settings {
+    /// New terminals of this host should go on after the connection. Without tabs that come back
+    /// there would be no way to find them again.
+    pub fn keeps_terminals(&self, host: &str) -> bool {
+        self.restore_tabs && !self.plain_terminal_hosts.contains(host)
+    }
     /// Brings settings written for an older look up to the current one, once: what still has the
     /// old default takes the new one, and anything the user chose stays.
     pub fn migrate_style(&mut self) {
@@ -292,6 +299,9 @@ impl Settings {
         if self.session_logs.remove(&old.0) {
             self.session_logs.insert(new.0.clone());
         }
+        if self.plain_terminal_hosts.remove(&old.0) {
+            self.plain_terminal_hosts.insert(new.0.clone());
+        }
         if self.key_login_offered.remove(&old.0) {
             self.key_login_offered.insert(new.0.clone());
         }
@@ -363,13 +373,81 @@ pub enum SplitAxis {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "pane", rename_all = "snake_case")]
 pub enum SavedPane {
-    Terminal,
+    Terminal {
+        /// Its name on the server, where its shell may still be running.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+    },
     Split {
         axis: SplitAxis,
         ratio: f32,
         first: Box<SavedPane>,
         second: Box<SavedPane>,
     },
+}
+impl SavedPane {
+    /// The names of its terminals on the server.
+    pub fn keys(&self) -> Vec<String> {
+        match self {
+            Self::Terminal { key } => key.iter().cloned().collect(),
+            Self::Split { first, second, .. } => {
+                let mut keys = first.keys();
+                keys.extend(second.keys());
+                keys
+            }
+        }
+    }
+    /// Without the terminals that have no name or fail `keep`; a neighbour takes their room.
+    pub fn retain_keys(&self, keep: &dyn Fn(&str) -> bool) -> Option<Self> {
+        match self {
+            Self::Terminal { key } => {
+                key.as_deref()
+                    .filter(|key| keep(key))
+                    .map(|key| Self::Terminal {
+                        key: Some(key.to_string()),
+                    })
+            }
+            Self::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => match (first.retain_keys(keep), second.retain_keys(keep)) {
+                (Some(first), Some(second)) => Some(Self::Split {
+                    axis: *axis,
+                    ratio: *ratio,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                }),
+                (Some(only), None) | (None, Some(only)) => Some(only),
+                (None, None) => None,
+            },
+        }
+    }
+}
+/// How a terminal stays on the server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Persistence {
+    /// Its name there.
+    pub key: String,
+    /// It should be there already: if it is gone, it was closed and comes to an end here too.
+    pub known: bool,
+}
+/// A tab as the PCs on a host share it. Which one is active, and what else it shows, stays with
+/// each PC.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SharedTab {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub layout: SavedPane,
+}
+/// The tabs of a host, kept on the server for all the PCs using it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SharedTabs {
+    /// The run of the app that wrote this, which has no need to read it back.
+    pub writer: String,
+    pub tabs: Vec<SharedTab>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -513,6 +591,7 @@ impl Default for Settings {
             host_order: Vec::new(),
             group_order: Vec::new(),
             session_logs: BTreeSet::new(),
+            plain_terminal_hosts: BTreeSet::new(),
             key_login_offered: BTreeSet::new(),
             window: None,
             keybindings: BTreeMap::new(),
@@ -550,6 +629,28 @@ pub enum Event {
     TerminalExited {
         id: TerminalId,
         status: Option<u32>,
+    },
+    /// The terminal was closed on another PC, or no longer exists: it goes from here too.
+    TerminalClosed {
+        id: TerminalId,
+    },
+    /// What runs on a host that was just connected. Comes for every connection that can keep
+    /// terminals, even with nothing running, before any terminal attaches.
+    SharedServer {
+        host: HostId,
+        /// The keys of the terminals running.
+        live: Vec<String>,
+        /// How the last PC to change them had them.
+        tabs: Option<SharedTabs>,
+    },
+    /// A PC changed the tabs of a host.
+    SharedTabsChanged {
+        host: HostId,
+        tabs: SharedTabs,
+    },
+    /// The server said it has no tmux that can keep terminals running.
+    TmuxMissing {
+        host: HostId,
     },
     RemotePath {
         req: RequestId,
@@ -963,12 +1064,16 @@ mod tests {
                     layout: SavedPane::Split {
                         axis: SplitAxis::Row,
                         ratio: 0.25,
-                        first: Box::new(SavedPane::Terminal),
+                        first: Box::new(SavedPane::Terminal {
+                            key: Some("k1".into()),
+                        }),
                         second: Box::new(SavedPane::Split {
                             axis: SplitAxis::Column,
                             ratio: 0.5,
-                            first: Box::new(SavedPane::Terminal),
-                            second: Box::new(SavedPane::Terminal),
+                            first: Box::new(SavedPane::Terminal { key: None }),
+                            second: Box::new(SavedPane::Terminal {
+                                key: Some("k2".into()),
+                            }),
                         }),
                     },
                     name: None,
@@ -977,7 +1082,7 @@ mod tests {
                     both: false,
                     ratio: None,
                     host: "c".into(),
-                    layout: SavedPane::Terminal,
+                    layout: SavedPane::Terminal { key: None },
                     name: Some("database".into()),
                 },
             ],
@@ -989,6 +1094,21 @@ mod tests {
             toml::from_str::<SavedTabs>(&empty).unwrap(),
             SavedTabs::default()
         );
+    }
+
+    #[test]
+    fn tabs_saved_before_terminals_had_a_name_still_open() {
+        let tabs: SavedTabs = toml::from_str(
+            "[[tabs]]\nkind = \"terminal\"\nhost = \"a\"\n[tabs.layout]\npane = \"terminal\"\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            &tabs.tabs[0],
+            SavedTab::Terminal {
+                layout: SavedPane::Terminal { key: None },
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -178,6 +178,8 @@ async fn login(name: &str, rules: Rules, script: Script, with_key: bool) -> Run 
         known_hosts_lock: Arc::new(Mutex::new(())),
         use_agent: false,
         open_forwards: false,
+        persist_terminals: false,
+        tmux: Default::default(),
     });
     let seen = Arc::new(Mutex::new(Seen::default()));
     let config = Arc::new(server::Config {

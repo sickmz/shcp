@@ -44,7 +44,11 @@ use shcp_core::{
     ConnectErrorKind, Event, ForwardState, HostConfig, HostId, HostSource, NoticeLevel, SavedPane,
     SavedTab, SavedTabs, SavedWindow, SessionId, SessionState, SplitAxis, TransferState,
 };
-use std::{collections::HashMap, time::Duration};
+use shcp_core::{SharedTab, SharedTabs, TerminalId};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 /// Seconds to wait before each automatic attempt to connect again; the last one repeats.
 const RECONNECT_DELAYS: [u64; 5] = [2, 5, 10, 20, 30];
@@ -112,6 +116,15 @@ pub struct Workspace {
     face_fade: Option<(u64, u64)>,
     /// Where the two views were last drawn, to turn a drag into a share.
     both_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
+    /// This run of the app, as the other PCs on a host see it.
+    writer: String,
+    /// How the tabs of each host are as far as the other PCs know.
+    shared: HashMap<HostId, SharedTabs>,
+    /// A change from another PC, waiting for a divider to be let go of.
+    pending_shared: HashMap<HostId, SharedTabs>,
+    /// Hosts whose tabs are in step with the server. Until then what is here may be old, and must
+    /// not overwrite what is there.
+    surveyed: HashSet<HostId>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -174,6 +187,10 @@ impl Workspace {
             face_pill: SlidingPill::default(),
             face_fade: None,
             both_bounds: Default::default(),
+            writer: shcp_core::new_terminal_key(),
+            shared: HashMap::new(),
+            pending_shared: HashMap::new(),
+            surveyed: HashSet::new(),
             _subscriptions: subscriptions,
         };
         let this = cx.weak_entity();
@@ -254,7 +271,7 @@ impl Workspace {
                     ratio,
                     name,
                 } if known(host, self, cx) => {
-                    self.open_terminal_with(HostId(host.clone()), layout, window, cx);
+                    self.open_terminal_with(HostId(host.clone()), layout, true, window, cx);
                     if *both && let Some(index) = self.active {
                         self.set_face(index, Face::Files, window, cx);
                         if let Some(ratio) = ratio.filter(|ratio| ratio.is_finite()) {
@@ -293,12 +310,252 @@ impl Workspace {
                 .iter()
                 .map(|tab| SavedTab::Terminal {
                     host: tab.host.0.clone(),
-                    layout: tab.panes.read(cx).saved(),
+                    layout: tab.panes.read(cx).saved(cx),
                     both: tab.face.shows_files(),
                     ratio: tab.face.shows_files().then_some(tab.both_ratio),
                     name: tab.name.clone(),
                 })
                 .collect(),
+        }
+    }
+
+    // ---- tabs shared with other PCs ----
+
+    /// The tabs of a host as they are here. In a set order, since each PC has its own.
+    fn shared_now(&self, host: &HostId, cx: &App) -> SharedTabs {
+        let mut tabs: Vec<SharedTab> = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.host == *host)
+            .filter_map(|tab| {
+                let layout = tab.panes.read(cx).saved(cx).retain_keys(&|_| true)?;
+                Some(SharedTab {
+                    name: tab.name.clone(),
+                    layout,
+                })
+            })
+            .collect();
+        tabs.sort_by_cached_key(|tab| tab.layout.keys().into_iter().min());
+        SharedTabs {
+            writer: self.writer.clone(),
+            tabs,
+        }
+    }
+
+    /// Tells the other PCs on each host what changed here. It is written as long as the app has
+    /// something to say: the first terminal of a host that gets there takes it along.
+    fn publish_shared(&mut self, cx: &mut Context<Self>) {
+        self.shared
+            .retain(|host, _| self.tabs.iter().any(|tab| tab.host == *host));
+        let mut hosts: Vec<HostId> = Vec::new();
+        for tab in &self.tabs {
+            if !hosts.contains(&tab.host) && self.surveyed.contains(&tab.host) {
+                hosts.push(tab.host.clone());
+            }
+        }
+        for host in hosts {
+            let tabs: Vec<&Tab> = self.tabs.iter().filter(|tab| tab.host == host).collect();
+            if tabs.iter().any(|tab| tab.panes.read(cx).is_dragging()) {
+                continue;
+            }
+            let now = self.shared_now(&host, cx);
+            if self
+                .shared
+                .get(&host)
+                .is_some_and(|known| known.tabs == now.tabs)
+            {
+                continue;
+            }
+            let Some(terminal) = tabs
+                .iter()
+                .find_map(|tab| tab.panes.read(cx).live_terminal(cx))
+            else {
+                continue;
+            };
+            self.state.read(cx).engine.publish_tabs(terminal, &now);
+            self.shared.insert(host, now);
+        }
+    }
+
+    /// A host was just connected. What it says wins over what this PC remembers, except for new
+    /// terminals of this PC, which it has not heard of.
+    fn on_shared_server(
+        &mut self,
+        host: &HostId,
+        live: &[String],
+        tabs: Option<&SharedTabs>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.state.read(cx).keeps_terminals(host) {
+            return;
+        }
+        self.surveyed.insert(host.clone());
+        let live: HashSet<String> = live.iter().cloned().collect();
+        let mut shared = tabs.cloned().unwrap_or_default();
+        // A server with nothing running has restarted: the tabs stay, with new shells.
+        if !live.is_empty() {
+            shared.tabs = shared
+                .tabs
+                .iter()
+                .filter_map(|tab| {
+                    let layout = tab.layout.retain_keys(&|key| live.contains(key))?;
+                    Some(SharedTab {
+                        name: tab.name.clone(),
+                        layout,
+                    })
+                })
+                .collect();
+        }
+        let mut here = HashSet::new();
+        let mut gone = HashSet::new();
+        for tab in self.tabs.iter().filter(|tab| tab.host == *host) {
+            let panes = tab.panes.read(cx);
+            here.extend(panes.keys(cx));
+            if !live.is_empty() {
+                gone.extend(panes.missing_keys(&live, cx));
+            }
+        }
+        // Running there and shown nowhere, like a terminal closed while the connection was down.
+        let listed: HashSet<String> = shared
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.layout.keys())
+            .collect();
+        let mut lost: Vec<&String> = live
+            .iter()
+            .filter(|key| !listed.contains(*key) && !here.contains(*key))
+            .collect();
+        lost.sort();
+        for key in lost {
+            shared.tabs.push(SharedTab {
+                name: None,
+                layout: SavedPane::Terminal {
+                    key: Some(key.clone()),
+                },
+            });
+        }
+        self.apply_shared(host, &shared, &gone, window, cx);
+        self.shared.insert(host.clone(), shared);
+    }
+
+    /// A PC changed the tabs of a host.
+    fn on_shared_tabs(
+        &mut self,
+        host: &HostId,
+        tabs: &SharedTabs,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // What this PC wrote comes back late, when it may have moved on.
+        if tabs.writer == self.writer || !self.state.read(cx).keeps_terminals(host) {
+            return;
+        }
+        let dragging = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.host == *host)
+            .any(|tab| tab.panes.read(cx).is_dragging());
+        if dragging {
+            self.pending_shared.insert(host.clone(), tabs.clone());
+            return;
+        }
+        self.pending_shared.remove(host);
+        let previous = self.shared.get(host);
+        if previous.is_some_and(|known| known.tabs == tabs.tabs) {
+            return;
+        }
+        let listed: HashSet<String> = tabs.tabs.iter().flat_map(|tab| tab.layout.keys()).collect();
+        // Only what the other PC knew and took out was closed. The rest is too new for it to know.
+        let gone: HashSet<String> = previous
+            .iter()
+            .flat_map(|known| known.tabs.iter())
+            .flat_map(|tab| tab.layout.keys())
+            .filter(|key| !listed.contains(key))
+            .collect();
+        self.apply_shared(host, tabs, &gone, window, cx);
+        self.shared.insert(host.clone(), tabs.clone());
+    }
+
+    /// Makes the tabs of a host follow `shared`, leaving the keyboard and the active tab alone.
+    fn apply_shared(
+        &mut self,
+        host: &HostId,
+        shared: &SharedTabs,
+        gone: &HashSet<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let active = self.active.and_then(|i| self.tabs.get(i)).map(|t| t.id);
+        let mut matched = Vec::new();
+        for remote in &shared.tabs {
+            let keys: HashSet<String> = remote.layout.keys().into_iter().collect();
+            let local = self.tabs.iter().position(|tab| {
+                tab.host == *host
+                    && !matched.contains(&tab.id)
+                    && tab.panes.read(cx).keys(cx).iter().any(|k| keys.contains(k))
+            });
+            match local {
+                Some(index) => {
+                    let tab = &mut self.tabs[index];
+                    tab.name.clone_from(&remote.name);
+                    matched.push(tab.id);
+                    let panes = tab.panes.clone();
+                    panes.update(cx, |panes, cx| {
+                        panes.apply_layout(&remote.layout, gone, window, cx)
+                    });
+                }
+                None => {
+                    self.open_terminal_with(host.clone(), &remote.layout, false, window, cx);
+                    if let Some(tab) = self.tabs.last_mut() {
+                        tab.name.clone_from(&remote.name);
+                        matched.push(tab.id);
+                    }
+                }
+            }
+        }
+        // The other tabs of the host are new here, unless what they showed was closed.
+        let others: Vec<u64> = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.host == *host && !matched.contains(&tab.id))
+            .map(|tab| tab.id)
+            .collect();
+        for id in others {
+            let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
+                continue;
+            };
+            let panes = self.tabs[index].panes.clone();
+            if !panes.update(cx, |panes, cx| panes.drop_keys(gone, window, cx)) {
+                self.drop_tab(index, false, window, cx);
+            }
+        }
+        if let Some(index) = active.and_then(|id| self.tabs.iter().position(|tab| tab.id == id))
+            && self.active != Some(index)
+        {
+            self.activate(index, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// A terminal was closed on another PC, or its shell is not on the server any more.
+    fn on_terminal_closed(&mut self, id: TerminalId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.panes.read(cx).has_terminal(id, cx))
+        else {
+            return;
+        };
+        let panes = self.tabs[index].panes.clone();
+        if !panes.update(cx, |panes, cx| panes.remove_terminal(id, window, cx)) {
+            self.drop_tab(index, false, window, cx);
+        }
+    }
+
+    fn apply_pending_shared(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for (host, tabs) in std::mem::take(&mut self.pending_shared) {
+            self.on_shared_tabs(&host, &tabs, window, cx);
         }
     }
 
@@ -685,6 +942,9 @@ impl Workspace {
     ) {
         match event {
             Event::Session { id, host, state } => {
+                if !matches!(state, SessionState::Connected) {
+                    self.surveyed.remove(host);
+                }
                 self.on_session_for_reconnect(*id, host, state, cx);
                 self.modals
                     .update(cx, |m, cx| m.dismiss_session(*id, window, cx));
@@ -703,6 +963,13 @@ impl Workspace {
                 }
             }
             Event::TerminalTitle { .. } | Event::TerminalExited { .. } => cx.notify(),
+            Event::TerminalClosed { id } => self.on_terminal_closed(*id, window, cx),
+            Event::SharedServer { host, live, tabs } => {
+                self.on_shared_server(host, live, tabs.as_ref(), window, cx);
+            }
+            Event::SharedTabsChanged { host, tabs } => {
+                self.on_shared_tabs(host, tabs, window, cx);
+            }
             Event::EditConflict { session, remote } => {
                 let name = remote.rsplit('/').next().unwrap_or(remote);
                 let message = format!(
@@ -772,12 +1039,13 @@ impl Workspace {
         &mut self,
         host: &HostId,
         layout: &SavedPane,
+        known: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<TerminalPanes> {
         let state = self.state.clone();
         let host = host.clone();
-        let panes = cx.new(|cx| TerminalPanes::new(state, host, layout, window, cx));
+        let panes = cx.new(|cx| TerminalPanes::new(state, host, layout, known, window, cx));
         self._subscriptions
             .push(cx.subscribe_in(&panes, window, Self::on_panes_event));
         panes
@@ -908,18 +1176,19 @@ impl Workspace {
     }
 
     pub fn open_terminal(&mut self, host: HostId, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_terminal_with(host, &SavedPane::Terminal, window, cx);
+        self.open_terminal_with(host, &SavedPane::Terminal { key: None }, false, window, cx);
     }
 
     fn open_terminal_with(
         &mut self,
         host: HostId,
         layout: &SavedPane,
+        known: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let label = self.alias(&host, cx);
-        let panes = self.new_panes(&host, layout, window, cx);
+        let panes = self.new_panes(&host, layout, known, window, cx);
         self.push_tab(host, label, panes, window, cx);
     }
 
@@ -1096,11 +1365,20 @@ impl Workspace {
     }
 
     pub fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.drop_tab(index, true, window, cx);
+    }
+
+    /// Takes a tab away, ending what runs in it if `kill`. Otherwise it was closed elsewhere.
+    fn drop_tab(&mut self, index: usize, kill: bool, window: &mut Window, cx: &mut Context<Self>) {
         if index >= self.tabs.len() {
             return;
         }
         let tab = self.tabs.remove(index);
-        tab.panes.read(cx).close(cx);
+        if kill {
+            tab.panes.read(cx).close(cx);
+        } else {
+            tab.panes.read(cx).detach(cx);
+        }
         self.active = match self.active {
             _ if self.tabs.is_empty() => None,
             Some(active) if active > index => Some(active - 1),
@@ -2212,6 +2490,13 @@ impl Render for Workspace {
         }
         if !self.resizing_both {
             self.save_tabs(cx);
+        }
+        self.publish_shared(cx);
+        let dragging = self.tabs.iter().any(|tab| tab.panes.read(cx).is_dragging());
+        if !dragging && !self.pending_shared.is_empty() {
+            cx.defer_in(window, |this, window, cx| {
+                this.apply_pending_shared(window, cx)
+            });
         }
         self.first_empty_state &= self.tabs.is_empty();
         self.notices_open &= self.state.read(cx).notices.iter().any(|n| !n.leaving);

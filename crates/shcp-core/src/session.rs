@@ -62,6 +62,9 @@ pub(crate) struct Context {
     pub known_hosts_lock: Arc<Mutex<()>>,
     pub use_agent: bool,
     pub open_forwards: bool,
+    /// Its terminals should go on after the connection, if the server can do that.
+    pub persist_terminals: bool,
+    pub tmux: tmux::HostState,
 }
 impl Context {
     pub fn emit(&self, event: Event) {
@@ -154,12 +157,20 @@ pub(crate) struct OpenTerminal {
     pub input: Receiver<TerminalCommand>,
     /// Where to write what it shows, when asked to.
     pub log_dir: Option<std::path::PathBuf>,
+    /// How it stays on the server when it should outlive the connection, as far as the server can.
+    pub persist: Option<Persistence>,
+    /// The lines the server keeps for it while no one is looking.
+    pub history: usize,
+    /// What to run in a new shell.
+    pub startup: Option<String>,
 }
 pub(crate) enum Command {
     OpenTerminal(OpenTerminal),
     /// Starts one more local forward (a retry, or a failed one moved to another port).
     StartForward(ForwardSpec),
     StopForward(ForwardSpec),
+    /// Tells the user whether the server can keep terminals running.
+    ReportKeeping,
 }
 impl Control {
     pub fn new(context: Context, concurrency: usize) -> (Arc<Self>, Receiver<Command>) {
@@ -240,6 +251,12 @@ pub(crate) async fn run(control: Arc<Control>, commands: Receiver<Command>) {
             }
             control.ready.send_replace(Some(Ok(files)));
             ctx.state(SessionState::Connected);
+            if ctx.persist_terminals {
+                tokio::select! { biased;
+                    _ = ctx.cancel.cancelled() => {}
+                    _ = tmux::survey(ctx, &ssh) => {}
+                }
+            }
             let mut monitor = tokio::time::interval(Duration::from_millis(250));
             let reason = loop {
                 tokio::select! { biased;
@@ -258,6 +275,9 @@ pub(crate) async fn run(control: Arc<Control>, commands: Receiver<Command>) {
                             if let Some(token) = tunnels.remove(&(spec.bind_addr, spec.bind_port, spec.kind)) {
                                 token.cancel();
                             }
+                        }
+                        Ok(Command::ReportKeeping) => {
+                            tasks.spawn(tmux::report_keeping(ctx.clone(), ssh.clone()));
                         }
                         Err(_) => break None,
                     },

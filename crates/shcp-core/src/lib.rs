@@ -19,6 +19,7 @@ mod socks;
 mod ssh_command;
 mod ssh_keys;
 mod terminal;
+mod tmux;
 mod transfer;
 mod types;
 
@@ -31,4 +32,5 @@ pub use shcp_term as term;
 pub use shcp_term::{TerminalHandle, TerminalId};
 pub use ssh_command::{SshCommand, address_text, is_ssh_command, suggested_host_name};
 pub use ssh_keys::find_ssh_keys;
+pub use tmux::new_terminal_key;
 pub use types::*;

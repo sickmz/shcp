@@ -25,6 +25,10 @@ pub use types::*;
 #[derive(Debug)]
 pub enum TerminalCommand {
     Write(Vec<u8>),
+    /// Only from a terminal that is `managed`: what wraps the text is up to the other side.
+    Paste(String),
+    /// For the other PCs on the same shell.
+    Publish(String),
     Resize(u16, u16),
     Close,
 }
@@ -69,6 +73,12 @@ struct State {
     shell_started: bool,
     dirty: bool,
     search: Option<search::Search>,
+    /// Something between here and the program sees its output too and answers it, so an answer
+    /// from here would be a second one.
+    managed: bool,
+    /// How big it can be on screen, once the app has said. A managed terminal is the size the
+    /// other side decides, which another PC may keep smaller.
+    requested: Option<(u16, u16)>,
 }
 struct Inner {
     id: TerminalId,
@@ -120,6 +130,8 @@ impl TerminalHandle {
                     shell_started: false,
                     dirty: false,
                     search: None,
+                    managed: false,
+                    requested: None,
                 }),
                 events: listener,
                 input: Mutex::new(input),
@@ -176,6 +188,15 @@ impl TerminalHandle {
     pub fn resize(&self, cols: u16, rows: u16) {
         let (cols, rows) = (cols.max(2), rows.max(1));
         let mut state = self.0.state.lock();
+        let changed = state.requested != Some((cols, rows));
+        state.requested = Some((cols, rows));
+        if state.managed {
+            drop(state);
+            if changed {
+                self.send(TerminalCommand::Resize(cols, rows));
+            }
+            return;
+        }
         if state.term.columns() == cols as usize && state.term.screen_lines() == rows as usize {
             return;
         }
@@ -183,6 +204,35 @@ impl TerminalHandle {
         drop(state);
         self.send(TerminalCommand::Resize(cols, rows));
         self.changed();
+    }
+    /// Takes the size the other side decided, which it needs no telling about.
+    #[doc(hidden)]
+    pub fn fit(&self, cols: u16, rows: u16) {
+        let (cols, rows) = (cols.max(2), rows.max(1));
+        let mut state = self.0.state.lock();
+        if state.term.columns() == cols as usize && state.term.screen_lines() == rows as usize {
+            return;
+        }
+        state.term.resize(Size(cols, rows));
+        drop(state);
+        self.changed();
+    }
+    #[doc(hidden)]
+    pub fn requested(&self) -> Option<(u16, u16)> {
+        self.0.state.lock().requested
+    }
+    /// With no one else to decide its size any more, it goes back to the one it was asked for.
+    #[doc(hidden)]
+    pub fn set_managed(&self, managed: bool) {
+        let mut state = self.0.state.lock();
+        state.managed = managed;
+        if !managed && let Some((cols, rows)) = state.requested {
+            state.term.resize(Size(cols, rows));
+        }
+    }
+    #[doc(hidden)]
+    pub fn publish(&self, text: String) {
+        self.send(TerminalCommand::Publish(text));
     }
     fn write(&self, bytes: Vec<u8>) {
         self.scroll_to_bottom();
@@ -245,13 +295,20 @@ impl TerminalHandle {
         self.write(s.as_bytes().to_vec());
     }
     pub fn paste(&self, s: &str) {
-        let bracketed = self
-            .0
-            .state
-            .lock()
-            .term
-            .mode()
-            .contains(TermMode::BRACKETED_PASTE);
+        let (bracketed, managed) = {
+            let state = self.0.state.lock();
+            (
+                state.term.mode().contains(TermMode::BRACKETED_PASTE),
+                state.managed,
+            )
+        };
+        if managed {
+            self.scroll_to_bottom();
+            if self.is_alive() {
+                self.send(TerminalCommand::Paste(s.replace('\x1b', "")));
+            }
+            return;
+        }
         let text = s.replace("\r\n", "\r").replace('\n', "\r");
         // Strip ESC in bracketed paste to prevent pasted text terminating the envelope.
         self.write(if bracketed {
@@ -385,8 +442,10 @@ impl TerminalHandle {
             parser.advance(term, bytes);
         }
         let events = std::mem::take(&mut *self.0.events.0.lock());
+        let managed = self.0.state.lock().managed;
         for event in events {
             match event {
+                AlEvent::PtyWrite(_) | AlEvent::TextAreaSizeRequest(_) if managed => {}
                 AlEvent::PtyWrite(text) => {
                     self.send(TerminalCommand::Write(text.into_bytes()));
                 }
@@ -490,6 +549,46 @@ mod tests {
         terminal.text("ls");
         assert!(matches!(input.try_recv(), Ok(TerminalCommand::Write(_))));
         assert!(old_input.is_closed());
+    }
+
+    #[test]
+    fn a_managed_terminal_leaves_the_answers_to_the_other_side() {
+        let (terminal, _copied, input) = terminal();
+        terminal.feed(b"\x1b[6n");
+        assert!(matches!(input.try_recv(), Ok(TerminalCommand::Write(_))));
+        terminal.set_managed(true);
+        terminal.feed(b"\x1b[6n\x1b[c\x1b[18t");
+        assert!(input.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_managed_terminal_only_changes_size_when_told() {
+        let (terminal, _copied, input) = terminal();
+        terminal.set_managed(true);
+        terminal.resize(120, 40);
+        assert!(matches!(
+            input.try_recv(),
+            Ok(TerminalCommand::Resize(120, 40))
+        ));
+        assert_eq!(terminal.dimensions(), (80, 24));
+        // The same again is nothing new, even when the answer was another size.
+        terminal.fit(100, 30);
+        terminal.resize(120, 40);
+        assert!(input.try_recv().is_err());
+        assert_eq!(terminal.dimensions(), (100, 30));
+        terminal.set_managed(false);
+        assert_eq!(terminal.dimensions(), (120, 40));
+    }
+
+    #[test]
+    fn a_managed_terminal_hands_over_a_paste_as_it_is() {
+        let (terminal, _copied, input) = terminal();
+        terminal.set_managed(true);
+        terminal.paste("a\nb\x1b");
+        assert!(matches!(
+            input.try_recv(),
+            Ok(TerminalCommand::Paste(text)) if text == "a\nb"
+        ));
     }
 
     #[test]

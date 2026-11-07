@@ -15,8 +15,12 @@ use gpui::{
     FocusHandle, Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     Point, SharedString, Window, canvas, div, px, relative,
 };
-use shcp_core::{HostId, SavedPane, SplitAxis};
-use std::{cell::Cell, rc::Rc};
+use shcp_core::{HostId, SavedPane, SplitAxis, TerminalId};
+use std::{
+    cell::Cell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 const MIN_RATIO: f32 = 0.1;
 
@@ -128,9 +132,11 @@ impl Node {
         }
     }
 
-    fn saved(&self) -> SavedPane {
+    fn saved(&self, cx: &App) -> SavedPane {
         match self {
-            Self::Leaf(_) => SavedPane::Terminal,
+            Self::Leaf(view) => SavedPane::Terminal {
+                key: view.read(cx).key(),
+            },
             Self::Split {
                 axis,
                 ratio,
@@ -140,8 +146,8 @@ impl Node {
             } => SavedPane::Split {
                 axis: *axis,
                 ratio: *ratio,
-                first: Box::new(first.saved()),
-                second: Box::new(second.saved()),
+                first: Box::new(first.saved(cx)),
+                second: Box::new(second.saved(cx)),
             },
         }
     }
@@ -172,14 +178,24 @@ impl Focusable for TerminalPanes {
 }
 
 impl TerminalPanes {
+    /// `known`: the terminals of `layout` are from the last run, see `TerminalView::new`.
     pub fn new(
         state: Entity<AppState>,
         host: HostId,
         layout: &SavedPane,
+        known: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let root = Self::build(&state, &host, layout, window, cx);
+        let root = Self::build(
+            &state,
+            &host,
+            layout,
+            known,
+            &mut HashMap::new(),
+            window,
+            cx,
+        );
         let mut leaves = Vec::new();
         root.leaves(&mut leaves);
         let active = leaves.remove(0);
@@ -193,23 +209,31 @@ impl TerminalPanes {
         }
     }
 
+    /// Makes the tree of `layout`, taking the terminals it can out of `existing`.
     fn build(
         state: &Entity<AppState>,
         host: &HostId,
         layout: &SavedPane,
+        known: bool,
+        existing: &mut HashMap<String, Entity<TerminalView>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Node {
         match layout {
-            SavedPane::Terminal => Node::Leaf(Self::terminal(state, host, window, cx)),
+            SavedPane::Terminal { key } => {
+                match key.as_ref().and_then(|key| existing.remove(key)) {
+                    Some(view) => Node::Leaf(view),
+                    None => Node::Leaf(Self::terminal(state, host, key.clone(), known, window, cx)),
+                }
+            }
             SavedPane::Split {
                 axis,
                 ratio,
                 first,
                 second,
             } => {
-                let first = Self::build(state, host, first, window, cx);
-                let second = Self::build(state, host, second, window, cx);
+                let first = Self::build(state, host, first, known, existing, window, cx);
+                let second = Self::build(state, host, second, known, existing, window, cx);
                 let ratio = if ratio.is_finite() {
                     ratio.clamp(MIN_RATIO, 1. - MIN_RATIO)
                 } else {
@@ -223,11 +247,13 @@ impl TerminalPanes {
     fn terminal(
         state: &Entity<AppState>,
         host: &HostId,
+        key: Option<String>,
+        known: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<TerminalView> {
         let (state, host) = (state.clone(), host.clone());
-        let view = cx.new(|cx| TerminalView::new(state, host, window, cx));
+        let view = cx.new(|cx| TerminalView::new(state, host, key, known, window, cx));
         // The tab row and the palette show the active terminal's title and session.
         cx.observe(&view, |_, _, cx| cx.notify()).detach();
         view
@@ -256,8 +282,10 @@ impl TerminalPanes {
             .all(|terminal| terminal.read(cx).shell_gone(cx))
     }
 
-    pub fn saved(&self) -> SavedPane {
-        self.root.as_ref().map_or(SavedPane::Terminal, Node::saved)
+    pub fn saved(&self, cx: &App) -> SavedPane {
+        self.root
+            .as_ref()
+            .map_or(SavedPane::Terminal { key: None }, |root| root.saved(cx))
     }
 
     /// Releases every backend terminal; call when the tab is closed.
@@ -267,8 +295,128 @@ impl TerminalPanes {
         }
     }
 
+    /// Lets go of every backend terminal, leaving the shells to whoever else has them.
+    pub fn detach(&self, cx: &App) {
+        for view in self.leaves() {
+            view.read(cx).detach(cx);
+        }
+    }
+
+    /// The names of its terminals on the server.
+    pub fn keys(&self, cx: &App) -> Vec<String> {
+        self.saved(cx).keys()
+    }
+
+    /// The names of the terminals that should be on a server in use but are not in `live`.
+    pub fn missing_keys(&self, live: &HashSet<String>, cx: &App) -> Vec<String> {
+        self.leaves()
+            .iter()
+            .map(|view| view.read(cx))
+            .filter(|view| view.expects_shell())
+            .filter_map(|view| view.key())
+            .filter(|key| !live.contains(key))
+            .collect()
+    }
+
+    pub fn has_terminal(&self, id: TerminalId, cx: &App) -> bool {
+        self.leaves()
+            .iter()
+            .any(|view| view.read(cx).terminal_id() == id)
+    }
+
+    /// A terminal that can still reach the server.
+    pub fn live_terminal(&self, cx: &App) -> Option<TerminalId> {
+        self.leaves()
+            .iter()
+            .map(|view| view.read(cx))
+            .find(|view| view.is_alive())
+            .map(TerminalView::terminal_id)
+    }
+
+    /// A divider is under the pointer, so the layout is on its way to something else.
+    pub fn is_dragging(&self) -> bool {
+        self.dragging.is_some()
+    }
+
+    /// Takes the layout another PC gave its terminals. The ones in `gone` were closed there; any
+    /// other that the layout does not have is new here, so it stays, next to the rest.
+    pub fn apply_layout(
+        &mut self,
+        layout: &SavedPane,
+        gone: &HashSet<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.saved(cx) == *layout {
+            return;
+        }
+        let focused = self.active.read(cx).contains_focus(window, cx);
+        let mut existing = HashMap::new();
+        let mut unnamed = Vec::new();
+        for view in self.leaves() {
+            match view.read(cx).key() {
+                Some(key) => {
+                    existing.insert(key, view);
+                }
+                None => unnamed.push(view),
+            }
+        }
+        let (state, host) = (self.state.clone(), self.host.clone());
+        let mut root = Self::build(&state, &host, layout, false, &mut existing, window, cx);
+        for (key, view) in existing {
+            if gone.contains(&key) {
+                view.read(cx).detach(cx);
+            } else {
+                root = Node::split(SplitAxis::Row, 0.5, root, Node::Leaf(view));
+            }
+        }
+        for view in unnamed {
+            root = Node::split(SplitAxis::Row, 0.5, root, Node::Leaf(view));
+        }
+        let mut leaves = Vec::new();
+        root.leaves(&mut leaves);
+        if !leaves.contains(&self.active) {
+            self.active = leaves[0].clone();
+        }
+        self.root = Some(root);
+        if focused {
+            window.focus(&self.active.focus_handle(cx));
+        }
+        cx.notify();
+    }
+
+    /// Lets go of the terminals with these names. `false`: the tab has none left.
+    pub fn drop_keys(
+        &mut self,
+        keys: &HashSet<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        for view in self.leaves() {
+            let closed = view.read(cx).key().is_some_and(|key| keys.contains(&key));
+            if closed && !self.take_pane(view, false, window, cx) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Lets go of a terminal closed elsewhere. `false`: it was the last one, the tab goes instead.
+    pub fn remove_terminal(
+        &mut self,
+        id: TerminalId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let target = self
+            .leaves()
+            .into_iter()
+            .find(|view| view.read(cx).terminal_id() == id);
+        target.is_none_or(|target| self.take_pane(target, false, window, cx))
+    }
+
     pub fn split(&mut self, axis: SplitAxis, window: &mut Window, cx: &mut Context<Self>) {
-        let new = Self::terminal(&self.state, &self.host, window, cx);
+        let new = Self::terminal(&self.state, &self.host, None, false, window, cx);
         let target = self.active.entity_id();
         self.root = self
             .root
@@ -290,12 +438,29 @@ impl TerminalPanes {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.take_pane(target, true, window, cx)
+    }
+
+    /// Takes a terminal out of the tree, ending what runs in it if `kill`.
+    fn take_pane(
+        &mut self,
+        target: Entity<TerminalView>,
+        kill: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let leaves = self.leaves();
         if leaves.len() < 2 {
             return false;
         }
         let index = leaves.iter().position(|view| *view == target).unwrap_or(0);
-        target.read(cx).close(cx);
+        // Closed from elsewhere, it must not pull the keyboard away from what it is on.
+        let refocus = kill || target.read(cx).contains_focus(window, cx);
+        if kill {
+            target.read(cx).close(cx);
+        } else {
+            target.read(cx).detach(cx);
+        }
         self.root = self
             .root
             .take()
@@ -303,7 +468,9 @@ impl TerminalPanes {
         if self.active == target {
             self.active = leaves[if index == 0 { 1 } else { index - 1 }].clone();
         }
-        window.focus(&self.active.focus_handle(cx));
+        if refocus {
+            window.focus(&self.active.focus_handle(cx));
+        }
         cx.notify();
         true
     }

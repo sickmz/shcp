@@ -787,6 +787,22 @@ impl Sidebar {
             )
             .icon(IconName::File),
         );
+        let keeping = state.keeps_terminals(&host.id);
+        let keep_id = host.id.clone();
+        entries.push(
+            MenuEntry::item(
+                if keeping {
+                    "Don't keep terminals via tmux"
+                } else {
+                    "Keep terminals via tmux"
+                },
+                handler(this.clone(), move |view, _, cx| {
+                    view.state
+                        .update(cx, |state, cx| state.toggle_keep_terminals(&keep_id, cx));
+                }),
+            )
+            .icon(IconName::Terminal),
+        );
         entries.push(
             MenuEntry::item("Set up key login", emit(SidebarEvent::SetUpKey, id.clone()))
                 .icon(IconName::Lock),
