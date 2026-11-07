@@ -1700,7 +1700,7 @@ impl FilesView {
                     this.update(cx, |this, cx| {
                         let Some(mode) = parse_mode(&text) else {
                             this.notice(
-                                NoticeLevel::Error,
+                                NoticeLevel::Warning,
                                 format!(
                                     "{text} is not a permission: try something like 644 or 755"
                                 ),

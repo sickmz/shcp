@@ -246,7 +246,7 @@ impl Edit {
         let unsaved = !matches!(local_stamp(&self.local).await, Ok(stamp) if stamp == self.synced);
         if unsaved {
             self.notice(
-                NoticeLevel::Warning,
+                NoticeLevel::Important,
                 format!(
                     "Changes to {} did not reach the server. Your copy is in {}",
                     self.name,
@@ -255,7 +255,7 @@ impl Edit {
             );
         } else {
             self.notice(
-                NoticeLevel::Info,
+                NoticeLevel::Important,
                 format!(
                     "Disconnected: saves to {} no longer reach the server. Open it again after reconnecting.",
                     self.name

@@ -62,7 +62,7 @@ async fn save_secret(account: String, secret: Zeroizing<String>, ctx: &SessionCo
         Err(error) => error.to_string(),
     };
     ctx.notice(
-        NoticeLevel::Warning,
+        NoticeLevel::Important,
         format!("Could not remember it in the Credential Manager: {error}"),
     );
     false
@@ -281,7 +281,7 @@ async fn public_key(
             Ok(key) => key,
             Err(e) => {
                 ctx.notice(
-                    NoticeLevel::Warning,
+                    NoticeLevel::Important,
                     format!("Could not load {}: {e}", path.display()),
                 );
                 continue;

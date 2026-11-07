@@ -125,7 +125,7 @@ fn main() {
             let state = cx.new(|cx| {
                 let mut state = AppState::new(engine);
                 for error in theme_errors {
-                    state.push_notice(shcp_core::NoticeLevel::Warning, error, cx);
+                    state.push_notice(shcp_core::NoticeLevel::Important, error, cx);
                 }
                 if let Some(name) = theme::missing_theme(&state.settings, cx) {
                     state.push_notice(

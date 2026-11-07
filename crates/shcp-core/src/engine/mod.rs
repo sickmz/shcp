@@ -106,7 +106,7 @@ pub fn start(settings_override: Option<Settings>) -> Result<(EngineHandle, Recei
     }
     for message in warnings {
         let _ = events.try_send(Event::Notice {
-            level: NoticeLevel::Warning,
+            level: NoticeLevel::Important,
             message,
         });
     }
@@ -141,7 +141,7 @@ impl EngineHandle {
     fn warnings(&self, warnings: Vec<String>) {
         for message in warnings {
             self.emit(Event::Notice {
-                level: NoticeLevel::Warning,
+                level: NoticeLevel::Important,
                 message,
             });
         }

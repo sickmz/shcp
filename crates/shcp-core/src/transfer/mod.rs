@@ -66,7 +66,7 @@ impl Progress {
             count => format!(" and {} more", count - 1),
         };
         let _ = self.events.try_send(Event::Notice {
-            level: NoticeLevel::Warning,
+            level: NoticeLevel::Important,
             message: format!(
                 "{}: skipped {first}{others}, a symbolic link to a folder or to nothing",
                 self.info.label

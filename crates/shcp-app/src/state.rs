@@ -11,7 +11,9 @@ use shcp_core::{
     TransferInfo, TransferState,
 };
 use std::{
+    cell::Cell,
     collections::{BTreeMap, HashMap, HashSet},
+    rc::Rc,
     time::{Duration, Instant},
 };
 
@@ -25,6 +27,8 @@ pub struct ForwardInfo {
 /// The least a step of the connection stays on screen, for it to be read. It delays only what is
 /// drawn: the connection never waits for it, and a shell that is ready appears at once.
 const STEP_PACE: Duration = Duration::from_millis(180);
+/// How often a notice past its time looks whether it can go.
+const NOTICE_HELD_CHECK: Duration = Duration::from_secs(1);
 
 pub struct SessionInfo {
     pub state: SessionState,
@@ -90,6 +94,8 @@ pub struct AppState {
     /// What the label in the panel has to say, oldest first.
     pub notices: Vec<Notice>,
     next_notice: u64,
+    /// The pointer is on a notice or the list is open, so none goes by itself.
+    pub notices_held: Rc<Cell<bool>>,
     pub update: UpdateStatus,
     login_prompts: HashMap<HostId, Entity<LoginPrompt>>,
     /// Hosts being reconnected automatically, with the attempt under way or coming next.
@@ -134,6 +140,7 @@ impl AppState {
             transfers: Vec::new(),
             notices: Vec::new(),
             next_notice: 1,
+            notices_held: Rc::default(),
             update: UpdateStatus::Idle,
             login_prompts: HashMap::new(),
             reconnecting: HashMap::new(),
@@ -566,11 +573,11 @@ impl AppState {
     }
 
     pub fn push_notice(&mut self, level: NoticeLevel, message: String, cx: &mut Context<Self>) {
-        // An error stays until it is closed: it may be read later, and it may need acting on.
+        // What matters stays until it is closed: it may be read later, and it may need acting on.
         let linger = match level {
-            NoticeLevel::Info => Some(Duration::from_secs(3)),
-            NoticeLevel::Warning => Some(Duration::from_secs(6)),
-            NoticeLevel::Error => None,
+            NoticeLevel::Info => Some(Duration::from_secs(5)),
+            NoticeLevel::Warning => Some(Duration::from_secs(10)),
+            NoticeLevel::Important | NoticeLevel::Error => None,
         };
         self.add_notice(level, message, None, linger, cx);
     }
@@ -609,6 +616,13 @@ impl AppState {
         if let Some(linger) = linger {
             cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(linger).await;
+                // Not while it is being read: it goes shortly after the pointer leaves.
+                while this
+                    .update(cx, |state, _| state.notices_held.get())
+                    .unwrap_or(false)
+                {
+                    cx.background_executor().timer(NOTICE_HELD_CHECK).await;
+                }
                 this.update(cx, |state, cx| state.dismiss_notice(id, cx))
                     .ok();
             })

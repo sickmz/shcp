@@ -728,6 +728,8 @@ pub enum ForwardState {
 pub enum NoticeLevel {
     Info,
     Warning,
+    /// A warning that stays until it is closed: missing it can cost data or work.
+    Important,
     Error,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

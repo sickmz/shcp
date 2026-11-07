@@ -83,10 +83,14 @@ pub struct Workspace {
     first_empty_state: bool,
     /// What the window was last told to do with its backdrop.
     translucent: bool,
-    /// The list of notices is showing.
+    /// The notice is expanded to the full text of all of them.
     pub(crate) notices_open: bool,
-    /// The pointer is on the label that opens the list.
+    /// The pointer is on the notice, not expanded.
     pub(crate) notice_hovered: bool,
+    /// How far the notice is expanded, on its way there or back.
+    pub(crate) notices_reveal: motion::Reveal,
+    /// The notice that was on the label when it last expanded.
+    pub(crate) notice_folded: Option<u64>,
     /// The user agreed to close despite what is running.
     close_confirmed: bool,
     /// The question is on screen, so another click on the X adds nothing.
@@ -157,6 +161,8 @@ impl Workspace {
             translucent,
             notices_open: false,
             notice_hovered: false,
+            notices_reveal: motion::Reveal::new(false),
+            notice_folded: None,
             close_confirmed: false,
             close_asked: false,
             key_setup_waiting: None,
@@ -309,7 +315,7 @@ impl Workspace {
             // Deferred: this runs while rendering.
             cx.defer(move |cx| {
                 state.update(cx, |state, cx| {
-                    state.push_notice(NoticeLevel::Warning, message, cx)
+                    state.push_notice(NoticeLevel::Important, message, cx)
                 })
             });
         }
@@ -513,7 +519,7 @@ impl Workspace {
             settings.sync_theme = false;
             if let Err(error) = state.update_settings(settings, cx) {
                 state.push_notice(
-                    NoticeLevel::Warning,
+                    NoticeLevel::Important,
                     format!("Could not save the settings: {error:#}"),
                     cx,
                 );
@@ -856,6 +862,23 @@ impl Workspace {
         if self.animated(cx) {
             self.dock_reveal.arm();
         }
+    }
+
+    /// The mouse expands or folds the notice: it glides, if the setting allows it.
+    pub(crate) fn show_notices(&mut self, open: bool, cx: &mut Context<Self>) {
+        if self.notices_open == open {
+            return;
+        }
+        if self.animated(cx) {
+            self.notices_reveal.arm();
+        }
+        self.notices_open = open;
+        // The label goes, and will not hear the pointer leave.
+        self.notice_hovered = false;
+        if open {
+            self.notice_folded = self.state.read(cx).notices.last().map(|notice| notice.id);
+        }
+        cx.notify();
     }
 
     /// The files go where the terminal goes.
@@ -2193,6 +2216,14 @@ impl Render for Workspace {
         self.first_empty_state &= self.tabs.is_empty();
         self.notices_open &= self.state.read(cx).notices.iter().any(|n| !n.leaving);
         self.notice_hovered &= !self.state.read(cx).notices.is_empty();
+        self.notices_reveal.set(self.notices_open);
+        if self.notices_reveal.moving() {
+            window.request_animation_frame();
+        }
+        self.state
+            .read(cx)
+            .notices_held
+            .set(self.notices_open || self.notice_hovered);
         let notice_bottom = 8.;
         let theme = cx.theme().clone();
         self.sidebar_reveal.set(self.sidebar_visible);

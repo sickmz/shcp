@@ -72,7 +72,7 @@ impl EngineHandle {
             Ok(tabs) => tabs,
             Err(error) => {
                 self.emit(Event::Notice {
-                    level: NoticeLevel::Warning,
+                    level: NoticeLevel::Important,
                     message: format!("Could not read tabs.toml: {error:#}"),
                 });
                 SavedTabs::default()
