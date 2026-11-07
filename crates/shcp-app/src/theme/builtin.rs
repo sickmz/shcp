@@ -230,7 +230,8 @@ fn porcelain(accent: Accent) -> Theme {
         warning: amber,
         error: red,
         hover: Hsla { a: 0.055, ..ink },
-        active: oklch(0.905, n, h, 1.),
+        // See-through like `hover`: on a see-through window a solid gray would lighten what it marks.
+        active: Hsla { a: 0.11, ..ink },
         selected: oklch(lit_l, lit_c, accent, 0.15),
         lit_line: oklch(lit_l, lit_c, accent, 0.42),
         scrim: oklch(0.4, 0.02, h, 0.22),
