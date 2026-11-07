@@ -4,6 +4,7 @@ ssh and sftp client for Windows written in Rust with [gpui](https://gpui.rs).
 
 ![A terminal and the files of its folder side by side, with hosts grouped in the sidebar](docs/both.png)
 
+- Terminals keep running when you close the app, and you can pick them up from another machine (needs tmux on the server)
 - Terminal, alone or next to its SFTP browser
 - Tabs and split terminals share one SSH connection per host. Tabs reopen when you start the app again
 - Group and reorder hosts in the sidebar
@@ -50,3 +51,4 @@ On the server:
 | What                                                                                           | Where                  |
 | ---------------------------------------------------------------------------------------------- | ---------------------- |
 | Screenshots and files pasted or dropped on a terminal (removed at the next paste after 7 days) | `~/.cache/shcp/paste/` |
+| Running terminals, in memory until the server restarts                                         | tmux socket `shcp`     |
