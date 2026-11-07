@@ -80,10 +80,13 @@ pub struct SettingsModal {
     page: Page,
     search: Entity<TextInput>,
     editor: Entity<TextInput>,
+    skip_folders: Entity<TextInput>,
     theme_browser: Entity<ThemeBrowser>,
     icon_theme_browser: Entity<ThemeBrowser>,
     /// Waits for typing to pause before applying the editor.
     editor_commit: Option<Task<()>>,
+    /// Waits for typing to pause before applying the folders a search skips.
+    skip_folders_commit: Option<Task<()>>,
     /// Every installed font family, to tell whether the configured one is there.
     installed_fonts: Vec<String>,
     /// What the font list offers; found the first time it opens, since that loads every font.
@@ -121,6 +124,12 @@ impl SettingsModal {
         let editor = cx.new(|cx| {
             let mut input = TextInput::new("VS Code or Notepad", false, cx);
             input.set_text(&editor_path, cx);
+            input
+        });
+        let skip_names = state.read(cx).settings.search_skip_folders.join(", ");
+        let skip_folders = cx.new(|cx| {
+            let mut input = TextInput::new("node_modules, .git", false, cx);
+            input.set_text(&skip_names, cx);
             input
         });
         let themes_dir = state.read(cx).engine.paths().config_dir.join("themes");
@@ -168,6 +177,15 @@ impl SettingsModal {
                         TextInputEvent::Cancel => this.close(cx),
                     }
                 }),
+                cx.subscribe_in(
+                    &skip_folders,
+                    window,
+                    |this, _, event: &TextInputEvent, _, cx| match event {
+                        TextInputEvent::Changed => this.schedule_skip_folders_commit(cx),
+                        TextInputEvent::Submit => this.commit_skip_folders(cx),
+                        TextInputEvent::Cancel => this.close(cx),
+                    },
+                ),
             ];
         Self {
             state,
@@ -175,9 +193,11 @@ impl SettingsModal {
             page: Page::Appearance,
             search,
             editor,
+            skip_folders,
             theme_browser,
             icon_theme_browser,
             editor_commit: None,
+            skip_folders_commit: None,
             installed_fonts,
             monospace_fonts: None,
             open_dropdown: None,
@@ -376,6 +396,9 @@ impl SettingsModal {
                     let editor = this.state.read(cx).settings.editor.clone();
                     this.editor
                         .update(cx, |input, cx| input.set_text(&editor, cx));
+                    let skip_names = this.state.read(cx).settings.search_skip_folders.join(", ");
+                    this.skip_folders
+                        .update(cx, |input, cx| input.set_text(&skip_names, cx));
                     cx.notify();
                 })
                 .ok();
@@ -427,8 +450,35 @@ impl SettingsModal {
         }
     }
 
+    fn schedule_skip_folders_commit(&mut self, cx: &mut Context<Self>) {
+        self.skip_folders_commit = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            this.update(cx, |this, cx| this.commit_skip_folders(cx))
+                .ok();
+        }));
+    }
+
+    fn commit_skip_folders(&mut self, cx: &mut Context<Self>) {
+        self.skip_folders_commit = None;
+        let names: Vec<String> = self
+            .skip_folders
+            .read(cx)
+            .text()
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(String::from)
+            .collect();
+        if names != self.state.read(cx).settings.search_skip_folders {
+            self.change(|s| s.search_skip_folders = names, cx);
+        }
+    }
+
     fn close(&mut self, cx: &mut Context<Self>) {
         self.commit_editor(cx);
+        self.commit_skip_folders(cx);
         cx.emit(DismissEvent);
     }
 
@@ -1399,6 +1449,14 @@ impl SettingsModal {
                         settings.show_hidden_files,
                         self.setter(|s, v| s.show_hidden_files = v, cx),
                     ),
+                );
+                add(
+                    "Folders a search skips",
+                    "Names separated by commas. Pressing Enter in the filter does not look inside them",
+                    div()
+                        .w(px(220.))
+                        .child(self.skip_folders.clone())
+                        .into_any_element(),
                 );
                 add(
                     "Editor for remote files",

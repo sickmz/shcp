@@ -109,7 +109,13 @@ impl EngineHandle {
     }
     /// Looks for a name in the subfolders of `root`. `Event::SearchFound` brings what it finds and
     /// `Event::SearchDone` ends it.
-    pub fn search_files(&self, s: SessionId, root: String, query: String) -> RequestId {
+    pub fn search_files(
+        &self,
+        s: SessionId,
+        root: String,
+        query: String,
+        scope: SearchScope,
+    ) -> RequestId {
         let req = RequestId(self.next());
         let control = self.control(s);
         let cancel = control
@@ -123,8 +129,7 @@ impl EngineHandle {
             let result = async {
                 let control = control.context("Session does not exist")?;
                 let files = control.files().await?;
-                let sftp = files.get().await?;
-                crate::files::search(&sftp, &root, &query, req, &events, &cancel).await
+                crate::files::search(&files, &root, &query, &scope, req, &events, &cancel).await
             }
             .await
             .map_err(|error: anyhow::Error| format!("{error:#}"));

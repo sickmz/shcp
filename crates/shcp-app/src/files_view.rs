@@ -24,8 +24,8 @@ use gpui::{
     UniformListScrollHandle, Window, canvas, div, img, point, px, uniform_list,
 };
 use shcp_core::{
-    EngineHandle, EntryKind, Event, HostId, NoticeLevel, RemoteEntry, RequestId, SessionId,
-    SessionState, TransferId, TransferState, archive_stem,
+    EngineHandle, EntryKind, Event, HostId, NoticeLevel, RemoteEntry, RequestId, SearchScope,
+    SessionId, SessionState, TransferId, TransferState, archive_stem,
 };
 use std::{
     cell::Cell,
@@ -232,6 +232,10 @@ struct FileSearch {
     running: bool,
     /// It stopped at its limit, so there may be more.
     limited: bool,
+    /// It also enters the folders the settings leave out.
+    everywhere: bool,
+    /// The folders it met and did not enter.
+    skipped: Vec<String>,
     found: Vec<RemoteEntry>,
 }
 
@@ -284,7 +288,15 @@ impl FilesView {
                 let show_hidden = state.read(cx).settings.show_hidden_files;
                 if show_hidden != this.show_hidden {
                     this.show_hidden = show_hidden;
-                    this.apply_filter(cx);
+                    // A search only looked where this let it, so it has to look again.
+                    match this
+                        .search
+                        .as_ref()
+                        .map(|s| (s.query.clone(), s.everywhere))
+                    {
+                        Some((query, everywhere)) => this.start_search(query, everywhere, cx),
+                        None => this.apply_filter(cx),
+                    }
                 }
             }),
             cx.subscribe_in(
@@ -295,7 +307,7 @@ impl FilesView {
                     // Enter goes beyond the folder: the filter already shows what is in it.
                     TextInputEvent::Submit => {
                         let query = input.read(cx).text().trim().to_string();
-                        this.start_search(query, cx);
+                        this.start_search(query, false, cx);
                         window.focus(&this.focus);
                     }
                     TextInputEvent::Cancel => {
@@ -453,8 +465,12 @@ impl FilesView {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        if let Some(query) = self.search.as_ref().map(|search| search.query.clone()) {
-            self.start_search(query, cx);
+        if let Some((query, everywhere)) = self
+            .search
+            .as_ref()
+            .map(|search| (search.query.clone(), search.everywhere))
+        {
+            self.start_search(query, everywhere, cx);
         } else if self.path.is_empty() {
             self.home_requested = false;
             self.load_home(cx);
@@ -471,22 +487,32 @@ impl FilesView {
         self.apply_filter(cx);
     }
 
-    /// Looks for a name in the folder on screen and everything under it.
-    fn start_search(&mut self, query: String, cx: &mut Context<Self>) {
+    /// Looks for a name in the folder on screen and everything under it. `everywhere` also enters
+    /// the folders the settings leave out.
+    fn start_search(&mut self, query: String, everywhere: bool, cx: &mut Context<Self>) {
         self.end_search(cx);
         if !query.is_empty() && !self.path.is_empty() && self.session_connected(cx) {
             let root = self.path.clone();
-            let req =
-                self.state
-                    .read(cx)
-                    .engine
-                    .search_files(self.session, root.clone(), query.clone());
+            let state = self.state.read(cx);
+            let scope = SearchScope {
+                hidden: self.show_hidden,
+                skip: if everywhere {
+                    Vec::new()
+                } else {
+                    state.settings.search_skip_folders.clone()
+                },
+            };
+            let req = state
+                .engine
+                .search_files(self.session, root.clone(), query.clone(), scope);
             self.search = Some(FileSearch {
                 req,
                 query,
                 root,
                 running: true,
                 limited: false,
+                everywhere,
+                skipped: Vec::new(),
                 found: Vec::new(),
             });
         }
@@ -658,7 +684,10 @@ impl FilesView {
                 if let Some(search) = self.search.as_mut().filter(|s| s.req == *req) {
                     search.running = false;
                     match result {
-                        Ok(limited) => search.limited = *limited,
+                        Ok(end) => {
+                            search.limited = end.limited;
+                            search.skipped = end.skipped.clone();
+                        }
                         Err(error) => {
                             let message = format!("Could not search: {error}");
                             self.notice(NoticeLevel::Error, message, cx);
@@ -2027,6 +2056,12 @@ impl FilesView {
         } else {
             format!("{found} for \"{}\" in {}", search.query, search.root)
         };
+        let can_widen = !search.running && !search.skipped.is_empty();
+        let text = if can_widen {
+            format!("{text}. Skipped {}", search.skipped.join(", "))
+        } else {
+            text
+        };
         let running = search.running;
         Some(
             div()
@@ -2044,6 +2079,20 @@ impl FilesView {
                     this.child(Icon::new(IconName::Spinner).color(theme.accent).spin())
                 })
                 .child(div().flex_1().min_w_0().truncate().child(text))
+                .when(can_widen, |this| {
+                    this.child(
+                        Button::new("search-everywhere")
+                            .label("Search everywhere")
+                            .style(ButtonStyle::Ghost)
+                            .compact()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(search) = this.search.as_ref() {
+                                    let query = search.query.clone();
+                                    this.start_search(query, true, cx);
+                                }
+                            })),
+                    )
+                })
                 .when(running, |this| {
                     this.child(
                         Button::new("search-stop")

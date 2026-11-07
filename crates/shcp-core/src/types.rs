@@ -155,6 +155,8 @@ pub struct Settings {
     pub auto_open_transfers: bool,
     /// List files and folders whose name starts with a dot in the Files tab.
     pub show_hidden_files: bool,
+    /// Names of the folders a search of the subfolders does not enter.
+    pub search_skip_folders: Vec<String>,
     /// Show the details of the selection beside the files, when there is room.
     pub show_file_details: bool,
     /// How wide those details are.
@@ -578,6 +580,25 @@ impl Default for Settings {
             auto_open_forwards: false,
             auto_open_transfers: true,
             show_hidden_files: false,
+            // Only names that are never a folder of someone's own: `target` or `build` can be.
+            search_skip_folders: [
+                ".git",
+                ".hg",
+                ".svn",
+                "node_modules",
+                "__pycache__",
+                ".venv",
+                ".cache",
+                ".next",
+                ".nuxt",
+                ".gradle",
+                ".terraform",
+                ".tox",
+                ".pytest_cache",
+                ".mypy_cache",
+            ]
+            .map(String::from)
+            .to_vec(),
             show_file_details: true,
             file_details_width: 344.,
             editor: String::new(),
@@ -608,6 +629,22 @@ impl Default for Settings {
             snippets: Vec::new(),
         }
     }
+}
+/// What a search of the subfolders leaves out.
+#[derive(Debug, Clone, Default)]
+pub struct SearchScope {
+    /// Also look at names starting with a dot, and inside folders named so.
+    pub hidden: bool,
+    /// Names of the folders it does not enter. They can still be found themselves.
+    pub skip: Vec<String>,
+}
+/// How a search of the subfolders ended.
+#[derive(Debug, Clone, Default)]
+pub struct SearchEnd {
+    /// It stopped at its limit, so there may be more.
+    pub limited: bool,
+    /// The names of the folders it met and did not enter because of `SearchScope::skip`.
+    pub skipped: Vec<String>,
 }
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -698,10 +735,10 @@ pub enum Event {
         req: RequestId,
         entries: Vec<RemoteEntry>,
     },
-    /// A search of the subfolders ended. `Ok(true)`: it stopped at its limit, so there may be more.
+    /// A search of the subfolders ended.
     SearchDone {
         req: RequestId,
-        result: Result<bool, String>,
+        result: Result<SearchEnd, String>,
     },
     Transfer(TransferInfo),
     /// A file pasted on a terminal reached the server: `result` is its path there.

@@ -1,11 +1,15 @@
-use crate::{EntryKind, Event, RemoteEntry, RequestId, session::Ssh};
+use crate::{EntryKind, Event, RemoteEntry, RequestId, SearchEnd, SearchScope, session::Ssh};
 use anyhow::{Context, Result, bail};
 use russh_sftp::{
     client::{SftpSession, fs::Metadata},
     protocol::{FileType, OpenFlags},
 };
-use std::{collections::VecDeque, sync::Arc};
-use tokio::{io::AsyncWriteExt, sync::OnceCell};
+use std::{
+    collections::{BTreeSet, HashSet, VecDeque},
+    sync::Arc,
+    time::{Duration, UNIX_EPOCH},
+};
+use tokio::{io::AsyncWriteExt, sync::OnceCell, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) struct Files {
@@ -365,32 +369,264 @@ pub(crate) async fn list(sftp: &SftpSession, path: &str) -> Result<Vec<RemoteEnt
     });
     Ok(entries)
 }
-/// Where a search of the subfolders stops: it goes over SFTP, one folder at a time.
+/// Where a search of the subfolders stops. The folders count only over SFTP.
 const MAX_SEARCH_RESULTS: usize = 1000;
 const MAX_SEARCH_FOLDERS: usize = 20_000;
+/// Folders a search reads at once: each one costs a few round trips over SFTP.
+const SEARCH_READS: usize = 16;
+/// What `find` prints once it has shown it can do the job, ahead of what it finds.
+const FIND_READY: &[u8] = b"shcp-find\0";
+/// How long a server gets to run `find` before the search goes over SFTP instead.
+const FIND_START: Duration = Duration::from_secs(10);
+/// More than this without an end is no line of `find`, or noise ahead of the first one.
+const MAX_FIND_LINE: usize = 64 * 1024;
 /// Finds the names containing `query` under `root`, ignoring case and sending them as they come.
-/// Links are not followed, and a folder that cannot be read is skipped. Tells whether it stopped
-/// at a limit.
+/// Links are not followed, and a folder that cannot be read is skipped. `root` itself is always
+/// read, whatever its name. `find` on the server does it in a moment; where there is none that
+/// can list what the rows show, it goes over SFTP.
 pub(crate) async fn search(
-    sftp: &SftpSession,
+    files: &Files,
     root: &str,
     query: &str,
+    scope: &SearchScope,
     req: RequestId,
     events: &async_channel::Sender<Event>,
     cancel: &CancellationToken,
-) -> Result<bool> {
+) -> Result<SearchEnd> {
     let query = query.to_lowercase();
-    let mut folders = VecDeque::from([root.to_string()]);
-    let (mut visited, mut found) = (0, 0);
-    while let Some(folder) = folders.pop_front() {
-        if visited == MAX_SEARCH_FOLDERS || found >= MAX_SEARCH_RESULTS {
-            return Ok(true);
+    if root.starts_with('/')
+        && let Some(end) =
+            search_with_find(files.ssh(), root, &query, scope, req, events, cancel).await
+    {
+        return Ok(end);
+    }
+    if cancel.is_cancelled() {
+        return Ok(SearchEnd::default());
+    }
+    let sftp = files.get().await?;
+    search_over_sftp(sftp, root, &query, scope, req, events, cancel).await
+}
+/// A name as `find` reads it, with nothing in it taken for a wildcard.
+fn find_literal(name: &str) -> String {
+    let mut literal = String::with_capacity(name.len());
+    for c in name.chars() {
+        if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+            literal.push('\\');
         }
-        visited += 1;
-        let listed = tokio::select! {
-            _ = cancel.cancelled() => return Ok(false),
-            listed = list(sftp, &folder) => listed,
+        literal.push(c);
+    }
+    literal
+}
+/// What `find -iname` looks for. Whether it folds the case of a letter beyond ASCII depends on the
+/// locale of the server, so such a letter matches anything here and `search_with_find` checks the
+/// names itself.
+fn find_pattern(query: &str) -> String {
+    let parts: Vec<String> = query
+        .split(|c: char| !c.is_ascii() && (c.is_lowercase() || c.is_uppercase()))
+        .map(find_literal)
+        .collect();
+    format!("*{}*", parts.join("*"))
+}
+/// Each line tells why it is there, then what a row shows. The first `find` checks that `-printf`
+/// exists: BusyBox and BSD have none. `exec` lets a signal reach the second one.
+fn find_command(root: &str, query: &str, scope: &SearchScope) -> String {
+    const ROW: &str = r"\t%y\t%s\t%T@\t%m\t%p\0";
+    let root = shell_quote(root);
+    let pattern = shell_quote(&find_pattern(query));
+    // The kernel makes up what is in these, without end.
+    let mut leave_out = String::from("'(' -path /proc -o -path /sys -o -path /dev ')' -prune -o ");
+    if !scope.hidden {
+        leave_out.push_str("-name '.*' -prune -o ");
+    }
+    if !scope.skip.is_empty() {
+        let names: Vec<String> = scope
+            .skip
+            .iter()
+            .map(|name| format!("-name {}", shell_quote(&find_literal(name))))
+            .collect();
+        leave_out.push_str(&format!(
+            "-type d '(' {} ')' -prune -printf 's{ROW}' -o ",
+            names.join(" -o ")
+        ));
+    }
+    let check = format!(r"find -H {root} -maxdepth 0 -printf 'shcp-find\0'");
+    let search = format!("find -H {root} -mindepth 1 {leave_out}-iname {pattern} -printf 'm{ROW}'");
+    sh(&format!("{check} && exec {search}"))
+}
+/// Reads a line of `find`: whether it is a folder left out, and the row.
+fn find_line(line: &[u8]) -> Option<(bool, RemoteEntry)> {
+    let line = String::from_utf8_lossy(line);
+    let mut fields = line.splitn(6, '\t');
+    let left_out = fields.next()? == "s";
+    let kind = match fields.next()? {
+        "d" => EntryKind::Dir,
+        "f" => EntryKind::File,
+        "l" => EntryKind::Symlink,
+        _ => EntryKind::Other,
+    };
+    let size = fields.next()?.parse().ok()?;
+    let modified = fields
+        .next()?
+        .split('.')
+        .next()
+        .and_then(|seconds| seconds.parse().ok())
+        .and_then(|seconds| UNIX_EPOCH.checked_add(Duration::from_secs(seconds)));
+    let permissions = u32::from_str_radix(fields.next()?, 8).ok();
+    let path = fields.next()?.to_string();
+    let name = path.rsplit('/').next().filter(|name| !name.is_empty())?;
+    Some((
+        left_out,
+        RemoteEntry {
+            name: name.to_string(),
+            path: path.clone(),
+            kind,
+            size,
+            modified,
+            permissions,
+        },
+    ))
+}
+/// Searches with `find` on the server. `None`: it could not, and nothing was found yet.
+async fn search_with_find(
+    ssh: &Ssh,
+    root: &str,
+    query: &str,
+    scope: &SearchScope,
+    req: RequestId,
+    events: &async_channel::Sender<Event>,
+    cancel: &CancellationToken,
+) -> Option<SearchEnd> {
+    let mut channel = ssh.channel_open_session().await.ok()?;
+    channel
+        .exec(true, find_command(root, query, scope))
+        .await
+        .ok()?;
+    // An account limited to SFTP may be waiting for what comes in.
+    channel.eof().await.ok()?;
+    let mut pending = Vec::new();
+    let mut ready = false;
+    let (mut found, mut skipped, mut status) = (0, BTreeSet::new(), None);
+    let give_up = tokio::time::sleep(FIND_START);
+    tokio::pin!(give_up);
+    // Without a signal `find` would go on until it next has something to say.
+    let stop = async |channel: &russh::Channel<_>| {
+        let _ = channel.signal(russh::Sig::TERM).await;
+        let _ = channel.close().await;
+    };
+    loop {
+        let message = tokio::select! {
+            _ = cancel.cancelled() => {
+                stop(&channel).await;
+                return Some(SearchEnd { limited: false, skipped: skipped.into_iter().collect() });
+            }
+            _ = &mut give_up, if !ready => {
+                stop(&channel).await;
+                return None;
+            }
+            message = channel.wait() => message,
         };
+        match message {
+            Some(russh::ChannelMsg::Data { data }) => {
+                pending.extend_from_slice(&data);
+                if !ready {
+                    let at = pending
+                        .windows(FIND_READY.len())
+                        .position(|bytes| bytes == FIND_READY);
+                    let Some(at) = at else {
+                        if pending.len() > MAX_FIND_LINE {
+                            stop(&channel).await;
+                            return None;
+                        }
+                        continue;
+                    };
+                    // A login script may have said something first.
+                    pending.drain(..at + FIND_READY.len());
+                    ready = true;
+                }
+                let complete = pending.iter().rposition(|b| *b == 0).map_or(0, |at| at + 1);
+                let mut matches = Vec::new();
+                for line in pending[..complete].split(|b| *b == 0) {
+                    let Some((left_out, entry)) = find_line(line) else {
+                        continue;
+                    };
+                    if left_out {
+                        skipped.insert(entry.name.clone());
+                    }
+                    if found + matches.len() < MAX_SEARCH_RESULTS
+                        && entry.name.to_lowercase().contains(query)
+                    {
+                        matches.push(entry);
+                    }
+                }
+                pending.drain(..complete);
+                if !matches.is_empty() {
+                    found += matches.len();
+                    let _ = events.try_send(Event::SearchFound {
+                        req,
+                        entries: matches,
+                    });
+                }
+                if found >= MAX_SEARCH_RESULTS || pending.len() > MAX_FIND_LINE {
+                    stop(&channel).await;
+                    return Some(SearchEnd {
+                        limited: true,
+                        skipped: skipped.into_iter().collect(),
+                    });
+                }
+            }
+            Some(russh::ChannelMsg::ExitStatus { exit_status }) => status = Some(exit_status),
+            Some(russh::ChannelMsg::Failure) if !ready => return None,
+            Some(russh::ChannelMsg::Close) | None => break,
+            _ => {}
+        }
+    }
+    ready.then(|| SearchEnd {
+        // 1 is a folder it could not read. Anything else, or nothing: it did not get to the end.
+        limited: !matches!(status, Some(0 | 1)),
+        skipped: skipped.into_iter().collect(),
+    })
+}
+async fn search_over_sftp(
+    sftp: Arc<SftpSession>,
+    root: &str,
+    query: &str,
+    scope: &SearchScope,
+    req: RequestId,
+    events: &async_channel::Sender<Event>,
+    cancel: &CancellationToken,
+) -> Result<SearchEnd> {
+    let skip: HashSet<&str> = scope.skip.iter().map(String::as_str).collect();
+    let mut skipped = BTreeSet::new();
+    let mut folders = VecDeque::from([root.to_string()]);
+    let mut reading = JoinSet::new();
+    let (mut visited, mut found) = (0, 0);
+    loop {
+        while reading.len() < SEARCH_READS && visited < MAX_SEARCH_FOLDERS {
+            let Some(folder) = folders.pop_front() else {
+                break;
+            };
+            visited += 1;
+            let sftp = sftp.clone();
+            reading.spawn(async move {
+                let listed = list(&sftp, &folder).await;
+                (folder, listed)
+            });
+        }
+        // Reads left behind go on to the end, so that each closes its folder on the server.
+        let read = tokio::select! {
+            _ = cancel.cancelled() => {
+                reading.detach_all();
+                return Ok(SearchEnd { limited: false, skipped: skipped.into_iter().collect() });
+            }
+            read = reading.join_next() => read,
+        };
+        let Some(read) = read else {
+            return Ok(SearchEnd {
+                limited: !folders.is_empty(),
+                skipped: skipped.into_iter().collect(),
+            });
+        };
+        let (folder, listed) = read.context("Read a folder")?;
         let entries = match listed {
             Ok(entries) => entries,
             Err(error) if folder == root => return Err(error),
@@ -399,17 +635,24 @@ pub(crate) async fn search(
                 continue;
             }
         };
-        folders.extend(
-            entries
-                .iter()
-                .filter(|entry| entry.kind == EntryKind::Dir)
-                .map(|entry| entry.path.clone()),
-        );
-        let matches: Vec<RemoteEntry> = entries
+        let entries = entries
             .into_iter()
-            .filter(|entry| entry.name.to_lowercase().contains(&query))
-            .take(MAX_SEARCH_RESULTS - found)
-            .collect();
+            .filter(|entry| scope.hidden || !entry.name.starts_with('.'));
+        let mut matches = Vec::new();
+        for entry in entries {
+            if entry.kind == EntryKind::Dir {
+                if skip.contains(entry.name.as_str()) {
+                    skipped.insert(entry.name.clone());
+                } else {
+                    folders.push_back(entry.path.clone());
+                }
+            }
+            if matches.len() < MAX_SEARCH_RESULTS - found
+                && entry.name.to_lowercase().contains(query)
+            {
+                matches.push(entry);
+            }
+        }
         if !matches.is_empty() {
             found += matches.len();
             let _ = events.try_send(Event::SearchFound {
@@ -417,8 +660,14 @@ pub(crate) async fn search(
                 entries: matches,
             });
         }
+        if found >= MAX_SEARCH_RESULTS {
+            reading.detach_all();
+            return Ok(SearchEnd {
+                limited: true,
+                skipped: skipped.into_iter().collect(),
+            });
+        }
     }
-    Ok(false)
 }
 pub(crate) fn join(parent: &str, child: &str) -> String {
     if parent.ends_with('/') {
@@ -485,7 +734,46 @@ pub(crate) fn safe_name(name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::without_repeats;
+    use super::{find_line, find_literal, find_pattern, without_repeats};
+    use crate::EntryKind;
+
+    #[test]
+    fn wildcards_in_a_name_are_taken_as_they_are() {
+        assert_eq!(find_literal(r"a*b?[c]\d"), r"a\*b\?\[c\]\\d");
+    }
+
+    #[test]
+    fn a_letter_whose_case_may_not_fold_matches_anything() {
+        assert_eq!(find_pattern("report"), "*report*");
+        assert_eq!(find_pattern("caffè bar"), "*caff* bar*");
+        assert_eq!(find_pattern("日本語"), "*日本語*");
+    }
+
+    #[test]
+    fn a_line_of_find_becomes_a_row() {
+        let line = b"s\td\t4096\t1700000000.5\t755\t/srv/app/node_modules";
+        let (left_out, entry) = find_line(line).unwrap();
+        assert!(left_out);
+        assert_eq!(entry.name, "node_modules");
+        assert_eq!(entry.path, "/srv/app/node_modules");
+        assert_eq!(entry.kind, EntryKind::Dir);
+        assert_eq!(entry.size, 4096);
+        assert_eq!(entry.permissions, Some(0o755));
+        assert!(entry.modified.is_some());
+    }
+
+    #[test]
+    fn a_tab_in_a_path_stays_in_the_path() {
+        let (left_out, entry) = find_line(b"m\tf\t1\t1\t644\t/srv/a\tb").unwrap();
+        assert!(!left_out);
+        assert_eq!(entry.name, "a\tb");
+    }
+
+    #[test]
+    fn what_is_no_line_of_find_is_left_out() {
+        assert!(find_line(b"").is_none());
+        assert!(find_line(b"Welcome to the server").is_none());
+    }
 
     #[test]
     fn a_message_repeated_in_a_row_is_said_once() {
