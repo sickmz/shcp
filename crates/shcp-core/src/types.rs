@@ -433,12 +433,18 @@ pub struct Persistence {
     /// It should be there already: if it is gone, it was closed and comes to an end here too.
     pub known: bool,
 }
-/// A tab as the PCs on a host share it. Which one is active, and what else it shows, stays with
-/// each PC.
+/// A tab as the PCs on a host share it. Which one is active, and the folder its files are at, stay
+/// with each PC.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SharedTab {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The files show next to the terminals.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub files: bool,
+    /// With the files showing, the share of the terminals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_ratio: Option<f32>,
     pub layout: SavedPane,
 }
 /// The tabs of a host, kept on the server for all the PCs using it.

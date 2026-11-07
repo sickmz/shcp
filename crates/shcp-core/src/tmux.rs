@@ -955,6 +955,8 @@ mod tests {
             writer: "pc".into(),
             tabs: vec![crate::SharedTab {
                 name: Some("logs è".into()),
+                files: true,
+                files_ratio: Some(0.4),
                 layout: crate::SavedPane::Split {
                     axis: crate::SplitAxis::Row,
                     ratio: 0.3,

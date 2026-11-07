@@ -329,8 +329,11 @@ impl Workspace {
             .filter(|tab| tab.host == *host)
             .filter_map(|tab| {
                 let layout = tab.panes.read(cx).saved(cx).retain_keys(&|_| true)?;
+                let files = tab.face.shows_files();
                 Some(SharedTab {
                     name: tab.name.clone(),
+                    files,
+                    files_ratio: files.then_some(tab.both_ratio),
                     layout,
                 })
             })
@@ -345,6 +348,9 @@ impl Workspace {
     /// Tells the other PCs on each host what changed here. It is written as long as the app has
     /// something to say: the first terminal of a host that gets there takes it along.
     fn publish_shared(&mut self, cx: &mut Context<Self>) {
+        if self.resizing_both {
+            return;
+        }
         self.shared
             .retain(|host, _| self.tabs.iter().any(|tab| tab.host == *host));
         let mut hosts: Vec<HostId> = Vec::new();
@@ -401,8 +407,8 @@ impl Workspace {
                 .filter_map(|tab| {
                     let layout = tab.layout.retain_keys(&|key| live.contains(key))?;
                     Some(SharedTab {
-                        name: tab.name.clone(),
                         layout,
+                        ..tab.clone()
                     })
                 })
                 .collect();
@@ -430,6 +436,8 @@ impl Workspace {
         for key in lost {
             shared.tabs.push(SharedTab {
                 name: None,
+                files: false,
+                files_ratio: None,
                 layout: SavedPane::Terminal {
                     key: Some(key.clone()),
                 },
@@ -451,11 +459,12 @@ impl Workspace {
         if tabs.writer == self.writer || !self.state.read(cx).keeps_terminals(host) {
             return;
         }
-        let dragging = self
-            .tabs
-            .iter()
-            .filter(|tab| tab.host == *host)
-            .any(|tab| tab.panes.read(cx).is_dragging());
+        let dragging = self.resizing_both
+            || self
+                .tabs
+                .iter()
+                .filter(|tab| tab.host == *host)
+                .any(|tab| tab.panes.read(cx).is_dragging());
         if dragging {
             self.pending_shared.insert(host.clone(), tabs.clone());
             return;
@@ -504,6 +513,7 @@ impl Workspace {
                     panes.update(cx, |panes, cx| {
                         panes.apply_layout(&remote.layout, gone, window, cx)
                     });
+                    self.apply_shared_face(index, remote, window, cx);
                 }
                 None => {
                     self.open_terminal_with(host.clone(), &remote.layout, false, window, cx);
@@ -511,6 +521,7 @@ impl Workspace {
                         tab.name.clone_from(&remote.name);
                         matched.push(tab.id);
                     }
+                    self.apply_shared_face(self.tabs.len() - 1, remote, window, cx);
                 }
             }
         }
@@ -536,6 +547,27 @@ impl Workspace {
             self.activate(index, window, cx);
         }
         cx.notify();
+    }
+
+    /// Shows a tab the way another PC does: with its files or not, and how much room they take.
+    fn apply_shared_face(
+        &mut self,
+        index: usize,
+        remote: &SharedTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let face = if remote.files {
+            Face::Files
+        } else {
+            Face::Terminal
+        };
+        if self.tabs[index].face != face {
+            self.set_face(index, face, window, cx);
+        }
+        if let Some(ratio) = remote.files_ratio.filter(|ratio| ratio.is_finite()) {
+            self.tabs[index].both_ratio = ratio.clamp(MIN_BOTH_RATIO, 1. - MIN_BOTH_RATIO);
+        }
     }
 
     /// A terminal was closed on another PC, or its shell is not on the server any more.
@@ -2492,7 +2524,8 @@ impl Render for Workspace {
             self.save_tabs(cx);
         }
         self.publish_shared(cx);
-        let dragging = self.tabs.iter().any(|tab| tab.panes.read(cx).is_dragging());
+        let dragging =
+            self.resizing_both || self.tabs.iter().any(|tab| tab.panes.read(cx).is_dragging());
         if !dragging && !self.pending_shared.is_empty() {
             cx.defer_in(window, |this, window, cx| {
                 this.apply_pending_shared(window, cx)
