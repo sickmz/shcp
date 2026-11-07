@@ -108,6 +108,9 @@ pub(crate) async fn report_keeping(ctx: Arc<Context>, ssh: Arc<Ssh>) {
     let says = |word: &str| output.lines().any(|line| line == word);
     let alias = &ctx.host.alias;
     if says(TMUX_USABLE) {
+        ctx.emit(Event::TmuxFound {
+            host: ctx.host.id.clone(),
+        });
         ctx.notice(
             NoticeLevel::Info,
             format!("New terminals on {alias} keep running when shcp closes"),
@@ -774,6 +777,9 @@ pub(crate) async fn run(
     let Some(info) = info.0.then(|| PaneInfo::parse(&info.1)).flatten() else {
         return Ok(Outcome::Unavailable);
     };
+    ctx.emit(Event::TmuxFound {
+        host: ctx.host.id.clone(),
+    });
     terminal.set_managed(true);
     // What tmux decided, which another PC may have a say in.
     terminal.fit(info.width, info.height);

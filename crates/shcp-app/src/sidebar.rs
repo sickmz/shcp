@@ -15,9 +15,9 @@ use crate::widgets::progress::ProgressRing;
 use crate::widgets::tooltip::tooltip;
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, Div, DragMoveEvent, Entity,
-    EventEmitter, FocusHandle, Focusable, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Pixels,
-    Point, SharedString, Stateful, Subscription, Window, WindowControlArea, div, px,
+    AnyElement, App, Bounds, ClickEvent, Context, Div, DragMoveEvent, Entity, EventEmitter,
+    FocusHandle, Focusable, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point,
+    SharedString, Stateful, Subscription, Window, WindowControlArea, div, px,
 };
 use shcp_core::{HostConfig, HostId, HostSource, SessionState};
 use std::collections::HashMap;
@@ -27,14 +27,11 @@ pub enum SidebarEvent {
     OpenTerminal(HostId),
     OpenFiles(HostId),
     Disconnect(HostId),
-    EditHost(HostId),
+    HostSettings(HostId),
     DuplicateHost(HostId),
-    CustomizeHost(HostId),
-    EditCommands(HostId),
     NewGroup(HostId),
     RenameGroup(String),
     Connect(HostId),
-    SetUpKey(HostId),
     NewHost,
     OpenSettings,
     HideSidebar,
@@ -674,7 +671,6 @@ impl Sidebar {
             handler(this.clone(), move |_, _, cx| cx.emit(event(id.clone())))
         };
         let id = host.id.clone();
-        let target = format!("{}@{}", host.user, host.hostname);
         let mut entries = vec![
             MenuEntry::item(
                 "Open terminal",
@@ -692,15 +688,6 @@ impl Sidebar {
                     .icon(IconName::Power),
             );
         }
-        entries.push(
-            MenuEntry::item(
-                "Copy user@host",
-                Rc::new(move |_, cx: &mut App| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(target.clone()))
-                }),
-            )
-            .icon(IconName::Copy),
-        );
         let hidden = state.is_host_hidden(&host.id);
         let hide_id = host.id.clone();
         entries.push(
@@ -762,61 +749,14 @@ impl Sidebar {
                 .icon(IconName::FolderPlus),
         );
         entries.push(MenuEntry::submenu("Move to", places).icon(IconName::Folder));
-        entries.push(MenuEntry::Separator);
-        entries.push(
-            MenuEntry::item("Commands", emit(SidebarEvent::EditCommands, id.clone()))
-                .icon(IconName::Play),
-        );
-        entries.push(
-            MenuEntry::item("Customize", emit(SidebarEvent::CustomizeHost, id.clone()))
-                .icon(IconName::Palette),
-        );
-        let logging = state.logs_sessions(&host.id);
-        let log_id = host.id.clone();
-        entries.push(
-            MenuEntry::item(
-                if logging {
-                    "Stop logging terminals to a file"
-                } else {
-                    "Log terminals to a file"
-                },
-                handler(this.clone(), move |view, _, cx| {
-                    view.state
-                        .update(cx, |state, cx| state.toggle_session_log(&log_id, cx));
-                }),
-            )
-            .icon(IconName::File),
-        );
-        let keeping = state.keeps_terminals(&host.id);
-        let keep_id = host.id.clone();
-        entries.push(
-            MenuEntry::item(
-                if keeping {
-                    "Don't keep terminals via tmux"
-                } else {
-                    "Keep terminals via tmux"
-                },
-                handler(this.clone(), move |view, _, cx| {
-                    view.state
-                        .update(cx, |state, cx| state.toggle_keep_terminals(&keep_id, cx));
-                }),
-            )
-            .icon(IconName::Terminal),
-        );
-        entries.push(
-            MenuEntry::item("Set up key login", emit(SidebarEvent::SetUpKey, id.clone()))
-                .icon(IconName::Lock),
-        );
         entries.push(
             MenuEntry::item("Duplicate", emit(SidebarEvent::DuplicateHost, id.clone()))
                 .icon(IconName::Copy),
         );
-        if host.source == HostSource::App {
-            entries.push(
-                MenuEntry::item("Edit host", emit(SidebarEvent::EditHost, id))
-                    .icon(IconName::Pencil),
-            );
-        }
+        entries.push(
+            MenuEntry::item("Host settings", emit(SidebarEvent::HostSettings, id))
+                .icon(IconName::Settings),
+        );
         if active {
             entries.push(MenuEntry::Separator);
             entries.push(

@@ -6,9 +6,9 @@ use crate::login_prompt::{LoginAsk, LoginPrompt};
 use crate::modals::{
     ModalLayer,
     confirm::ConfirmModal,
-    host_appearance::HostAppearanceModal,
     host_commands::HostCommandsModal,
     host_editor::{ConnectHandler, HostEditor},
+    host_settings::{HostPage, HostSettingsModal},
     key_setup::KeySetupModal,
     login::LoginModal,
     palette::{CommandPalette, PaletteItem},
@@ -712,15 +712,8 @@ impl Workspace {
             SidebarEvent::OpenTerminal(host) => self.open_terminal(host.clone(), window, cx),
             SidebarEvent::OpenFiles(host) => self.open_files(host.clone(), window, cx),
             SidebarEvent::Disconnect(host) => self.state.update(cx, |s, _| s.disconnect_host(host)),
-            SidebarEvent::EditHost(host) => self.edit_host(host, window, cx),
+            SidebarEvent::HostSettings(host) => self.host_settings(host, window, cx),
             SidebarEvent::DuplicateHost(host) => self.duplicate_host(host, window, cx),
-            SidebarEvent::CustomizeHost(host) => {
-                let state = self.state.clone();
-                let host = host.clone();
-                let modal = cx.new(|cx| HostAppearanceModal::new(state, host, cx));
-                self.modals.update(cx, |m, cx| m.show(modal, window, cx));
-            }
-            SidebarEvent::EditCommands(host) => self.edit_commands(host, window, cx),
             SidebarEvent::NewGroup(host) => {
                 let state = self.state.clone();
                 let host = host.clone();
@@ -764,7 +757,6 @@ impl Workspace {
                     s.connect_host(host, cx);
                 });
             }
-            SidebarEvent::SetUpKey(host) => self.set_up_key(host, window, cx),
             SidebarEvent::NewHost => self.new_host(window, cx),
             SidebarEvent::OpenSettings => self.open_settings(window, cx),
             SidebarEvent::HideSidebar => {
@@ -1468,7 +1460,33 @@ impl Workspace {
 
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let state = self.state.clone();
-        let modal = cx.new(|cx| SettingsModal::new(state, window, cx));
+        let workspace = cx.entity().downgrade();
+        let open_host = std::rc::Rc::new(move |host: HostId, window: &mut Window, cx: &mut App| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.host_settings(&host, window, cx)
+                })
+                .ok();
+        });
+        let modal = cx.new(|cx| SettingsModal::new(state, open_host, window, cx));
+        self.modals.update(cx, |m, cx| m.show(modal, window, cx));
+    }
+
+    /// All that belongs to a host, from its menu or from the settings.
+    fn host_settings(&mut self, host: &HostId, window: &mut Window, cx: &mut Context<Self>) {
+        let (state, host) = (self.state.clone(), host.clone());
+        let workspace = cx.entity().downgrade();
+        let target = host.clone();
+        let open = std::rc::Rc::new(move |page: HostPage, window: &mut Window, cx: &mut App| {
+            workspace
+                .update(cx, |workspace, cx| match page {
+                    HostPage::Connection => workspace.edit_host(&target, window, cx),
+                    HostPage::KeyLogin => workspace.set_up_key(&target, window, cx),
+                    HostPage::Commands => workspace.edit_commands(&target, window, cx),
+                })
+                .ok();
+        });
+        let modal = cx.new(|cx| HostSettingsModal::new(state, host, open, cx));
         self.modals.update(cx, |m, cx| m.show(modal, window, cx));
     }
 

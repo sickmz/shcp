@@ -96,6 +96,8 @@ pub struct AppState {
     next_notice: u64,
     /// The pointer is on a notice or the list is open, so none goes by itself.
     pub notices_held: Rc<Cell<bool>>,
+    /// What the servers said in this run about having a tmux that can keep terminals.
+    tmux_hosts: HashMap<HostId, bool>,
     pub update: UpdateStatus,
     login_prompts: HashMap<HostId, Entity<LoginPrompt>>,
     /// Hosts being reconnected automatically, with the attempt under way or coming next.
@@ -141,6 +143,7 @@ impl AppState {
             notices: Vec::new(),
             next_notice: 1,
             notices_held: Rc::default(),
+            tmux_hosts: HashMap::new(),
             update: UpdateStatus::Idle,
             login_prompts: HashMap::new(),
             reconnecting: HashMap::new(),
@@ -764,6 +767,11 @@ impl AppState {
         self.settings.keeps_terminals(&host.0)
     }
 
+    /// Whether the server has a tmux that can keep terminals, once it has said so in this run.
+    pub fn has_tmux(&self, host: &HostId) -> Option<bool> {
+        self.tmux_hosts.get(host).copied()
+    }
+
     /// Whether new terminals of a host stay on the server, or end with the connection.
     pub fn toggle_keep_terminals(&mut self, host: &HostId, cx: &mut Context<Self>) {
         let keep = self.settings.plain_terminal_hosts.remove(&host.0);
@@ -977,7 +985,11 @@ impl AppState {
             Event::Notice { level, message } => self.push_notice(*level, message.clone(), cx),
             // The option goes back off: it never worked, and the server would say so at every
             // connection. Installing tmux, the user can ask for it again.
+            Event::TmuxFound { host } => {
+                self.tmux_hosts.insert(host.clone(), true);
+            }
             Event::TmuxMissing { host } => {
+                self.tmux_hosts.insert(host.clone(), false);
                 if self.settings.plain_terminal_hosts.insert(host.0.clone()) {
                     self.persist_settings(cx);
                     let alias = self.host(host).map_or(host.0.clone(), |h| h.alias.clone());
@@ -985,7 +997,8 @@ impl AppState {
                         NoticeLevel::Important,
                         format!(
                             "Terminals on {alias} end when shcp closes: the server needs tmux \
-                             3.2 or newer. Install it, then choose Keep terminals via tmux"
+                             3.2 or newer. Install it, then turn on Keep terminals via tmux in the \
+                             settings of the host"
                         ),
                         cx,
                     );

@@ -4,6 +4,7 @@ pub mod folder_picker;
 pub mod host_appearance;
 pub mod host_commands;
 pub mod host_editor;
+pub mod host_settings;
 pub mod key_setup;
 pub mod login;
 pub mod palette;

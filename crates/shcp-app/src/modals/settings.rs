@@ -16,7 +16,7 @@ use gpui::{
     KeyDownEvent, PathPromptOptions, SharedString, Subscription, Task, Window, anchored, deferred,
     div, img, px, relative,
 };
-use shcp_core::{Accent, CursorStyle, Density, KnownHost, NoticeLevel, Settings};
+use shcp_core::{Accent, CursorStyle, Density, HostId, KnownHost, NoticeLevel, Settings};
 use std::{path::PathBuf, rc::Rc, time::Duration};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -27,6 +27,7 @@ enum Page {
     IconThemeBrowser,
     /// Reached from Connections, likewise.
     KnownHosts,
+    Hosts,
     Terminal,
     Connections,
     Forwarding,
@@ -43,8 +44,9 @@ enum Dropdown {
     IconTheme,
 }
 
-const PAGES: [(Page, &str, IconName); 6] = [
+const PAGES: [(Page, &str, IconName); 7] = [
     (Page::Appearance, "Appearance", IconName::Palette),
+    (Page::Hosts, "Hosts", IconName::Settings),
     (Page::Terminal, "Terminal", IconName::Terminal),
     (Page::Connections, "Connections", IconName::Plug),
     (Page::Forwarding, "Port forwarding", IconName::Forward),
@@ -68,10 +70,13 @@ const FIXED_SHORTCUTS: [(&str, &str); 8] = [
 ];
 
 /// Applies one value of a setting (from a click) to the settings and saves them.
-type Setter<T> = Rc<dyn Fn(T, &mut Window, &mut App)>;
+pub(super) type Setter<T> = Rc<dyn Fn(T, &mut Window, &mut App)>;
+/// Opens the settings of a host. Only one modal shows at a time, so this one closes first.
+pub type OpenHostSettings = Rc<dyn Fn(HostId, &mut Window, &mut App)>;
 
 pub struct SettingsModal {
     state: Entity<AppState>,
+    open_host: OpenHostSettings,
     page: Page,
     search: Entity<TextInput>,
     editor: Entity<TextInput>,
@@ -104,7 +109,12 @@ impl Focusable for SettingsModal {
 }
 
 impl SettingsModal {
-    pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        state: Entity<AppState>,
+        open_host: OpenHostSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let search = cx.new(|cx| TextInput::new("Search settings", false, cx));
         let installed_fonts = cx.text_system().all_font_names();
         let editor_path = state.read(cx).settings.editor.clone();
@@ -161,6 +171,7 @@ impl SettingsModal {
             ];
         Self {
             state,
+            open_host,
             page: Page::Appearance,
             search,
             editor,
@@ -813,9 +824,9 @@ pub(super) fn section(theme: &Theme, label: &'static str) -> AnyElement {
         .into_any_element()
 }
 
-fn row(
+pub(super) fn row(
     theme: &Theme,
-    label: &'static str,
+    label: impl Into<SharedString>,
     help: Option<SharedString>,
     control: impl IntoElement,
 ) -> AnyElement {
@@ -833,7 +844,7 @@ fn row(
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .child(div().text_color(theme.text).child(label))
+                .child(div().text_color(theme.text).child(label.into()))
                 .children(help.map(|h| {
                     div()
                         .text_size(ui_px(12.))
@@ -845,7 +856,7 @@ fn row(
         .into_any_element()
 }
 
-fn switch(theme: &Theme, id: &'static str, on: bool, set: Setter<bool>) -> AnyElement {
+pub(super) fn switch(theme: &Theme, id: &'static str, on: bool, set: Setter<bool>) -> AnyElement {
     let track = if on { theme.accent } else { theme.border };
     let knob = if on {
         theme.on_primary
@@ -1090,8 +1101,44 @@ fn theme_dots(ui: &Theme, item: &Theme) -> impl IntoElement + use<> {
 }
 
 impl SettingsModal {
+    /// A row for each host, which opens its settings. Their names are not known in advance.
+    fn host_rows(&self, query: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let theme = cx.theme().clone();
+        let hosts = self.state.read(cx).hosts.clone();
+        hosts
+            .into_iter()
+            .filter(|host| {
+                query.is_empty()
+                    || host.alias.to_lowercase().contains(query)
+                    || host.hostname.to_lowercase().contains(query)
+            })
+            .enumerate()
+            .map(|(index, host)| {
+                let help =
+                    shcp_core::address_text(Some(&host.user), &host.hostname, Some(host.port));
+                let id = host.id;
+                row(
+                    &theme,
+                    host.alias,
+                    Some(help.into()),
+                    Button::new(("host-open-settings", index))
+                        .keyboard_focus()
+                        .label("Settings")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.close(cx);
+                            let open = this.open_host.clone();
+                            open(id.clone(), window, cx);
+                        })),
+                )
+            })
+            .collect()
+    }
+
     /// Rows of one page, keeping those that match the lowercase `query`.
     fn page_rows(&self, page: Page, query: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        if page == Page::Hosts {
+            return self.host_rows(query, cx);
+        }
         let theme = cx.theme().clone();
         let settings = self.state.read(cx).settings.clone();
         let shown = |label: &str, help: &str| {
@@ -1448,7 +1495,11 @@ impl SettingsModal {
                     );
                 }
             }
-            Page::ThemeBrowser | Page::IconThemeBrowser | Page::KnownHosts | Page::About => {}
+            Page::Hosts
+            | Page::ThemeBrowser
+            | Page::IconThemeBrowser
+            | Page::KnownHosts
+            | Page::About => {}
         }
         rows
     }

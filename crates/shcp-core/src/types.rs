@@ -654,6 +654,10 @@ pub enum Event {
         host: HostId,
         tabs: SharedTabs,
     },
+    /// The server has a tmux that can keep terminals running.
+    TmuxFound {
+        host: HostId,
+    },
     /// The server said it has no tmux that can keep terminals running.
     TmuxMissing {
         host: HostId,

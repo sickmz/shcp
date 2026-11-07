@@ -75,6 +75,11 @@ pub struct Theme {
 }
 
 impl Theme {
+    /// This theme draws hosts in their colors. With the Mono accent they are all gray.
+    pub fn shows_host_colors(&self) -> bool {
+        self.lit_c > 0.
+    }
+
     /// The color of a host, at the lightness this theme draws accents at.
     pub fn host_color(&self, color: HostColor) -> Hsla {
         let chroma = if color == HostColor::Gray {

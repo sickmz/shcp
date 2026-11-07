@@ -1,19 +1,11 @@
-//! Picks the color of a host. A modal of its own too, because `HostEditor` never opens for the
-//! read-only `~/.ssh/config` hosts.
-use super::{button_row, card, title};
-use crate::state::AppState;
+//! Picks the color of a host, inside the modals that deal with hosts.
 use crate::theme::{ActiveTheme as _, ui_px};
-use crate::widgets::button::{Button, ButtonStyle};
 use crate::widgets::host_color::HostColor;
 use gpui::prelude::*;
-use gpui::{
-    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, KeyDownEvent,
-    Subscription, Window, div, px,
-};
-use shcp_core::{HostAppearance, HostId};
+use gpui::{Context, Window, div, px};
+use shcp_core::HostAppearance;
 
-/// The controls, for a modal to embed. It changes nothing by itself: the modal reads `appearance`
-/// when saving.
+/// The controls, for a modal to embed. It changes nothing by itself: the modal reads `appearance`.
 pub struct AppearancePicker {
     color: HostColor,
 }
@@ -43,6 +35,7 @@ impl AppearancePicker {
 impl Render for AppearancePicker {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (muted, ring) = (cx.theme().text_muted, cx.theme().text);
+        let shown = cx.theme().shows_host_colors();
         let colors: Vec<_> = HostColor::ALL
             .iter()
             .copied()
@@ -80,90 +73,14 @@ impl Render for AppearancePicker {
             .gap(px(8.))
             .child(div().text_size(ui_px(12.)).text_color(muted).child("Color"))
             .child(div().flex().flex_wrap().gap(px(8.)).children(colors))
+            // A color can still be picked: it shows as soon as the accent lets it.
+            .when(!shown, |this| {
+                this.child(
+                    div()
+                        .text_size(ui_px(12.))
+                        .text_color(muted)
+                        .child("The Mono accent shows every host in gray. The color you pick here appears with any other accent, under Appearance in the settings."),
+                )
+            })
     }
 }
-
-pub struct HostAppearanceModal {
-    state: Entity<AppState>,
-    host: HostId,
-    alias: String,
-    picker: Entity<AppearancePicker>,
-    focus: FocusHandle,
-    _subscription: Subscription,
-}
-
-impl EventEmitter<DismissEvent> for HostAppearanceModal {}
-
-impl Focusable for HostAppearanceModal {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus.clone()
-    }
-}
-
-impl HostAppearanceModal {
-    pub fn new(state: Entity<AppState>, host: HostId, cx: &mut Context<Self>) -> Self {
-        let (alias, appearance) = {
-            let state = state.read(cx);
-            let alias = state
-                .host(&host)
-                .map_or(host.0.clone(), |h| h.alias.clone());
-            (alias, state.host_appearance(&host))
-        };
-        let picker = cx.new(|_| AppearancePicker::new(&appearance));
-        let subscription = cx.observe(&picker, |_, _, cx| cx.notify());
-        Self {
-            state,
-            host,
-            alias,
-            picker,
-            focus: cx.focus_handle(),
-            _subscription: subscription,
-        }
-    }
-
-    fn save(&mut self, cx: &mut Context<Self>) {
-        let appearance = self.picker.read(cx).appearance();
-        self.state.update(cx, |state, cx| {
-            state.set_host_appearance(&self.host, appearance, cx);
-        });
-        cx.emit(DismissEvent);
-    }
-
-    fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        match event.keystroke.key.as_str() {
-            "escape" => cx.emit(DismissEvent),
-            "enter" => self.save(cx),
-            _ => return,
-        }
-        cx.stop_propagation();
-    }
-}
-
-impl Render for HostAppearanceModal {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        card(&theme, 420.)
-            .track_focus(&self.focus)
-            .on_key_down(cx.listener(Self::on_key_down))
-            .child(title(&theme, format!("Customize {}", self.alias)))
-            .child(self.picker.clone())
-            .child(
-                button_row()
-                    .child(
-                        Button::new("cancel")
-                            .keyboard_focus()
-                            .label("Cancel")
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
-                    )
-                    .child(
-                        Button::new("save")
-                            .keyboard_focus()
-                            .label("Save")
-                            .style(ButtonStyle::Primary)
-                            .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
-                    ),
-            )
-    }
-}
-
-impl super::ModalView for HostAppearanceModal {}
