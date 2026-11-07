@@ -2,6 +2,7 @@
 //! shapes the text, scrolls horizontally to keep the caret visible and paints the caret.
 mod ime;
 
+use super::button::{Button, ButtonStyle};
 use super::icon::{Icon, IconName};
 use crate::theme::ActiveTheme as _;
 use gpui::prelude::*;
@@ -39,6 +40,8 @@ pub struct TextInput {
     masked: bool,
     /// No box around it until it has the focus: for a field that sits in a toolbar.
     quiet: bool,
+    /// A button at the end takes the text away, while there is some.
+    clearable: bool,
     /// No box at all: it sits in something that is already one.
     bare: bool,
     /// A word before the text that says what it takes, for the field a dialog is about.
@@ -71,6 +74,7 @@ impl TextInput {
             caret_blink_from: (0, 0),
             masked,
             quiet: false,
+            clearable: false,
             bare: false,
             prompt: None,
             marked: None,
@@ -88,6 +92,11 @@ impl TextInput {
 
     pub fn quiet(mut self) -> Self {
         self.quiet = true;
+        self
+    }
+
+    pub fn clearable(mut self) -> Self {
+        self.clearable = true;
         self
     }
 
@@ -429,6 +438,28 @@ impl Render for TextInput {
                     )
             })
             .child(TextElement { input: cx.entity() })
+            .when(self.clearable && !self.text.is_empty(), |this| {
+                this.child(
+                    div()
+                        .flex_none()
+                        // Into the padding, which is as much room as a button this size needs.
+                        .mr(px(-6.))
+                        // The press is not one in the text: it would move the caret.
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            Button::new("text-input-clear")
+                                .icon(IconName::Close)
+                                .tooltip("Clear (Esc)")
+                                .style(ButtonStyle::Ghost)
+                                .compact()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.set_text("", cx);
+                                    this.focus(window);
+                                    cx.emit(TextInputEvent::Changed);
+                                })),
+                        ),
+                )
+            })
     }
 }
 

@@ -275,7 +275,11 @@ impl FilesView {
         cx: &mut Context<Self>,
     ) -> Self {
         let session = state.update(cx, |s, cx| s.connect_host(&host, cx));
-        let filter_input = cx.new(|cx| TextInput::new("Filter this folder", false, cx).quiet());
+        let filter_input = cx.new(|cx| {
+            TextInput::new("Filter this folder", false, cx)
+                .quiet()
+                .clearable()
+        });
         let filter_focus = filter_input.focus_handle(cx);
         let show_hidden = state.read(cx).settings.show_hidden_files;
         let details_open = state.read(cx).settings.show_file_details;
@@ -1998,7 +2002,7 @@ impl FilesView {
             .gap(px(1.))
             .child(
                 div()
-                    .w(px(150.))
+                    .w(px(220.))
                     .mr(px(4.))
                     .flex_none()
                     .child(self.filter_input.clone()),
