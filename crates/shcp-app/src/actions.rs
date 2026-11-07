@@ -160,7 +160,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
     ),
     shortcut!(
         "cycle_face",
-        "Terminal, files or both",
+        "Terminal, or terminal and files",
         CycleFace,
         &[("ctrl-`", ANYWHERE)]
     ),

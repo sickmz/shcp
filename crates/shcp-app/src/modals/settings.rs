@@ -1276,6 +1276,29 @@ impl SettingsModal {
                         })
                         .into_any_element(),
                 );
+                let ssh_config = self.state.read(cx).engine.paths().ssh_config;
+                let state = self.state.clone();
+                add(
+                    "SSH config",
+                    "Hosts also come from ~/.ssh/config. Reload reads it again after you change it",
+                    div()
+                        .flex()
+                        .flex_none()
+                        .gap(px(6.))
+                        .child(
+                            Button::new("open-ssh-config")
+                                .label("Open")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_path(ssh_config.clone(), cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("reload-ssh-config")
+                                .label("Reload")
+                                .on_click(move |_, _, cx| state.read(cx).engine.reload_hosts()),
+                        )
+                        .into_any_element(),
+                );
                 add(
                     "Trusted servers",
                     "The server keys saved in known_hosts. Remove one whose key changed",
@@ -1743,12 +1766,6 @@ impl SettingsModal {
                     .flex()
                     .flex_wrap()
                     .gap(px(6.))
-                    .child(open(
-                        "open-ssh-config",
-                        IconName::Pencil,
-                        "Edit ~/.ssh/config",
-                        paths.ssh_config.clone(),
-                    ))
                     .child(open(
                         "open-config",
                         IconName::Folder,

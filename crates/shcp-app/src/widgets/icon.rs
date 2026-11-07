@@ -11,13 +11,6 @@ macro_rules! icons {
         pub enum IconName { $($variant),* }
         impl IconName {
             pub const ALL: &'static [IconName] = &[$(IconName::$variant),*];
-            /// The name saved in the settings: keep it stable.
-            pub fn slug(self) -> &'static str {
-                match self { $(IconName::$variant => $file),* }
-            }
-            pub fn from_slug(slug: &str) -> Option<Self> {
-                Self::ALL.iter().copied().find(|icon| icon.slug() == slug)
-            }
             pub fn path(self) -> &'static str {
                 match self { $(IconName::$variant => concat!("icons/", $file, ".svg")),* }
             }
@@ -100,33 +93,6 @@ icons! {
     Sun => "sun",
     Moon => "moon",
 }
-
-/// The icons a host can be given.
-pub const HOST_ICONS: &[IconName] = &[
-    IconName::Server,
-    IconName::Database,
-    IconName::Cloud,
-    IconName::Globe,
-    IconName::Shield,
-    IconName::Lock,
-    IconName::Container,
-    IconName::Cpu,
-    IconName::Router,
-    IconName::Network,
-    IconName::HardDrive,
-    IconName::Archive,
-    IconName::Flask,
-    IconName::GitBranch,
-    IconName::Monitor,
-    IconName::Terminal,
-    IconName::Home,
-    IconName::Folder,
-    IconName::Briefcase,
-    IconName::Wrench,
-    IconName::Mail,
-    IconName::Zap,
-    IconName::Star,
-];
 
 #[derive(IntoElement)]
 pub struct Icon {

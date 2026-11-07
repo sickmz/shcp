@@ -1,7 +1,7 @@
 //! Command palette: type to filter hosts, open tabs and commands, Enter runs the selected one.
 use crate::theme::{ActiveTheme as _, ui_px};
 use crate::widgets::context_menu::Handler;
-use crate::widgets::host_tile::{HostColor, HostLook, HostTile, TileState};
+use crate::widgets::host_color::{HostColor, color_dot};
 use crate::widgets::icon::{Icon, IconName};
 use crate::widgets::text_input::{TextInput, TextInputEvent};
 use gpui::prelude::*;
@@ -16,8 +16,8 @@ pub struct PaletteItem {
     pub title: SharedString,
     pub detail: Option<SharedString>,
     pub icon: IconName,
-    /// The host's tile, shown instead of the icon on a host.
-    pub tile: Option<(HostLook, TileState)>,
+    /// Instead of the icon on a host: its color, and whether it is connected.
+    pub dot: Option<(HostColor, bool)>,
     /// The icon in the color of the host it belongs to.
     pub tint: Option<HostColor>,
     pub shortcut: Option<&'static str>,
@@ -203,13 +203,12 @@ impl Render for CommandPalette {
                         }),
                     )
                     .child(
-                        // As wide as a tile, so titles line up with or without one.
+                        // As wide for all, so titles line up.
                         div().w(px(22.)).flex().flex_none().justify_center().child(
-                            match &item.tile {
-                                Some((look, state)) => HostTile::new(look.clone())
-                                    .small()
-                                    .state(*state)
-                                    .into_any_element(),
+                            match item.dot {
+                                Some((color, connected)) => {
+                                    color_dot(theme.host_color(color), connected).into_any_element()
+                                }
                                 None => Icon::new(item.icon).color(icon_color).into_any_element(),
                             },
                         ),

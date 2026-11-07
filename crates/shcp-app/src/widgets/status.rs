@@ -24,24 +24,6 @@ pub fn status_dot(theme: &Theme, state: Option<&SessionState>) -> AnyElement {
     }
 }
 
-/// The tag that travels with a host: PROD, STAGING.
-pub fn env_tag(text: &'static str, color: Hsla) -> Div {
-    div()
-        .h(px(16.))
-        .px(px(5.))
-        .flex()
-        .flex_none()
-        .items_center()
-        .rounded(px(4.))
-        .border_1()
-        .border_color(Hsla { a: 0.42, ..color })
-        .font_family(crate::theme::mono_font())
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_size(px(9.5))
-        .text_color(color)
-        .child(text)
-}
-
 pub fn badge(text: impl Into<SharedString>, color: Hsla) -> Div {
     div()
         .h(px(18.))

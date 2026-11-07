@@ -4,9 +4,9 @@ ssh and sftp client for Windows written in Rust with [gpui](https://gpui.rs).
 
 ![A terminal and the files of its folder side by side, with hosts grouped in the sidebar](docs/both.png)
 
-- Terminal and SFTP browser, separately or side by side
+- Terminal, alone or next to its SFTP browser
 - Tabs and split terminals share one SSH connection per host. Tabs reopen when you start the app again
-- Group and reorder hosts in the sidebar, with tags for production and staging
+- Group and reorder hosts in the sidebar
 - Search terminal output, open links with Ctrl+click, and save session logs
 - Automatic reconnection without losing terminal output, and resumable file transfers
 - Preview files, change permissions, and edit remote files in your local editor

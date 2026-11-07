@@ -27,13 +27,12 @@ use crate::title_bar::{self, WindowControls};
 use crate::transfers_panel::{DockTab, TransfersEvent, TransfersPanel};
 use crate::widgets::button::{Button, ButtonStyle};
 use crate::widgets::context_menu::{ContextMenu, OpenMenu, handler};
-use crate::widgets::host_tile::TileState;
 use crate::widgets::icon::Icon;
 use crate::widgets::icon::IconName;
 use crate::widgets::pill::SlidingPill;
 use crate::widgets::progress::ProgressRing;
 use crate::widgets::segmented::{groove, segment};
-use crate::widgets::status::{env_tag, status_dot};
+use crate::widgets::status::status_dot;
 use crate::widgets::tooltip::tooltip;
 use gpui::prelude::*;
 use gpui::{
@@ -251,7 +250,7 @@ impl Workspace {
                 } if known(host, self, cx) => {
                     self.open_terminal_with(HostId(host.clone()), layout, window, cx);
                     if *both && let Some(index) = self.active {
-                        self.set_face(index, Face::Both, window, cx);
+                        self.set_face(index, Face::Files, window, cx);
                         if let Some(ratio) = ratio.filter(|ratio| ratio.is_finite()) {
                             self.tabs[index].both_ratio =
                                 ratio.clamp(MIN_BOTH_RATIO, 1. - MIN_BOTH_RATIO);
@@ -286,18 +285,12 @@ impl Workspace {
             tabs: self
                 .tabs
                 .iter()
-                .map(|tab| match (&tab.panes, tab.face) {
-                    (Some(panes), Face::Terminal | Face::Both) => SavedTab::Terminal {
-                        host: tab.host.0.clone(),
-                        layout: panes.read(cx).saved(),
-                        both: tab.face == Face::Both,
-                        ratio: (tab.face == Face::Both).then_some(tab.both_ratio),
-                        name: tab.name.clone(),
-                    },
-                    _ => SavedTab::Files {
-                        host: tab.host.0.clone(),
-                        name: tab.name.clone(),
-                    },
+                .map(|tab| SavedTab::Terminal {
+                    host: tab.host.0.clone(),
+                    layout: tab.panes.read(cx).saved(),
+                    both: tab.face.shows_files(),
+                    ratio: tab.face.shows_files().then_some(tab.both_ratio),
+                    name: tab.name.clone(),
                 })
                 .collect(),
         }
@@ -429,7 +422,7 @@ impl Workspace {
             SidebarEvent::CustomizeHost(host) => {
                 let state = self.state.clone();
                 let host = host.clone();
-                let modal = cx.new(|cx| HostAppearanceModal::new(state, host, window, cx));
+                let modal = cx.new(|cx| HostAppearanceModal::new(state, host, cx));
                 self.modals.update(cx, |m, cx| m.show(modal, window, cx));
             }
             SidebarEvent::EditCommands(host) => self.edit_commands(host, window, cx),
@@ -477,10 +470,6 @@ impl Workspace {
                 });
             }
             SidebarEvent::SetUpKey(host) => self.set_up_key(host, window, cx),
-            SidebarEvent::OpenSshConfig => {
-                let path = self.state.read(cx).engine.paths().ssh_config;
-                cx.open_with_system(&path);
-            }
             SidebarEvent::NewHost => self.new_host(window, cx),
             SidebarEvent::OpenSettings => self.open_settings(window, cx),
             SidebarEvent::HideSidebar => {
@@ -750,29 +739,21 @@ impl Workspace {
         &mut self,
         host: HostId,
         label: String,
-        face: Face,
-        (panes, files): (Option<Entity<TerminalPanes>>, Option<Entity<FilesView>>),
+        panes: Entity<TerminalPanes>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
-        let mut observers = Vec::new();
-        if let Some(panes) = &panes {
-            observers.push(cx.observe(panes, |_, _, cx| cx.notify()));
-        }
-        // The tab names its folder, and the status bar counts what is in it.
-        if let Some(files) = &files {
-            observers.push(cx.observe(files, |_, _, cx| cx.notify()));
-        }
+        let observers = vec![cx.observe(&panes, |_, _, cx| cx.notify())];
         self.tabs.push(Tab {
             id,
             host,
             label,
             name: None,
-            face,
+            face: Face::Terminal,
             panes,
-            files,
+            files: None,
             linked: true,
             both_ratio: 0.5,
             followed: None,
@@ -810,9 +791,9 @@ impl Workspace {
         view
     }
 
-    /// Shows a tab's place another way. What it has not shown yet is made now, at the same folder.
-    /// A terminal that already exists is left alone: it may be running something, and a `cd` typed
-    /// into that would go to the program. The path in the location bar is there to send one.
+    /// Shows a tab's place another way. The files are made the first time, at the folder of the
+    /// terminal. The terminal is left alone: it may be running something, and a `cd` typed into
+    /// that would go to the program. The path in the location bar is there to send one.
     pub(crate) fn set_face(
         &mut self,
         index: usize,
@@ -825,21 +806,9 @@ impl Workspace {
         };
         let host = tab.host.clone();
         let previous = tab.face;
-        if face.shows_terminal() && tab.panes.is_none() {
-            let folder = tab.folder(cx);
-            let panes = self.new_panes(&host, &SavedPane::Terminal, window, cx);
-            if let Some(folder) = folder.filter(|folder| !folder.is_empty()) {
-                let command = format!("cd {}", shcp_core::shell_quote(&folder));
-                let terminal = panes.read(cx).active().clone();
-                terminal.update(cx, |terminal, cx| terminal.run_command(&command, cx));
-            }
-            let observer = cx.observe(&panes, |_, _, cx| cx.notify());
-            let tab = &mut self.tabs[index];
-            tab._observers.push(observer);
-            tab.panes = Some(panes);
-        }
         if face.shows_files() && self.tabs[index].files.is_none() {
             let files = self.new_files(&host, window, cx);
+            // The tab names its folder, and the status bar counts what is in it.
             let observer = cx.observe(&files, |_, _, cx| cx.notify());
             let tab = &mut self.tabs[index];
             tab._observers.push(observer);
@@ -848,8 +817,7 @@ impl Workspace {
         let tab = &mut self.tabs[index];
         tab.face = face;
         // From the terminal to the files: to where the terminal is.
-        let from_terminal = previous == Face::Terminal || (previous == Face::Both && tab.linked);
-        if face.shows_files() && from_terminal {
+        if face.shows_files() && previous == Face::Terminal {
             let folder = tab.terminal_folder(cx);
             tab.followed.clone_from(&folder);
             if let (Some(files), Some(folder)) = (tab.files.clone(), folder) {
@@ -869,8 +837,7 @@ impl Workspace {
         };
         let next = match self.tabs[index].face {
             Face::Terminal => Face::Files,
-            Face::Files => Face::Both,
-            Face::Both => Face::Terminal,
+            Face::Files => Face::Terminal,
         };
         self.set_face(index, next, window, cx);
     }
@@ -891,12 +858,12 @@ impl Workspace {
         }
     }
 
-    /// With both showing, the files go where the terminal goes.
+    /// The files go where the terminal goes.
     fn follow_terminal(&mut self, cx: &mut Context<Self>) {
         let Some(tab) = self.active.and_then(|index| self.tabs.get_mut(index)) else {
             return;
         };
-        if tab.face != Face::Both || !tab.linked {
+        if !tab.face.shows_files() || !tab.linked {
             return;
         }
         let folder = tab.terminal_folder(cx);
@@ -930,7 +897,7 @@ impl Workspace {
     ) {
         let label = self.alias(&host, cx);
         let panes = self.new_panes(&host, layout, window, cx);
-        self.push_tab(host, label, Face::Terminal, (Some(panes), None), window, cx);
+        self.push_tab(host, label, panes, window, cx);
     }
 
     /// "Browse this folder" in a terminal.
@@ -943,13 +910,10 @@ impl Workspace {
     ) {
         let PanesEvent::Browse = event;
         // Next to the terminal it was asked from.
-        let index = self
-            .tabs
-            .iter()
-            .position(|tab| tab.panes.as_ref() == Some(panes));
+        let index = self.tabs.iter().position(|tab| tab.panes == *panes);
         if let Some(index) = index {
             self.activate(index, window, cx);
-            self.set_face(index, Face::Both, window, cx);
+            self.set_face(index, Face::Files, window, cx);
         }
     }
 
@@ -1041,10 +1005,9 @@ impl Workspace {
         modals.update(cx, |m, cx| m.show(editor, window, cx));
     }
 
-    /// The terminals of the active tab, when it has some.
+    /// The terminals of the active tab, if there is one.
     fn active_panes(&self) -> Option<Entity<TerminalPanes>> {
-        let tab = self.tabs.get(self.active?)?;
-        tab.panes.clone().filter(|_| tab.face.shows_terminal())
+        Some(self.tabs.get(self.active?)?.panes.clone())
     }
 
     fn edit_commands(&mut self, host: &HostId, window: &mut Window, cx: &mut Context<Self>) {
@@ -1061,9 +1024,14 @@ impl Workspace {
         if let Some(index) = existing {
             return self.activate(index, window, cx);
         }
-        let label = self.alias(&host, cx);
-        let view = self.new_files(&host, window, cx);
-        self.push_tab(host, label, Face::Files, (None, Some(view)), window, cx);
+        self.open_terminal(host, window, cx);
+        if let Some(index) = self.active {
+            self.set_face(index, Face::Files, window, cx);
+            // Asked for the files, so that is where the keyboard goes.
+            if let Some(files) = &self.tabs[index].files {
+                window.focus(&files.focus_handle(cx));
+            }
+        }
     }
 
     pub fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1082,18 +1050,16 @@ impl Workspace {
     fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
         let tab = self.active.and_then(|i| self.tabs.get(i));
         let handle = match tab {
-            Some(tab) => match (&tab.panes, &tab.files) {
-                (Some(panes), _) if tab.face.shows_terminal() => panes.focus_handle(cx),
-                (_, Some(files)) => files.focus_handle(cx),
-                (Some(panes), None) => panes.focus_handle(cx),
-                (None, None) => self.sidebar.focus_handle(cx),
+            Some(tab) => match &tab.files {
+                Some(files) if tab.files_alone(cx) => files.focus_handle(cx),
+                _ => tab.panes.focus_handle(cx),
             },
             None => self.sidebar.focus_handle(cx),
         };
         window.focus(&handle);
     }
 
-    /// Closes the terminal in focus; the tab goes with its last one, or if it has no terminals.
+    /// Closes the terminal in focus; the tab goes with its last one.
     fn close_pane_or_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(active) = self.active else {
             return;
@@ -1111,9 +1077,7 @@ impl Workspace {
             return;
         }
         let tab = self.tabs.remove(index);
-        if let Some(panes) = &tab.panes {
-            panes.read(cx).close(cx);
-        }
+        tab.panes.read(cx).close(cx);
         self.active = match self.active {
             _ if self.tabs.is_empty() => None,
             Some(active) if active > index => Some(active - 1),
@@ -1202,8 +1166,8 @@ impl Workspace {
                 title: title.into(),
                 detail: Some(detail.into()),
                 icon: tab.face.icon(),
-                tile: None,
-                tint: Some(state.host_look(&tab.host).color),
+                dot: None,
+                tint: Some(state.host_color(&tab.host)),
                 shortcut: None,
                 run: handler(this.clone(), move |w, window, cx| {
                     if let Some(index) = w.tabs.iter().position(|t| t.id == id) {
@@ -1220,18 +1184,18 @@ impl Workspace {
                 .host_group(&host.id)
                 .map_or(String::new(), |group| format!(" · {group}"));
             let target = format!("{}@{}{group}", host.user, host.hostname);
-            let tile_state = match state.host_session(&host.id).map(|s| &s.state) {
-                Some(SessionState::Connected) => TileState::Live,
-                _ => TileState::Idle,
-            };
-            let look = state.host_look(&host.id);
+            let connected = matches!(
+                state.host_session(&host.id).map(|s| &s.state),
+                Some(SessionState::Connected)
+            );
+            let color = state.host_color(&host.id);
             let (terminal, files) = (host.id.clone(), host.id.clone());
             items.push(PaletteItem {
                 section: "Hosts".into(),
                 title: host.alias.clone().into(),
                 detail: Some(target.into()),
                 icon: IconName::Terminal,
-                tile: Some((look, tile_state)),
+                dot: Some((color, connected)),
                 tint: None,
                 shortcut: None,
                 run: handler(this.clone(), move |w, window, cx| {
@@ -1260,7 +1224,7 @@ impl Workspace {
                     title: snippet.name.clone().into(),
                     detail: Some(snippet.command.clone().into()),
                     icon: IconName::Play,
-                    tile: None,
+                    dot: None,
                     tint: None,
                     shortcut: None,
                     run: std::rc::Rc::new(move |_, cx| {
@@ -1276,7 +1240,7 @@ impl Workspace {
                 title: "Commands of this host".into(),
                 detail: None,
                 icon: IconName::Pencil,
-                tile: None,
+                dot: None,
                 tint: None,
                 shortcut: None,
                 run: handler(this.clone(), move |w, window, cx| {
@@ -1291,7 +1255,7 @@ impl Workspace {
                 title: title.into(),
                 detail: None,
                 icon,
-                tile: None,
+                dot: None,
                 tint: None,
                 shortcut,
                 run,
@@ -1625,7 +1589,7 @@ impl Workspace {
 
     /// The path of a terminal, each folder a way to go there with `cd`.
     fn terminal_crumbs(&self, tab: &Tab, cx: &Context<Self>) -> Option<AnyElement> {
-        let panes = tab.panes.clone()?;
+        let panes = tab.panes.clone();
         let folder = tab.terminal_folder(cx)?;
         let theme = cx.theme().clone();
         let (hover, press) = (theme.track, theme.active);
@@ -1715,16 +1679,13 @@ impl Workspace {
         let theme = cx.theme().clone();
         let tab = &self.tabs[index];
         let face = tab.face;
-        let look = self.state.read(cx).host_look(&tab.host);
         let host = self.state.read(cx).host(&tab.host).cloned();
         let alias = host
             .as_ref()
             .map_or(tab.host.0.clone(), |h| h.alias.clone());
         let target = host.map_or(String::new(), |h| format!("{}@{}", h.user, h.hostname));
-        // The tag in the color of the host's tile, which is how it reads in the sidebar too.
-        let lit = theme.host_color(look.color);
         let files = tab.files.clone().filter(|_| face.shows_files());
-        let panes = tab.panes.clone().filter(|_| face.shows_terminal());
+        let panes = Some(tab.panes.clone());
         let (nav, crumbs, tools) = match &files {
             Some(view) => view.update(cx, |view, cx| {
                 (
@@ -1811,8 +1772,7 @@ impl Workspace {
                         .text_size(crate::theme::ui_px(13.))
                         .text_color(theme.text)
                         .tooltip(tooltip(target))
-                        .child(alias)
-                        .children(look.tag.map(|tag| env_tag(tag, lit))),
+                        .child(alias),
                 )
                 .children(crumbs)
                 .child(div().flex_1().min_w(px(8.)))
@@ -1984,7 +1944,7 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// What the panel shows: the terminals, the files, or both with the link between them.
+    /// What the panel shows: the terminals, or them and the files with the link between them.
     fn tab_content(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let Some(tab) = self.active.and_then(|i| self.tabs.get(i)) else {
             return self.empty_state(cx);
@@ -1993,8 +1953,11 @@ impl Workspace {
         let linked = tab.linked;
         let ratio = tab.both_ratio;
         let bounds = self.both_bounds.clone();
-        match (tab.face, tab.panes.clone(), tab.files.clone()) {
-            (Face::Both, Some(panes), Some(files)) => div()
+        let alone = tab.files_alone(cx);
+        let panes = tab.panes.clone();
+        match tab.files.clone().filter(|_| tab.face.shows_files()) {
+            Some(files) if alone => files.into_any_element(),
+            Some(files) => div()
                 .size_full()
                 .relative()
                 .flex()
@@ -2076,10 +2039,7 @@ impl Workspace {
                 )
                 .child(div().flex_1().min_w_0().h_full().child(files))
                 .into_any_element(),
-            (Face::Files, _, Some(files)) => files.into_any_element(),
-            (_, Some(panes), _) => panes.into_any_element(),
-            (_, _, Some(files)) => files.into_any_element(),
-            _ => self.empty_state(cx),
+            None => panes.into_any_element(),
         }
     }
 

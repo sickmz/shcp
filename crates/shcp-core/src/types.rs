@@ -400,14 +400,11 @@ pub struct SavedTabs {
     pub active: Option<usize>,
     pub tabs: Vec<SavedTab>,
 }
-/// What the user picked for a host's tile. An unset field keeps the default; the names are the
-/// app's own, and one it does not know also keeps the default.
+/// What the user picked for a host: its color. Unset, or one the app does not know, keeps the
+/// default.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HostAppearance {
-    pub icon: Option<String>,
-    /// Short text drawn instead of an icon.
-    pub text: Option<String>,
     pub color: Option<String>,
 }
 /// The shape of the terminal cursor.
@@ -869,10 +866,9 @@ mod tests {
         }
     }
 
-    fn look(icon: &str) -> HostAppearance {
+    fn look(color: &str) -> HostAppearance {
         HostAppearance {
-            icon: Some(icon.into()),
-            ..HostAppearance::default()
+            color: Some(color.into()),
         }
     }
 
@@ -885,22 +881,30 @@ mod tests {
         settings.host_appearance.insert(
             "prod.db".into(),
             HostAppearance {
-                icon: Some("database".into()),
-                text: None,
                 color: Some("red".into()),
             },
         );
         settings.host_appearance.insert(
             "pi".into(),
             HostAppearance {
-                text: Some("Pi".into()),
-                ..HostAppearance::default()
+                color: Some("teal".into()),
             },
         );
         let text = toml::to_string_pretty(&settings).unwrap();
         let read: Settings = toml::from_str(&text).unwrap();
         assert_eq!(read.host_appearance, settings.host_appearance);
         assert_eq!(read.extra_forwards, settings.extra_forwards);
+    }
+
+    #[test]
+    fn hosts_saved_with_an_icon_or_text_keep_their_color() {
+        let read: Settings = toml::from_str(
+            "[host_appearance.nuc]\ntext = \"NU\"\ncolor = \"green\"\n\n\
+             [host_appearance.ec2]\nicon = \"zap\"\ncolor = \"red\"\n",
+        )
+        .unwrap();
+        assert_eq!(read.host_appearance["nuc"], look("green"));
+        assert_eq!(read.host_appearance["ec2"], look("red"));
     }
 
     #[test]
@@ -1029,13 +1033,13 @@ mod tests {
         let mut settings = Settings::default();
         settings.hidden_hosts.insert("old".into());
         settings.extra_forwards.insert("old".into(), vec![spec(1)]);
-        settings.host_appearance.insert("old".into(), look("cloud"));
+        settings.host_appearance.insert("old".into(), look("teal"));
         settings.rename_host(&old, &new);
         assert!(settings.hidden_hosts.contains("new"));
         assert!(!settings.hidden_hosts.contains("old"));
         assert_eq!(settings.extra_forwards["new"], vec![spec(1)]);
         assert!(!settings.extra_forwards.contains_key("old"));
-        assert_eq!(settings.host_appearance["new"], look("cloud"));
+        assert_eq!(settings.host_appearance["new"], look("teal"));
         assert!(!settings.host_appearance.contains_key("old"));
     }
 
@@ -1056,11 +1060,9 @@ mod tests {
         let id = HostId("same".into());
         let mut settings = Settings::default();
         settings.hidden_hosts.insert("same".into());
-        settings
-            .host_appearance
-            .insert("same".into(), look("cloud"));
+        settings.host_appearance.insert("same".into(), look("teal"));
         settings.rename_host(&id, &id);
         assert!(settings.hidden_hosts.contains("same"));
-        assert_eq!(settings.host_appearance["same"], look("cloud"));
+        assert_eq!(settings.host_appearance["same"], look("teal"));
     }
 }

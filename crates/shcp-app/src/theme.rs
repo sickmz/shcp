@@ -6,7 +6,7 @@ pub mod icon_theme;
 pub mod open_vsx;
 mod vscode;
 
-use crate::widgets::host_tile::HostColor;
+use crate::widgets::host_color::HostColor;
 use gpui::{
     App, BoxShadow, Global, Hsla, Pixels, SharedString, WindowAppearance,
     WindowBackgroundAppearance, hsla, point, px,
@@ -75,7 +75,7 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// The color of a host's tile, at the lightness this theme draws accents at.
+    /// The color of a host, at the lightness this theme draws accents at.
     pub fn host_color(&self, color: HostColor) -> Hsla {
         let chroma = if color == HostColor::Gray {
             0.012

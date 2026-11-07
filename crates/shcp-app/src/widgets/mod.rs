@@ -1,7 +1,7 @@
 pub mod button;
 pub mod context_menu;
 pub mod forward_fields;
-pub mod host_tile;
+pub mod host_color;
 pub mod icon;
 pub mod pill;
 pub mod progress;

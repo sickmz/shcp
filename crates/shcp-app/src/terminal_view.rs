@@ -238,6 +238,11 @@ impl TerminalView {
         })
     }
 
+    /// The connection is up and this terminal has no shell: it ended, or the server refused one.
+    pub fn shell_gone(&self, cx: &App) -> bool {
+        !self.terminal.is_alive() && !self.session_is_gone(cx)
+    }
+
     /// A new shell on `session`, in the same terminal: what it showed stays in the scrollback.
     fn attach(&mut self, session: SessionId, cx: &mut Context<Self>) {
         self.session = session;

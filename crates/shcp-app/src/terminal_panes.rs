@@ -249,6 +249,13 @@ impl TerminalPanes {
         self.active.read(cx).title()
     }
 
+    /// With the connection up, none of them has a shell.
+    pub fn shells_gone(&self, cx: &App) -> bool {
+        self.leaves()
+            .iter()
+            .all(|terminal| terminal.read(cx).shell_gone(cx))
+    }
+
     pub fn saved(&self) -> SavedPane {
         self.root.as_ref().map_or(SavedPane::Terminal, Node::saved)
     }

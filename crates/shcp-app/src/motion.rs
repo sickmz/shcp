@@ -48,11 +48,12 @@ pub const NOTICE_IN: Beat = Beat::new(180, 6.);
 pub const NOTICE_OUT: Beat = Beat::new(120, 4.);
 /// The content of a tab when it shows another way.
 pub const FACE: Beat = Beat::new(170, 0.);
-/// What a host or a group shows on opening.
-pub const ROW_IN: Beat = Beat::new(150, 3.);
 
 /// How long a panel takes to open or close.
 const REVEAL: Duration = Duration::from_millis(210);
+/// How long rows of a list take to fold. Slower than a panel: a lone row is small, and at the end
+/// of the list nothing under it moves to show that it went.
+const FOLD: Duration = Duration::from_millis(260);
 
 /// A panel opening and closing: how much of it shows, from 0 to 1. Asked per frame, and can change
 /// its mind halfway, going back from where it is.
@@ -61,6 +62,8 @@ pub struct Reveal {
     from: f32,
     started: Option<Instant>,
     armed: bool,
+    duration: Duration,
+    ease: fn(f32) -> f32,
 }
 
 impl Reveal {
@@ -70,6 +73,17 @@ impl Reveal {
             from: if open { 1. } else { 0. },
             started: None,
             armed: false,
+            duration: REVEAL,
+            ease: ease_out,
+        }
+    }
+
+    /// For rows of a list folding under what holds them.
+    pub fn rows(open: bool) -> Self {
+        Self {
+            duration: FOLD,
+            ease: ease_out_soft,
+            ..Self::new(open)
         }
     }
 
@@ -96,7 +110,7 @@ impl Reveal {
 
     pub fn moving(&self) -> bool {
         self.started
-            .is_some_and(|started| started.elapsed() < REVEAL)
+            .is_some_and(|started| started.elapsed() < self.duration)
     }
 
     fn value_at(&self, now: Instant) -> f32 {
@@ -104,8 +118,8 @@ impl Reveal {
         let Some(started) = self.started else {
             return to;
         };
-        let t = now.duration_since(started).as_secs_f32() / REVEAL.as_secs_f32();
-        self.from + (to - self.from) * ease_out(t)
+        let t = now.duration_since(started).as_secs_f32() / self.duration.as_secs_f32();
+        self.from + (to - self.from) * (self.ease)(t)
     }
 }
 
@@ -344,6 +358,12 @@ fn ease_out(t: f32) -> f32 {
     bezier(1., 1., (low + high) / 2.).clamp(0., 1.)
 }
 
+/// Also starts at once, but keeps something of the way for later: what is small stays in sight.
+fn ease_out_soft(t: f32) -> f32 {
+    let left = 1. - t.clamp(0., 1.);
+    1. - left * left
+}
+
 /// "Animation effects" is off in Windows: elements fade, but stay where they are.
 #[cfg(windows)]
 pub fn animations_off() -> bool {
@@ -387,6 +407,22 @@ mod tests {
             assert!(reveal.value_at(started) > 0.99);
             assert_eq!(reveal.value_at(started + REVEAL), 0.);
         }
+    }
+
+    #[test]
+    fn folding_rows_take_longer_than_a_panel_and_still_arrive() {
+        let mut rows = Reveal::rows(true);
+        let mut panel = Reveal::new(true);
+        let now = Instant::now();
+        rows.from = rows.value_at(now);
+        rows.open = false;
+        rows.started = Some(now);
+        panel.from = panel.value_at(now);
+        panel.open = false;
+        panel.started = Some(now);
+        let early = now + Duration::from_millis(50);
+        assert!(rows.value_at(early) > panel.value_at(early));
+        assert_eq!(rows.value_at(now + FOLD), 0.);
     }
 
     const FROM: [f32; 4] = [0., 0., 100., 28.];

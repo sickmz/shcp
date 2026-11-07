@@ -57,7 +57,7 @@ const WIDE_DETAILS: f32 = 520.;
 const MIN_DETAILS: f32 = 260.;
 const MIN_LIST: f32 = 320.;
 /// Below these widths, a column or the details give way.
-const INSPECTOR_FROM: f32 = 800.;
+const INSPECTOR_FROM: f32 = 600.;
 const PERMS_FROM: f32 = 620.;
 const MODIFIED_FROM: f32 = 400.;
 /// Lines of a file the preview draws.

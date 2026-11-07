@@ -9,7 +9,7 @@ use crate::theme::{ActiveTheme as _, Theme, mono_font, ui_px};
 use crate::widgets::button::{Button, ButtonStyle};
 use crate::widgets::context_menu::{ContextMenu, MenuAnchor, MenuEntry, OpenMenu, handler};
 use crate::widgets::forward_fields::ForwardFields;
-use crate::widgets::host_tile::{Glyph, HostColor, HostLook, HostTile};
+use crate::widgets::host_color::color_dot;
 use crate::widgets::icon::{Icon, IconName};
 use crate::widgets::text_input::{TextInput, TextInputEvent};
 use crate::widgets::tooltip::tooltip;
@@ -186,8 +186,7 @@ impl HostEditor {
             .as_ref()
             .map(|host| state.read(cx).host_appearance(&host.id))
             .unwrap_or_default();
-        let appearance = cx.new(|cx| AppearancePicker::new(&saved, cx));
-        let appearance_text = appearance.read(cx).input().clone();
+        let appearance = cx.new(|_| AppearancePicker::new(&saved));
         let group = original
             .as_ref()
             .and_then(|host| state.read(cx).host_group(&host.id))
@@ -202,7 +201,6 @@ impl HostEditor {
             &jump,
             &keepalive,
             &keepalive_count,
-            &appearance_text,
         ] {
             subscriptions.push(cx.subscribe_in(input, window, Self::on_input_event));
         }
@@ -636,7 +634,7 @@ impl HostEditor {
         });
         match result {
             Ok((renamed, id)) => {
-                let appearance = self.appearance.read(cx).appearance(cx);
+                let appearance = self.appearance.read(cx).appearance();
                 let group = self.chosen_group(cx);
                 self.state.update(cx, |state, cx| {
                     if let Some(old) = &renamed {
@@ -872,13 +870,18 @@ fn question_text(question: &CheckQuestion) -> String {
 }
 
 impl HostEditor {
-    fn tile(&self, look: HostLook, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The color of the host, which opens what picks it.
+    fn appearance_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (hover, ring) = (theme.hover, theme.text);
+        let color = theme.host_color(self.appearance.read(cx).color());
         div()
-            .id("host-tile")
+            .id("host-appearance")
+            .size(px(26.))
+            .flex()
             .flex_none()
-            .p(px(2.))
+            .items_center()
+            .justify_center()
             .rounded(px(9.))
             .border_1()
             .border_color(transparent_black())
@@ -887,9 +890,9 @@ impl HostEditor {
             .focusable()
             .tab_stop(true)
             .focus(move |style| style.border_color(ring))
-            .tooltip(tooltip("Change appearance"))
+            .tooltip(tooltip("Color"))
             .on_key_down(|event, _, cx| {
-                // Enter/Space belong to the focused tile, whose click fires on key-up.
+                // Enter/Space belong to the focused button, whose click fires on key-up.
                 if matches!(event.keystroke.key.as_str(), "enter" | "space") {
                     cx.stop_propagation();
                 }
@@ -898,7 +901,7 @@ impl HostEditor {
                 this.show_appearance = !this.show_appearance;
                 cx.notify();
             }))
-            .child(HostTile::new(look))
+            .child(color_dot(color, true).size(px(10.)))
     }
 
     /// Reads back what the address will do, which is where a typo shows.
@@ -1376,17 +1379,6 @@ impl Render for HostEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let editing = self.original.is_some();
-        let name = self.name(cx);
-        let picker = self.appearance.read(cx);
-        let look = if name.is_empty() && picker.appearance(cx) == HostAppearance::default() {
-            HostLook {
-                glyph: Glyph::Icon(IconName::Server),
-                color: HostColor::Gray,
-                tag: None,
-            }
-        } else {
-            picker.look(cx)
-        };
         let target = SshCommand::parse(self.address.read(cx).text());
         let name_error = self.name_error(cx);
         let name_warning = self.replaces_config_host(cx);
@@ -1455,7 +1447,7 @@ impl Render for HostEditor {
                     .flex_none()
                     .items_center()
                     .gap(px(6.))
-                    .child(self.tile(look, cx))
+                    .child(self.appearance_button(cx))
                     .child(title(
                         &theme,
                         if editing { "Edit host" } else { "New host" },

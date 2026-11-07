@@ -3,7 +3,7 @@
 use crate::login_prompt::LoginPrompt;
 use crate::updater::UpdateStatus;
 use crate::widgets::context_menu::Handler;
-use crate::widgets::host_tile::HostLook;
+use crate::widgets::host_color::HostColor;
 use gpui::{App, Context, Entity, EventEmitter};
 use shcp_core::{
     ConnectProgress, ConnectStep, EngineHandle, Event, ForwardSpec, ForwardState, HostAppearance,
@@ -507,16 +507,14 @@ impl AppState {
             .unwrap_or_default()
     }
 
-    /// What a host's tile shows. A tab can outlive its host: it keeps the default look then.
-    pub fn host_look(&self, host: &HostId) -> HostLook {
-        let alias = self
-            .host(host)
-            .map_or(host.0.as_str(), |h| h.alias.as_str());
-        HostLook::resolve(
-            alias,
-            self.host_group(host),
-            self.settings.host_appearance.get(&host.0),
-        )
+    /// The color of a host, gray unless picked. A tab can outlive its host: it keeps gray then.
+    pub fn host_color(&self, host: &HostId) -> HostColor {
+        self.settings
+            .host_appearance
+            .get(&host.0)
+            .and_then(|appearance| appearance.color.as_deref())
+            .and_then(HostColor::from_slug)
+            .unwrap_or(HostColor::Gray)
     }
 
     /// Remembers how a host looks; the default look leaves nothing behind in the settings.
