@@ -16,7 +16,7 @@ pub(crate) async fn run(
     command: OpenTerminal,
     cancel: CancellationToken,
 ) {
-    let result = tokio::select! { _ = cancel.cancelled() => Ok(End::Exited(None)), result = channel(&ctx, &ssh, &command) => result };
+    let result = channel(&ctx, &ssh, &command, &cancel).await;
     let terminal = &command.terminal;
     terminal.finish();
     let end = match result {
@@ -86,7 +86,12 @@ pub(crate) fn show(
         );
     }
 }
-async fn channel(ctx: &Context, ssh: &Ssh, command: &OpenTerminal) -> Result<End> {
+async fn channel(
+    ctx: &Context,
+    ssh: &Ssh,
+    command: &OpenTerminal,
+    cancel: &CancellationToken,
+) -> Result<End> {
     let OpenTerminal {
         terminal,
         input,
@@ -99,7 +104,7 @@ async fn channel(ctx: &Context, ssh: &Ssh, command: &OpenTerminal) -> Result<End
         return Ok(End::Exited(None));
     }
     if let Some(persist) = persist {
-        match tmux::run(ctx, ssh, command, persist).await? {
+        match tmux::run(ctx, ssh, command, persist, cancel).await? {
             // tmux has the shell, so what it ended with is not known here.
             tmux::Outcome::Ended => return Ok(End::Exited(None)),
             tmux::Outcome::Closed => return Ok(End::Closed),
@@ -109,66 +114,72 @@ async fn channel(ctx: &Context, ssh: &Ssh, command: &OpenTerminal) -> Result<End
             tmux::Outcome::Unavailable => tmux::tell_unavailable(ctx),
         }
     }
-    terminal.set_managed(false);
-    let mut channel = ssh.channel_open_session().await?;
-    let (cols, rows) = terminal.dimensions();
-    channel
-        .request_pty(true, "xterm-256color", cols as u32, rows as u32, 0, 0, &[])
-        .await?;
-    accepted(&mut channel).await?;
-    if ctx.host.forward_agent {
-        // A server that refuses it can still give a shell: no answer is waited for, like OpenSSH.
-        channel.agent_forward(false).await?;
-    }
-    channel.request_shell(true).await?;
-    accepted(&mut channel).await?;
-    terminal.mark_shell_started();
-    let (mut reader, writer) = channel.split();
-    if let Some(startup) = startup {
-        writer
-            .data_bytes(format!("{startup}\r").into_bytes())
+    let plain = async {
+        terminal.set_managed(false);
+        let mut channel = ssh.channel_open_session().await?;
+        let (cols, rows) = terminal.dimensions();
+        channel
+            .request_pty(true, "xterm-256color", cols as u32, rows as u32, 0, 0, &[])
             .await?;
-    }
-    // A separate writer lets incoming channel data keep draining under SSH flow control.
-    let write_task = async {
-        while let Ok(command) = input.recv().await {
-            match command {
-                TerminalCommand::Write(bytes) => writer.data_bytes(bytes).await?,
-                // Asked for while tmux had the terminal, which is gone now.
-                TerminalCommand::Paste(text) => {
-                    writer
-                        .data_bytes(text.replace("\r\n", "\r").replace('\n', "\r").into_bytes())
-                        .await?
-                }
-                TerminalCommand::Resize(cols, rows) => {
-                    writer.window_change(cols as u32, rows as u32, 0, 0).await?
-                }
-                TerminalCommand::Publish(_) => {}
-                TerminalCommand::Close => break,
-            }
+        accepted(&mut channel).await?;
+        if ctx.host.forward_agent {
+            // A server that refuses it can still give a shell: no answer is waited for, like OpenSSH.
+            channel.agent_forward(false).await?;
         }
-        let _ = writer.eof().await;
-        let _ = writer.close().await;
-        Ok::<(), russh::Error>(())
-    };
-    let mut log = open_log(ctx, log_dir.clone());
-    let read_task = async {
-        let mut status = None;
-        while let Some(message) = reader.wait().await {
-            match message {
-                ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
-                    show(ctx, terminal, &mut log, &data);
-                }
-                ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
-                ChannelMsg::Close => break,
-                // EOF is half-close; wait for exit-status and close.
-                _ => {}
-            }
+        channel.request_shell(true).await?;
+        accepted(&mut channel).await?;
+        terminal.mark_shell_started();
+        let (mut reader, writer) = channel.split();
+        if let Some(startup) = startup {
+            writer
+                .data_bytes(format!("{startup}\r").into_bytes())
+                .await?;
         }
-        status
+        // A separate writer lets incoming channel data keep draining under SSH flow control.
+        let write_task = async {
+            while let Ok(command) = input.recv().await {
+                match command {
+                    TerminalCommand::Write(bytes) => writer.data_bytes(bytes).await?,
+                    // Asked for while tmux had the terminal, which is gone now.
+                    TerminalCommand::Paste(text) => {
+                        writer
+                            .data_bytes(text.replace("\r\n", "\r").replace('\n', "\r").into_bytes())
+                            .await?
+                    }
+                    TerminalCommand::Resize(cols, rows) => {
+                        writer.window_change(cols as u32, rows as u32, 0, 0).await?
+                    }
+                    TerminalCommand::Publish(_) => {}
+                    TerminalCommand::Close => break,
+                }
+            }
+            let _ = writer.eof().await;
+            let _ = writer.close().await;
+            Ok::<(), russh::Error>(())
+        };
+        let mut log = open_log(ctx, log_dir.clone());
+        let read_task = async {
+            let mut status = None;
+            while let Some(message) = reader.wait().await {
+                match message {
+                    ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                        show(ctx, terminal, &mut log, &data);
+                    }
+                    ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+                    ChannelMsg::Close => break,
+                    // EOF is half-close; wait for exit-status and close.
+                    _ => {}
+                }
+            }
+            status
+        };
+        tokio::select! {
+            result = write_task => { result?; Ok(End::Exited(None)) },
+            status = read_task => { tracing::debug!(session = ctx.id.0, "Terminal channel closed"); Ok(End::Exited(status)) },
+        }
     };
-    tokio::select! {
-        result = write_task => { result?; Ok(End::Exited(None)) },
-        status = read_task => { tracing::debug!(session = ctx.id.0, "Terminal channel closed"); Ok(End::Exited(status)) },
+    tokio::select! { biased;
+        _ = cancel.cancelled() => Ok(End::Exited(None)),
+        result = plain => result,
     }
 }

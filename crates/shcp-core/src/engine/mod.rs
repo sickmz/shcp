@@ -132,6 +132,30 @@ pub fn start(settings_override: Option<Settings>) -> Result<(EngineHandle, Recei
     Ok((engine, receiver))
 }
 impl EngineHandle {
+    /// Disconnects without closing persistent shells. Call after the UI event loop has ended.
+    pub fn shutdown(&self) {
+        let controls: Vec<_> = self.0.sessions.lock().values().cloned().collect();
+        for control in &controls {
+            control.context.cancel.cancel();
+        }
+        for token in self.0.transfers.lock().values() {
+            token.cancel();
+        }
+        let (finished, wait) = std::sync::mpsc::channel();
+        self.0.runtime.handle.spawn(async move {
+            while controls
+                .iter()
+                .any(|control| control.active.load(Ordering::SeqCst))
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let _ = finished.send(());
+        });
+        if wait.recv_timeout(Duration::from_secs(5)).is_err() {
+            tracing::warn!("Timed out waiting for SSH connections to disconnect");
+        }
+    }
+
     fn next(&self) -> u64 {
         self.0.next.fetch_add(1, Ordering::Relaxed)
     }

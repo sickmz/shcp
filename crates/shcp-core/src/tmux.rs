@@ -699,6 +699,7 @@ pub(crate) async fn run(
     ssh: &Ssh,
     command: &OpenTerminal,
     persist: &Persistence,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Outcome> {
     let terminal = &command.terminal;
     let name = session_name(&persist.key);
@@ -716,162 +717,209 @@ pub(crate) async fn run(
         return Ok(Outcome::Closed);
     }
     let (cols, rows) = terminal.requested().unwrap_or(terminal.dimensions());
-    let Ok(mut channel) = ssh.channel_open_session().await else {
+    let opened = tokio::select! { biased;
+        _ = cancel.cancelled() => return Ok(Outcome::Ended),
+        opened = ssh.channel_open_session() => opened,
+    };
+    let Ok(channel) = opened else {
         return Ok(Outcome::Unavailable);
     };
-    if ctx.host.forward_agent {
-        // A server that refuses it can still give a session, as with a plain shell.
-        channel.agent_forward(false).await?;
-    }
-    let start = start_command(&name, cols, rows, command.history, ctx.host.forward_agent);
-    if channel.exec(true, start).await.is_err() || terminal::accepted(&mut channel).await.is_err() {
-        return Ok(Outcome::Unavailable);
-    }
     let (mut reader, writer) = channel.split();
-    let mut parser = Parser::default();
-    let mut messages = Vec::new();
-    let mut replies: Vec<(bool, Vec<u8>)> = Vec::new();
-    let mut expected = None;
-    let mut sized = false;
-    let mut deadline = Instant::now() + START_TIMEOUT;
-    let rest = 'handshake: loop {
-        match timeout_at(deadline, reader.wait()).await {
-            Ok(Some(ChannelMsg::Data { data })) => parser.feed(&data, &mut messages),
-            Ok(Some(ChannelMsg::Close) | None) | Err(_) => return Ok(Outcome::Unavailable),
-            Ok(Some(_)) => {}
+    let session = async {
+        if ctx.host.forward_agent {
+            // A server that refuses it can still give a session, as with a plain shell.
+            writer.agent_forward(false).await?;
         }
-        let mut drained = std::mem::take(&mut messages).into_iter();
-        while let Some(message) = drained.next() {
-            match message {
-                Message::Text(line) if line == NO_TMUX.as_bytes() => {
-                    return Ok(Outcome::NoTmux);
-                }
-                Message::Exit => return Ok(Outcome::Unavailable),
-                // tmux is up: anything it reads from here on runs after the session exists.
-                Message::Reply { control: false, .. } if expected.is_none() => {
-                    let size = terminal.requested();
-                    sized = size.is_some();
-                    writer.data_bytes(attach_batch(size).into_bytes()).await?;
-                    expected = Some(attach_replies(size));
-                    deadline = Instant::now() + REPLY_TIMEOUT;
-                }
-                Message::Reply {
-                    control: true,
-                    ok,
-                    body,
-                } => {
-                    replies.push((ok, body));
-                    if Some(replies.len()) == expected {
-                        break 'handshake drained.collect::<Vec<_>>();
-                    }
+        let start = start_command(&name, cols, rows, command.history, ctx.host.forward_agent);
+        if writer.exec(true, start).await.is_err() {
+            return Ok(Outcome::Unavailable);
+        }
+        loop {
+            match reader.wait().await {
+                Some(ChannelMsg::Success) => break,
+                Some(ChannelMsg::Failure | ChannelMsg::Close) | None => {
+                    return Ok(Outcome::Unavailable);
                 }
                 _ => {}
             }
         }
-    };
-    let [info, path, title, _, _, history, screen, primary, pending] =
-        &replies[usize::from(sized)..]
-    else {
-        return Ok(Outcome::Unavailable);
-    };
-    let Some(info) = info.0.then(|| PaneInfo::parse(&info.1)).flatten() else {
-        return Ok(Outcome::Unavailable);
-    };
-    ctx.emit(Event::TmuxFound {
-        host: ctx.host.id.clone(),
-    });
-    terminal.set_managed(true);
-    // What tmux decided, which another PC may have a say in.
-    terminal.fit(info.width, info.height);
-    if persist.known && !info.existing {
-        terminal
-            .feed(b"\x1b[2m--- The previous shell is gone: the server restarted ---\x1b[0m\r\n");
-    }
-    let pending = decode_output(&pending.1);
-    terminal.feed(&restore_stream(
-        &info,
-        &Captures {
-            path: &path.1,
-            title: &title.1,
-            history: &history.1,
-            screen: &screen.1,
-            primary: &primary.1,
-            pending: &pending,
-        },
-    ));
-    terminal.mark_shell_started();
-    if !info.existing
-        && let Some(startup) = &command.startup
-    {
-        writer
-            .data_bytes(send_keys(format!("{startup}\r").as_bytes()))
-            .await?;
-    }
-    let mut live = Live {
-        ctx,
-        terminal,
-        log: terminal::open_log(ctx, command.log_dir.clone()),
-        closing: closing.clone().into_bytes(),
-        closed: false,
-    };
-    let write_task = async {
-        while let Ok(command) = command.input.recv().await {
-            let line = match command {
-                TerminalCommand::Write(bytes) => send_keys(&bytes),
-                TerminalCommand::Paste(text) => paste_commands(&name, &text),
-                TerminalCommand::Resize(cols, rows) => {
-                    format!("refresh-client -C {cols}x{rows}\n").into_bytes()
-                }
-                TerminalCommand::Publish(hex) => {
-                    format!("set-option -g @shcp_layout {hex}\n").into_bytes()
-                }
-                TerminalCommand::Close => {
-                    // The user closed this terminal: unlike leaving, that ends what runs in it.
-                    let rename = format!("rename-session {closing}\n");
-                    writer.data_bytes(rename.into_bytes()).await?;
-                    // tmux tells of the new name after the command, and only to clients still on
-                    // the session: the other PCs must hear of it before it ends.
-                    sleep(RENAME_WAIT).await;
-                    writer.data_bytes(&b"kill-session\n"[..]).await?;
-                    sleep(KILL_WAIT).await;
-                    break;
-                }
-            };
-            // An empty line would make tmux drop this client.
-            if !line.is_empty() {
-                writer.data_bytes(line).await?;
+        let mut parser = Parser::default();
+        let mut messages = Vec::new();
+        let mut replies: Vec<(bool, Vec<u8>)> = Vec::new();
+        let mut expected = None;
+        let mut sized = false;
+        let mut restored_size = None;
+        let mut deadline = Instant::now() + START_TIMEOUT;
+        let rest = 'handshake: loop {
+            match timeout_at(deadline, reader.wait()).await {
+                Ok(Some(ChannelMsg::Data { data })) => parser.feed(&data, &mut messages),
+                Ok(Some(ChannelMsg::Close) | None) | Err(_) => return Ok(Outcome::Unavailable),
+                Ok(Some(_)) => {}
             }
+            let mut drained = std::mem::take(&mut messages).into_iter();
+            while let Some(message) = drained.next() {
+                match message {
+                    Message::Text(line) if line == NO_TMUX.as_bytes() => {
+                        return Ok(Outcome::NoTmux);
+                    }
+                    Message::Exit => return Ok(Outcome::Unavailable),
+                    // tmux is up: anything it reads from here on runs after the session exists.
+                    Message::Reply { control: false, .. } if expected.is_none() => {
+                        let size = terminal.requested();
+                        sized = size.is_some();
+                        writer.data_bytes(attach_batch(size).into_bytes()).await?;
+                        expected = Some(attach_replies(size));
+                        deadline = Instant::now() + REPLY_TIMEOUT;
+                    }
+                    Message::Reply {
+                        control: true,
+                        ok,
+                        body,
+                    } => {
+                        replies.push((ok, body));
+                        if replies.len() == usize::from(sized) + 1 {
+                            // PaneInfo is authoritative for events before its snapshot.
+                            restored_size = None;
+                        }
+                        if Some(replies.len()) == expected {
+                            break 'handshake drained.collect::<Vec<_>>();
+                        }
+                    }
+                    Message::Resized(cols, rows) => {
+                        // A restored pane can resize while its screen is being captured.
+                        // Keep that size instead of losing it before the live reader starts.
+                        restored_size = Some((cols, rows));
+                    }
+                    _ => {}
+                }
+            }
+        };
+        let [info, path, title, _, _, history, screen, primary, pending] =
+            &replies[usize::from(sized)..]
+        else {
+            return Ok(Outcome::Unavailable);
+        };
+        let Some(info) = info.0.then(|| PaneInfo::parse(&info.1)).flatten() else {
+            return Ok(Outcome::Unavailable);
+        };
+        ctx.emit(Event::TmuxFound {
+            host: ctx.host.id.clone(),
+        });
+        terminal.set_managed(true);
+        // What tmux decided, which another PC may have a say in.
+        terminal.fit(info.width, info.height);
+        if persist.known && !info.existing {
+            terminal.feed(
+                b"\x1b[2m--- The previous shell is gone: the server restarted ---\x1b[0m\r\n",
+            );
         }
+        let pending = decode_output(&pending.1);
+        terminal.feed(&restore_stream(
+            &info,
+            &Captures {
+                path: &path.1,
+                title: &title.1,
+                history: &history.1,
+                screen: &screen.1,
+                primary: &primary.1,
+                pending: &pending,
+            },
+        ));
+        if let Some((cols, rows)) = restored_size {
+            terminal.fit(cols, rows);
+        }
+        terminal.mark_shell_started();
+        if !info.existing
+            && let Some(startup) = &command.startup
+        {
+            writer
+                .data_bytes(send_keys(format!("{startup}\r").as_bytes()))
+                .await?;
+        }
+        let mut live = Live {
+            ctx,
+            terminal,
+            log: terminal::open_log(ctx, command.log_dir.clone()),
+            closing: closing.clone().into_bytes(),
+            closed: false,
+        };
+        let write_task = async {
+            while let Ok(command) = command.input.recv().await {
+                let line = match command {
+                    TerminalCommand::Write(bytes) => send_keys(&bytes),
+                    TerminalCommand::Paste(text) => paste_commands(&name, &text),
+                    TerminalCommand::Resize(cols, rows) => {
+                        format!("refresh-client -C {cols}x{rows}\n").into_bytes()
+                    }
+                    TerminalCommand::Publish(hex) => {
+                        format!("set-option -g @shcp_layout {hex}\n").into_bytes()
+                    }
+                    TerminalCommand::Close => {
+                        // The user closed this terminal: unlike leaving, that ends what runs in it.
+                        let rename = format!("rename-session {closing}\n");
+                        writer.data_bytes(rename.into_bytes()).await?;
+                        // tmux tells of the new name after the command, and only to clients still on
+                        // the session: the other PCs must hear of it before it ends.
+                        sleep(RENAME_WAIT).await;
+                        writer.data_bytes(&b"kill-session\n"[..]).await?;
+                        sleep(KILL_WAIT).await;
+                        break;
+                    }
+                };
+                // An empty line would make tmux drop this client.
+                if !line.is_empty() {
+                    writer.data_bytes(line).await?;
+                }
+            }
+            let _ = writer.eof().await;
+            let _ = writer.close().await;
+            Ok::<(), russh::Error>(())
+        };
+        let read_task = async {
+            for message in rest {
+                live.handle(message);
+            }
+            while let Some(message) = reader.wait().await {
+                match message {
+                    ChannelMsg::Data { data } => {
+                        parser.feed(&data, &mut messages);
+                        for message in messages.drain(..) {
+                            live.handle(message);
+                        }
+                    }
+                    ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+        };
+        tokio::select! {
+            result = write_task => result?,
+            () = read_task => tracing::debug!(session = ctx.id.0, "tmux session channel closed"),
+        }
+        Ok(if live.closed {
+            Outcome::Closed
+        } else {
+            Outcome::Ended
+        })
+    };
+    let result = tokio::select! { biased;
+        _ = cancel.cancelled() => Ok(Outcome::Ended),
+        result = session => result,
+    };
+    // An empty control-mode command detaches this client, leaving its shell alive.
+    // Wait for the remote channel to end before letting the SSH connection go away.
+    let _ = timeout(Duration::from_secs(2), async {
+        let _ = writer.data_bytes(&b"\n"[..]).await;
         let _ = writer.eof().await;
-        let _ = writer.close().await;
-        Ok::<(), russh::Error>(())
-    };
-    let read_task = async {
-        for message in rest {
-            live.handle(message);
-        }
         while let Some(message) = reader.wait().await {
-            match message {
-                ChannelMsg::Data { data } => {
-                    parser.feed(&data, &mut messages);
-                    for message in messages.drain(..) {
-                        live.handle(message);
-                    }
-                }
-                ChannelMsg::Close => break,
-                _ => {}
+            if matches!(message, ChannelMsg::Close) {
+                break;
             }
         }
-    };
-    tokio::select! {
-        result = write_task => result?,
-        () = read_task => tracing::debug!(session = ctx.id.0, "tmux session channel closed"),
-    }
-    Ok(if live.closed {
-        Outcome::Closed
-    } else {
-        Outcome::Ended
     })
+    .await;
+    let _ = timeout(Duration::from_secs(1), writer.close()).await;
+    result
 }
 
 #[cfg(test)]

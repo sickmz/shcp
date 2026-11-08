@@ -101,6 +101,7 @@ fn main() {
         }
     };
     tell_about_crashes(&engine.paths().log_dir);
+    let shutdown_engine = engine.clone();
 
     Application::new()
         .with_assets(assets::Assets)
@@ -192,4 +193,6 @@ fn main() {
             .detach();
             cx.activate(true);
         });
+    // The window is gone, but the runtime must finish disconnecting before the process exits.
+    shutdown_engine.shutdown();
 }
