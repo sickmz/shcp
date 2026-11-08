@@ -105,6 +105,7 @@ pub struct HostEditor {
 }
 
 impl EventEmitter<DismissEvent> for HostEditor {}
+impl EventEmitter<super::CancelEvent> for HostEditor {}
 
 impl Focusable for HostEditor {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -286,7 +287,7 @@ impl HostEditor {
     ) {
         match event {
             TextInputEvent::Submit => self.save(self.connects(), window, cx),
-            TextInputEvent::Cancel => cx.emit(DismissEvent),
+            TextInputEvent::Cancel => cx.emit(super::CancelEvent),
             TextInputEvent::Changed => {
                 if input == &self.address {
                     self.on_address_changed(window, cx);
@@ -1561,7 +1562,7 @@ impl Render for HostEditor {
                             .keyboard_focus()
                             .label("Cancel")
                             .style(ButtonStyle::Ghost)
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(super::CancelEvent))),
                     )
                     .child(
                         Button::new("save")
@@ -1594,7 +1595,35 @@ impl Render for HostEditor {
     }
 }
 
-impl super::ModalView for HostEditor {}
+impl super::ModalView for HostEditor {
+    fn draft(&self, cx: &App) -> Vec<String> {
+        let mut values: Vec<String> = [
+            &self.address,
+            &self.alias,
+            &self.group_input,
+            &self.jump,
+            &self.proxy,
+            &self.keepalive,
+            &self.keepalive_count,
+        ]
+        .into_iter()
+        .map(|input| input.read(cx).text().to_string())
+        .collect();
+        values.extend([
+            self.group.clone().unwrap_or_default(),
+            self.identity
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            self.forward_agent.to_string(),
+            self.appearance.read(cx).color().slug().to_string(),
+        ]);
+        for forward in &self.forwards {
+            values.extend(forward.read(cx).draft(cx));
+        }
+        values
+    }
+}
 
 #[cfg(test)]
 mod tests {

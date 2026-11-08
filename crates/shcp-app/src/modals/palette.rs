@@ -37,6 +37,7 @@ pub struct CommandPalette {
 }
 
 impl EventEmitter<DismissEvent> for CommandPalette {}
+impl EventEmitter<super::CancelEvent> for CommandPalette {}
 
 impl Focusable for CommandPalette {
     fn focus_handle(&self, cx: &App) -> FocusHandle {

@@ -104,6 +104,7 @@ pub struct SettingsModal {
 }
 
 impl EventEmitter<DismissEvent> for SettingsModal {}
+impl EventEmitter<super::CancelEvent> for SettingsModal {}
 
 impl Focusable for SettingsModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -2066,6 +2067,7 @@ impl Render for SettingsModal {
         let about = self.nav_item(Page::About, "About", IconName::Info, searching, cx);
         div()
             .w(px(820.))
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .h(px(580.))
             .max_w(relative(0.96))
             .max_h(relative(0.96))

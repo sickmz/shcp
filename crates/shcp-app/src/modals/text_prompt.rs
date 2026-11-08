@@ -23,6 +23,7 @@ pub struct TextPrompt {
 }
 
 impl EventEmitter<DismissEvent> for TextPrompt {}
+impl EventEmitter<super::CancelEvent> for TextPrompt {}
 
 impl Focusable for TextPrompt {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -49,7 +50,7 @@ impl TextPrompt {
             window,
             |this, _, event: &TextInputEvent, window, cx| match event {
                 TextInputEvent::Submit => this.submit(window, cx),
-                TextInputEvent::Cancel => cx.emit(DismissEvent),
+                TextInputEvent::Cancel => cx.emit(super::CancelEvent),
                 TextInputEvent::Changed => {}
             },
         );
@@ -106,7 +107,7 @@ impl Render for TextPrompt {
                         Button::new("cancel")
                             .keyboard_focus()
                             .label("Cancel")
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(super::CancelEvent))),
                     )
                     .child(
                         Button::new("ok")
@@ -119,4 +120,8 @@ impl Render for TextPrompt {
     }
 }
 
-impl super::ModalView for TextPrompt {}
+impl super::ModalView for TextPrompt {
+    fn draft(&self, cx: &App) -> Vec<String> {
+        vec![self.input.read(cx).text().to_string()]
+    }
+}

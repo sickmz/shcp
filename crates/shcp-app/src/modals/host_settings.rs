@@ -37,6 +37,7 @@ pub struct HostSettingsModal {
 }
 
 impl EventEmitter<DismissEvent> for HostSettingsModal {}
+impl EventEmitter<super::CancelEvent> for HostSettingsModal {}
 
 impl Focusable for HostSettingsModal {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {

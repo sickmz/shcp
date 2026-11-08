@@ -15,6 +15,7 @@ pub struct LoginModal {
 }
 
 impl EventEmitter<DismissEvent> for LoginModal {}
+impl EventEmitter<super::CancelEvent> for LoginModal {}
 
 impl Focusable for LoginModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {

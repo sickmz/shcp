@@ -32,6 +32,7 @@ pub struct HostCommandsModal {
 }
 
 impl EventEmitter<DismissEvent> for HostCommandsModal {}
+impl EventEmitter<super::CancelEvent> for HostCommandsModal {}
 
 impl Focusable for HostCommandsModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -96,7 +97,7 @@ impl HostCommandsModal {
             window,
             |this, _, event: &TextInputEvent, _, cx| match event {
                 TextInputEvent::Submit => this.save(cx),
-                TextInputEvent::Cancel => cx.emit(DismissEvent),
+                TextInputEvent::Cancel => cx.emit(super::CancelEvent),
                 TextInputEvent::Changed => {}
             },
         )
@@ -251,7 +252,7 @@ impl Render for HostCommandsModal {
                         Button::new("cancel")
                             .keyboard_focus()
                             .label("Cancel")
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(super::CancelEvent))),
                     )
                     .child(
                         Button::new("save")
@@ -264,4 +265,16 @@ impl Render for HostCommandsModal {
     }
 }
 
-impl super::ModalView for HostCommandsModal {}
+impl super::ModalView for HostCommandsModal {
+    fn draft(&self, cx: &App) -> Vec<String> {
+        let mut values = vec![self.startup.read(cx).text().to_string()];
+        for row in &self.rows {
+            values.extend([
+                row.name.read(cx).text().to_string(),
+                row.command.read(cx).text().to_string(),
+                row.everywhere.to_string(),
+            ]);
+        }
+        values
+    }
+}

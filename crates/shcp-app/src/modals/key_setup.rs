@@ -30,6 +30,7 @@ pub struct KeySetupModal {
 }
 
 impl EventEmitter<DismissEvent> for KeySetupModal {}
+impl EventEmitter<super::CancelEvent> for KeySetupModal {}
 
 impl Focusable for KeySetupModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -86,7 +87,7 @@ impl KeySetupModal {
     ) {
         match event {
             TextInputEvent::Submit => self.install(window, cx),
-            TextInputEvent::Cancel => cx.emit(DismissEvent),
+            TextInputEvent::Cancel => cx.emit(super::CancelEvent),
             TextInputEvent::Changed => cx.notify(),
         }
     }
@@ -274,7 +275,7 @@ impl Render for KeySetupModal {
                         Button::new("key-close")
                             .keyboard_focus()
                             .label(if finished.is_some() { "Close" } else { "Cancel" })
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(super::CancelEvent))),
                     )
                     .when(finished.is_none(), |this| {
                         this.child(
@@ -298,4 +299,13 @@ impl Render for KeySetupModal {
     }
 }
 
-impl super::ModalView for KeySetupModal {}
+impl super::ModalView for KeySetupModal {
+    fn draft(&self, cx: &App) -> Vec<String> {
+        vec![self.path.read(cx).text().to_string()]
+    }
+
+    fn has_unsaved_changes(&self, initial: &[String], cx: &App) -> bool {
+        self.finished.is_none()
+            && (self.draft(cx) != initial || !self.passphrase.read(cx).text().is_empty())
+    }
+}

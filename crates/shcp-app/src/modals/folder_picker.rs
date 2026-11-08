@@ -40,6 +40,7 @@ pub struct FolderPicker {
 }
 
 impl EventEmitter<DismissEvent> for FolderPicker {}
+impl EventEmitter<super::CancelEvent> for FolderPicker {}
 
 impl Focusable for FolderPicker {
     fn focus_handle(&self, cx: &App) -> FocusHandle {

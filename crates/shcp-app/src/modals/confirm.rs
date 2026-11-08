@@ -18,6 +18,7 @@ pub struct ConfirmModal {
 }
 
 impl EventEmitter<DismissEvent> for ConfirmModal {}
+impl EventEmitter<super::CancelEvent> for ConfirmModal {}
 
 impl Focusable for ConfirmModal {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {

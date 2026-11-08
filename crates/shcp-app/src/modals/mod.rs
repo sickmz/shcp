@@ -12,6 +12,9 @@ pub mod settings;
 pub mod text_prompt;
 pub mod theme_browser;
 
+#[cfg(test)]
+mod tests;
+
 use crate::actions::{FocusNext, FocusPrev};
 use crate::motion;
 use crate::theme::{ActiveTheme as _, Theme};
@@ -20,17 +23,31 @@ use gpui::{
     AnimationExt as _, AnyView, Context, DismissEvent, Div, Entity, EntityId, EventEmitter,
     FocusHandle, Focusable, Hsla, Subscription, Window, WindowControlArea, div, px,
 };
+use std::rc::Rc;
 
-pub trait ModalView: Render + Focusable + EventEmitter<DismissEvent> {
+pub struct CancelEvent;
+
+pub trait ModalView:
+    Render + Focusable + EventEmitter<DismissEvent> + EventEmitter<CancelEvent>
+{
     /// Whether it fades in. Not what is opened all day from the keyboard.
     const ENTRANCE: bool = true;
+
+    /// Editable values before saving. UI-only state does not count as a change.
+    fn draft(&self, _cx: &gpui::App) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn has_unsaved_changes(&self, initial: &[String], cx: &gpui::App) -> bool {
+        self.draft(cx) != initial
+    }
 
     fn cancel(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         cx.emit(DismissEvent);
     }
 }
 
-type Cancel = Box<dyn Fn(&mut Window, &mut gpui::App)>;
+type Cancel = Rc<dyn Fn(&mut Window, &mut gpui::App)>;
 
 struct Active {
     id: EntityId,
@@ -39,6 +56,8 @@ struct Active {
     entrance: bool,
     focus: FocusHandle,
     cancel: Cancel,
+    dirty: Box<dyn Fn(&gpui::App) -> bool>,
+    _cancel_subscription: Subscription,
     _subscription: Subscription,
 }
 
@@ -91,9 +110,24 @@ impl ModalLayer {
         );
         let focus = modal.focus_handle(cx);
         let weak = modal.downgrade();
-        let cancel = Box::new(move |window: &mut Window, cx: &mut gpui::App| {
+        let cancel = Rc::new(move |window: &mut Window, cx: &mut gpui::App| {
             weak.update(cx, |modal, cx| modal.cancel(window, cx)).ok();
         });
+        let initial = modal.read(cx).draft(cx);
+        let weak = modal.downgrade();
+        let dirty = Box::new(move |cx: &gpui::App| {
+            weak.upgrade()
+                .is_some_and(|modal| modal.read(cx).has_unsaved_changes(&initial, cx))
+        });
+        let cancel_subscription = cx.subscribe_in(
+            &modal,
+            window,
+            move |this, _, _: &CancelEvent, window, cx| {
+                if this.stack.first().is_some_and(|active| active.id == id) {
+                    this.request_cancel(window, cx);
+                }
+            },
+        );
         self.stack.push(Active {
             id,
             session,
@@ -101,6 +135,8 @@ impl ModalLayer {
             entrance: M::ENTRANCE && !std::mem::take(&mut self.skip_next_entrance),
             focus,
             cancel,
+            dirty,
+            _cancel_subscription: cancel_subscription,
             _subscription: subscription,
         });
         if self.stack.len() == 1 {
@@ -124,6 +160,32 @@ impl ModalLayer {
         for id in ids {
             self.dismiss(id, window, cx);
         }
+    }
+
+    fn request_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(active) = self.stack.first() else {
+            return;
+        };
+        let cancel = active.cancel.clone();
+        let session = active.session;
+        if !(active.dirty)(cx) {
+            cancel(window, cx);
+            return;
+        }
+        let confirm = cx.new(|cx| {
+            confirm::ConfirmModal::new(
+                "Discard changes?",
+                "Your unsaved changes will be lost.".into(),
+                "Discard",
+                move |window, cx| cancel(window, cx),
+                cx,
+            )
+        });
+        self.show_for_session(confirm, session, window, cx);
+        // Unlike queued session prompts, this confirmation must precede its editor.
+        let confirmation = self.stack.pop().unwrap();
+        window.focus(&confirmation.focus);
+        self.stack.insert(0, confirmation);
     }
 
     fn step_focus(&self, reverse: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -203,6 +265,13 @@ impl Render for ModalLayer {
             .flex()
             .items_center()
             .justify_center()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.request_cancel(window, cx);
+                    cx.stop_propagation();
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &FocusNext, window, cx| this.step_focus(false, window, cx)),
             )
@@ -211,9 +280,7 @@ impl Render for ModalLayer {
             )
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
-                    if let Some(active) = this.stack.first() {
-                        (active.cancel)(window, cx);
-                    }
+                    this.request_cancel(window, cx);
                     cx.stop_propagation();
                 }
             }))
@@ -243,6 +310,7 @@ impl Render for ModalLayer {
 /// Common card frame for modals.
 pub fn card(theme: &Theme, width: f32) -> Div {
     div()
+        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .w(px(width))
         .max_h(px(620.))
         .p(px(20.))

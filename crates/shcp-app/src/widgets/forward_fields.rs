@@ -97,6 +97,15 @@ impl ForwardFields {
         [&self.bind, &self.target]
     }
 
+    /// Raw values, including incomplete ports, for detecting unsaved edits.
+    pub fn draft(&self, cx: &gpui::App) -> [String; 3] {
+        [
+            format!("{:?}", self.kind),
+            self.bind.read(cx).text().to_string(),
+            self.target.read(cx).text().to_string(),
+        ]
+    }
+
     pub fn focus(&self, window: &mut Window, cx: &gpui::App) {
         self.bind.read(cx).focus(window);
     }

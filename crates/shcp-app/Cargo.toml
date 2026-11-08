@@ -24,3 +24,6 @@ sha2 = "0.11"
 
 [build-dependencies]
 embed-resource = "3"
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
