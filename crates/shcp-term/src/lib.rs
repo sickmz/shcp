@@ -72,6 +72,8 @@ struct State {
     /// The server has given it a shell, whether or not the shell has said anything yet.
     shell_started: bool,
     dirty: bool,
+    /// Last visible screen, retained until the new shell has restored its output.
+    frozen: Option<TermSnapshot>,
     search: Option<search::Search>,
     /// Something between here and the program sees its output too and answers it, so an answer
     /// from here would be a second one.
@@ -129,6 +131,7 @@ impl TerminalHandle {
                     alive: true,
                     shell_started: false,
                     dirty: false,
+                    frozen: None,
                     search: None,
                     managed: false,
                     requested: None,
@@ -155,11 +158,13 @@ impl TerminalHandle {
     /// have died in the alternate screen or with mouse tracking on: those modes are switched off.
     #[doc(hidden)]
     pub fn reattach(&self, note: &str) -> async_channel::Receiver<TerminalCommand> {
+        let frozen = self.snapshot();
         let (input, receiver) = async_channel::unbounded();
         *self.0.input.lock() = input;
         {
             let mut state = self.0.state.lock();
             state.alive = true;
+            state.frozen = Some(frozen);
             // A new shell starts somewhere else.
             state.cwd = None;
             state.reports_cwd = false;
@@ -170,6 +175,14 @@ impl TerminalHandle {
         );
         self.feed(format!("\x1b[2m--- {note} ---\x1b[0m\r\n").as_bytes());
         receiver
+    }
+    /// Publishes the new shell's screen after its restored screen or first output is available.
+    #[doc(hidden)]
+    pub fn reveal(&self) {
+        let was_frozen = self.0.state.lock().frozen.take().is_some();
+        if was_frozen {
+            self.changed();
+        }
     }
     fn changed(&self) {
         let mut state = self.0.state.lock();
@@ -542,6 +555,7 @@ mod tests {
         let input = terminal.reattach("reconnected");
         assert!(terminal.is_alive());
         assert!(!terminal.mouse_mode());
+        terminal.reveal();
         let snapshot = terminal.snapshot();
         let text: String = snapshot.cells.iter().map(|c| c.ch).collect();
         assert!(text.contains("before"));
@@ -549,6 +563,72 @@ mod tests {
         terminal.text("ls");
         assert!(matches!(input.try_recv(), Ok(TerminalCommand::Write(_))));
         assert!(old_input.is_closed());
+    }
+
+    #[test]
+    fn reconnect_keeps_the_alternate_screen_until_the_restore_is_complete() {
+        let (terminal, _, _) = terminal();
+        terminal.feed(b"primary\x1b[?1049hprevious screen");
+        let before = terminal.snapshot();
+        terminal.finish();
+        let _input = terminal.reattach("reconnected");
+        terminal.fit(100, 30);
+        terminal.feed(b"\x1b[?1049h\x1b[2J\x1b[Hrestored screen");
+        let frozen = terminal.snapshot();
+        assert_eq!(frozen.cols, before.cols);
+        assert_eq!(frozen.rows, before.rows);
+        assert_eq!(
+            frozen.cells.iter().map(|c| c.ch).collect::<String>(),
+            before.cells.iter().map(|c| c.ch).collect::<String>()
+        );
+        terminal.mark_shell_started();
+        terminal.reveal();
+        let restored = terminal.snapshot();
+        assert_eq!(restored.cols, 100);
+        assert!(
+            restored
+                .cells
+                .iter()
+                .map(|c| c.ch)
+                .collect::<String>()
+                .contains("restored screen")
+        );
+    }
+
+    #[test]
+    fn a_failed_reconnect_keeps_the_same_screen_on_the_next_attempt() {
+        let (terminal, _, _) = terminal();
+        terminal.feed(b"\x1b[?1049hprevious screen");
+        let before = terminal
+            .snapshot()
+            .cells
+            .iter()
+            .map(|c| c.ch)
+            .collect::<String>();
+        terminal.finish();
+        let _first = terminal.reattach("first attempt");
+        terminal.finish();
+        let _second = terminal.reattach("second attempt");
+        assert_eq!(
+            terminal
+                .snapshot()
+                .cells
+                .iter()
+                .map(|c| c.ch)
+                .collect::<String>(),
+            before
+        );
+        terminal.feed(b"\x1b[2J\x1b[Hnew shell");
+        terminal.reveal();
+        assert!(
+            terminal
+                .snapshot()
+                .cells
+                .iter()
+                .map(|c| c.ch)
+                .collect::<String>()
+                .contains("new shell")
+        );
     }
 
     #[test]

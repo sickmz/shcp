@@ -76,6 +76,9 @@ pub(crate) fn show(
     data: &[u8],
 ) {
     terminal.feed(data);
+    if !data.is_empty() {
+        terminal.reveal();
+    }
     if let Some(file) = log.as_mut()
         && let Err(error) = file.write(data)
     {

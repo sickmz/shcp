@@ -4,6 +4,9 @@ impl TerminalHandle {
     pub fn snapshot(&self) -> TermSnapshot {
         let mut state = self.0.state.lock();
         state.dirty = false;
+        if let Some(frozen) = &state.frozen {
+            return frozen.clone();
+        }
         let search_hits = search::visible_hits(&mut state);
         let links = link::visible_links(&state.term);
         let content = state.term.renderable_content();

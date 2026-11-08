@@ -71,6 +71,7 @@ pub struct TerminalView {
     link_armed: bool,
     /// It has shown a shell, so it has output worth keeping in sight while disconnected.
     had_session: bool,
+    pub(crate) shared_startup: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -224,6 +225,7 @@ impl TerminalView {
             hovered_link: None,
             link_armed: false,
             had_session: false,
+            shared_startup: true,
             _subscriptions: subscriptions,
         }
     }
@@ -737,7 +739,7 @@ impl Render for TerminalView {
             Some(Overlay::Closed("Shell exited".into()))
         } else {
             // A new split can wait for its own shell after the shared connection is ready.
-            self.starting_shell()
+            (!self.shared_startup && self.starting_shell())
                 .then_some(Overlay::StartingShell { steps: shell_steps })
         };
         let focused = self.focus.is_focused(window);
@@ -827,6 +829,7 @@ impl Render for TerminalView {
                 overlay,
                 Surface {
                     heading,
+                    reconnecting: false,
                     docked: self.had_session,
                     background: theme.terminal_bg,
                     focus: self.focus.clone(),

@@ -3,8 +3,6 @@
 use crate::actions::{
     FocusPaneDown, FocusPaneLeft, FocusPaneRight, FocusPaneUp, SplitDown, SplitRight,
 };
-use crate::login_prompt::present;
-use crate::session_overlay::{self, Overlay, Surface};
 use crate::state::AppState;
 use crate::terminal_view::TerminalView;
 use crate::theme::ActiveTheme as _;
@@ -17,7 +15,7 @@ use gpui::{
     FocusHandle, Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     Point, SharedString, Subscription, Window, canvas, div, px, relative,
 };
-use shcp_core::{HostId, SavedPane, SessionState, SplitAxis, TerminalId};
+use shcp_core::{HostId, SavedPane, SplitAxis, TerminalId};
 use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
@@ -171,7 +169,7 @@ pub struct TerminalPanes {
     active: Entity<TerminalView>,
     dragging: Option<Path>,
     menu: Option<OpenMenu>,
-    /// The shared status becomes a strip after this tab has shown a shell.
+    /// Initial shells have finished starting; later splits use their own local status.
     had_session: bool,
     _state_subscription: Subscription,
 }
@@ -265,6 +263,24 @@ impl TerminalPanes {
         // The tab row and the palette show the active terminal's title and session.
         cx.observe(&view, |_, _, cx| cx.notify()).detach();
         view
+    }
+
+    pub fn had_session(&self) -> bool {
+        self.had_session
+    }
+
+    pub fn initial_shell_pending(&self, cx: &App) -> bool {
+        !self.had_session
+            && self
+                .leaves()
+                .iter()
+                .any(|view| view.read(cx).starting_shell())
+    }
+
+    pub fn retry(&mut self, cx: &mut Context<Self>) {
+        for view in self.leaves() {
+            view.update(cx, |view, cx| view.retry(cx));
+        }
     }
 
     fn leaves(&self) -> Vec<Entity<TerminalView>> {
@@ -834,55 +850,12 @@ impl Render for TerminalPanes {
         {
             self.active = focused.clone();
         }
-        let theme = cx.theme().clone();
-        let focus = self.active.focus_handle(cx);
-        let state = self.state.read(cx);
-        let session = state.host_session(&self.host);
-        self.had_session |= matches!(
-            session.map(|session| &session.state),
-            Some(SessionState::Connected)
-        ) && leaves.iter().any(|view| view.read(cx).shell_started());
-        let heading = state.host(&self.host).map(session_overlay::heading);
-        let steps = session_overlay::steps_of(session);
-        let shell_steps = session_overlay::shell_steps(session);
-        let prompt = state.login_prompt(&self.host, cx);
-        let overlay = session_overlay::with_reconnect(
-            session_overlay::overlay_for(session),
-            state.reconnect_attempt(&self.host),
-        );
-        let overlay = match prompt {
-            Some(prompt) => {
-                let own = present(&prompt, cx.entity_id(), &focus, window, cx);
-                Some(Overlay::Login { steps, prompt, own })
-            }
-            None => overlay,
-        };
-        let overlay = overlay.or_else(|| {
-            (!self.had_session && leaves.iter().any(|view| view.read(cx).starting_shell()))
-                .then_some(Overlay::StartingShell { steps: shell_steps })
-        });
-        let overlay = overlay.map(|overlay| {
-            session_overlay::render(
-                overlay,
-                Surface {
-                    heading,
-                    docked: self.had_session,
-                    background: theme.terminal_bg,
-                    focus,
-                    extra_steps: 1,
-                    owner: cx.entity_id(),
-                },
-                &theme,
-                window,
-                cx,
-                cx.listener(|this, _, window, cx| {
-                    for view in this.leaves() {
-                        view.update(cx, |view, cx| view.retry(cx));
-                    }
-                    window.focus(&this.active.focus_handle(cx));
-                }),
-            )
-        });
+        self.had_session |= leaves.iter().any(|view| view.read(cx).shell_started())
+            && !leaves.iter().any(|view| view.read(cx).starting_shell());
+        let shared_startup = !self.had_session;
+        for view in &leaves {
+            view.update(cx, |view, _| view.shared_startup = shared_startup);
+        }
         let several = leaves.len() > 1;
         let root = self.root.take();
         let content = root
@@ -939,7 +912,6 @@ impl Render for TerminalPanes {
                 )
             })
             .children(content)
-            .children(overlay)
             .children(self.menu.clone().map(|menu| {
                 let this = cx.entity().downgrade();
                 ContextMenu::new(

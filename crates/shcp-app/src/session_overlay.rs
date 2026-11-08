@@ -385,6 +385,7 @@ fn progress_view(
 pub struct Surface {
     pub heading: Option<(String, String)>,
     pub docked: bool,
+    pub reconnecting: bool,
     pub background: Hsla,
     /// A click on it gives the view the focus, which moves on to the prompt.
     pub focus: FocusHandle,
@@ -410,6 +411,7 @@ pub fn render(
     let Surface {
         heading,
         docked,
+        reconnecting,
         background,
         focus,
         extra_steps,
@@ -420,7 +422,7 @@ pub fn render(
         Overlay::Reconnecting { attempt } => {
             Some(("Reconnecting…", format!("Attempt {attempt}"), true))
         }
-        Overlay::Closed(reason) if docked => Some((
+        Overlay::Closed(reason) => Some((
             "Disconnected",
             if reason == "Disconnected" {
                 "Reconnect to resume this session.".to_string()
@@ -577,6 +579,11 @@ pub fn render(
             .into_any_element();
     }
     let card = div()
+        .p(px(20.))
+        .rounded(px(11.))
+        .bg(theme.elevated)
+        .border_1()
+        .border_color(theme.strong_border)
         .w(px(CARD_WIDTH))
         .max_w_full()
         .flex()
@@ -591,7 +598,11 @@ pub fn render(
                         .text_size(ui_px(19.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme.text)
-                        .child("Connecting to")
+                        .child(if reconnecting {
+                            "Reconnecting to"
+                        } else {
+                            "Connecting to"
+                        })
                         .child(div().text_color(theme.accent).child(alias)),
                 )
                 .child(

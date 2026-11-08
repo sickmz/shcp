@@ -1,12 +1,10 @@
 //! Files tab: SFTP browser for one host (listing, navigation, selection, upload/download,
 //! mkdir/rename/delete). Remote results arrive as core events re-emitted by `AppState`.
 use crate::files_format as format;
-use crate::login_prompt::present;
 use crate::modals::{
     ModalLayer, confirm::ConfirmModal, folder_picker::FolderPicker, text_prompt::TextPrompt,
 };
 use crate::motion::Reveal;
-use crate::session_overlay;
 use crate::state::AppState;
 use crate::theme::icon_theme::file_icon;
 use crate::theme::{ActiveTheme as _, row_px};
@@ -71,6 +69,7 @@ const TYPE_AHEAD: Duration = Duration::from_millis(800);
 
 pub enum FilesEvent {
     OpenTerminalHere(String),
+    GoHereInTerminal(String),
 }
 
 /// Where a key moves the cursor on a list of `len` rows.
@@ -556,35 +555,6 @@ impl FilesView {
         self.pending_ops.clear();
         self.uploads.clear();
         self.refresh(cx);
-    }
-
-    fn reconnect(&mut self, cx: &mut Context<Self>) {
-        self.session = self
-            .state
-            .update(cx, |s, cx| s.connect_host(&self.host, cx));
-        self.home_requested = false;
-        self.pending_home = None;
-        self.pending_list = None;
-        self.pending_ops.clear();
-        self.uploads.clear();
-        self.path.clear();
-        self.all_entries.clear();
-        self.entries.clear();
-        self.history.clear();
-        self.going_back = false;
-        self.search = None;
-        self.free_space = None;
-        self.total_space = None;
-        self.pending_space = None;
-        self.filter_input
-            .update(cx, |input, cx| input.set_text("", cx));
-        self.selected.clear();
-        self.anchor = None;
-        self.loading = false;
-        if self.session_connected(cx) {
-            self.load_home(cx);
-        }
-        cx.notify();
     }
 
     fn on_event(&mut self, event: &Event, cx: &mut Context<Self>) {
@@ -1151,19 +1121,6 @@ impl FilesView {
             match entry.kind {
                 EntryKind::Dir | EntryKind::Symlink => entries.push(open("Open", IconName::Folder)),
                 _ => entries.push(open("Edit", IconName::File).disabled(!ready)),
-            }
-            if entry.kind == EntryKind::Dir {
-                let path = entry.path.clone();
-                entries.push(
-                    MenuEntry::item(
-                        "Open terminal here",
-                        handler(this.clone(), move |_, _, cx: &mut Context<Self>| {
-                            cx.emit(FilesEvent::OpenTerminalHere(path.clone()))
-                        }),
-                    )
-                    .icon(IconName::Terminal)
-                    .disabled(!ready),
-                );
             }
             entries.push(MenuEntry::Separator);
         }
@@ -2967,11 +2924,11 @@ impl FilesView {
                         .child(
                             Button::new("details-terminal-here")
                                 .icon(IconName::Terminal)
-                                .label("Open terminal here")
+                                .label("Go here in terminal")
                                 .style(ButtonStyle::Primary)
                                 .disabled(!ready)
                                 .on_click(cx.listener(move |_, _, _, cx| {
-                                    cx.emit(FilesEvent::OpenTerminalHere(target.clone()))
+                                    cx.emit(FilesEvent::GoHereInTerminal(target.clone()))
                                 })),
                         ),
                 )
@@ -3046,7 +3003,7 @@ impl FilesView {
                 IconName::ExternalLink
             })
             .label(if is_dir {
-                "Open terminal here"
+                "Go here in terminal"
             } else {
                 "Edit in local editor"
             })
@@ -3054,7 +3011,7 @@ impl FilesView {
             .disabled(!ready)
             .on_click(cx.listener(move |this, _, _, cx| {
                 if is_dir {
-                    cx.emit(FilesEvent::OpenTerminalHere(folder.clone()));
+                    cx.emit(FilesEvent::GoHereInTerminal(folder.clone()));
                 } else if let Some(row) = row {
                     this.open(row, cx);
                 }
@@ -3282,42 +3239,6 @@ impl Render for FilesView {
             .then(|| details_size * self.details_reveal.value())
             .filter(|width| *width >= 1.);
         let list_width = width - details_now.unwrap_or(0.);
-        let overlay = session_overlay::with_reconnect(
-            session_overlay::overlay_for(self.state.read(cx).session(self.session)),
-            self.state.read(cx).reconnect_attempt(&self.host),
-        );
-        let heading = self
-            .state
-            .read(cx)
-            .host(&self.host)
-            .map(session_overlay::heading);
-        let steps = session_overlay::steps_of(self.state.read(cx).host_session(&self.host));
-        // A retry may have started a new session: what it asks is for this tab as well.
-        let overlay = match self.state.read(cx).login_prompt(&self.host, cx) {
-            Some(prompt) => {
-                let own = present(&prompt, cx.entity_id(), &self.focus, window, cx);
-                Some(session_overlay::Overlay::Login { steps, prompt, own })
-            }
-            None => overlay,
-        };
-        // Outside the view below: a key pressed in the prompt must not act on the files.
-        let overlay = overlay.map(|overlay| {
-            session_overlay::render(
-                overlay,
-                session_overlay::Surface {
-                    heading,
-                    docked: !self.path.is_empty(),
-                    background: theme.bg,
-                    focus: self.focus.clone(),
-                    extra_steps: 0,
-                    owner: cx.entity_id(),
-                },
-                &theme,
-                window,
-                cx,
-                cx.listener(|this, _, _, cx| this.reconnect(cx)),
-            )
-        });
         let drop_highlight = theme.selected;
         let bar = {
             let (metrics, moved) = (self.list_scroll.clone(), self.list_scroll.clone());
@@ -3509,7 +3430,7 @@ impl Render for FilesView {
                     }),
                 )
             }));
-        div().relative().size_full().child(view).children(overlay)
+        div().relative().size_full().child(view)
     }
 }
 

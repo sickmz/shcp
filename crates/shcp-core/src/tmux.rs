@@ -829,6 +829,7 @@ pub(crate) async fn run(
             terminal.fit(cols, rows);
         }
         terminal.mark_shell_started();
+        terminal.reveal();
         if !info.existing
             && let Some(startup) = &command.startup
         {

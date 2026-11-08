@@ -17,6 +17,7 @@ use crate::modals::{
 use crate::motion::{self, Beat};
 use crate::notices;
 use crate::panel;
+use crate::session_overlay::{self, Overlay, Surface};
 use crate::sidebar::{OpenTab, Sidebar, SidebarEvent};
 use crate::state::{AppState, NoticeAction};
 use crate::tabs::{self, Face, Tab};
@@ -1232,7 +1233,7 @@ impl Workspace {
         }
     }
 
-    /// "Open terminal here" in the files.
+    /// Terminal actions from the file browser.
     fn on_files_event(
         &mut self,
         view: &Entity<FilesView>,
@@ -1240,9 +1241,25 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let FilesEvent::OpenTerminalHere(folder) = event;
-        let host = view.read(cx).host().clone();
-        self.open_terminal_in(host, folder, window, cx);
+        match event {
+            FilesEvent::OpenTerminalHere(folder) => {
+                let host = view.read(cx).host().clone();
+                self.open_terminal_in(host, folder, window, cx);
+            }
+            FilesEvent::GoHereInTerminal(folder) => {
+                let Some(tab) = self
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.files.as_ref() == Some(view))
+                else {
+                    return;
+                };
+                let terminal = tab.panes.read(cx).active().clone();
+                let command = format!("cd {}", shcp_core::shell_quote(folder));
+                terminal.update(cx, |terminal, cx| terminal.run_command(&command, cx));
+                window.focus(&terminal.focus_handle(cx));
+            }
+        }
     }
 
     /// A new terminal tab on a host, starting in a folder.
@@ -2279,7 +2296,7 @@ impl Workspace {
     }
 
     /// What the panel shows: the terminals, or them and the files with the link between them.
-    fn tab_content(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn tab_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(tab) = self.active.and_then(|i| self.tabs.get(i)) else {
             return self.empty_state(cx);
         };
@@ -2289,7 +2306,58 @@ impl Workspace {
         let bounds = self.both_bounds.clone();
         let alone = tab.files_alone(cx);
         let panes = tab.panes.clone();
-        match tab.files.clone().filter(|_| tab.face.shows_files()) {
+        let state = self.state.read(cx);
+        let session = state.host_session(&tab.host);
+        let focus = if tab.face.shows_files() {
+            tab.files.as_ref().map(|files| files.focus_handle(cx))
+        } else {
+            None
+        }
+        .unwrap_or_else(|| panes.read(cx).active().focus_handle(cx));
+        let reconnecting = panes.read(cx).had_session()
+            || tab
+                .files
+                .as_ref()
+                .is_some_and(|files| !files.read(cx).path().is_empty());
+        let heading = state.host(&tab.host).map(session_overlay::heading);
+        let mut overlay = session_overlay::with_reconnect(
+            session_overlay::overlay_for(session),
+            state.reconnect_attempt(&tab.host),
+        );
+        let steps = session_overlay::steps_of(session);
+        let shell_steps = session_overlay::shell_steps(session);
+        if let Some(prompt) = state.login_prompt(&tab.host, cx) {
+            let own = crate::login_prompt::present(&prompt, cx.entity_id(), &focus, window, cx);
+            overlay = Some(Overlay::Login { steps, prompt, own });
+        }
+        if overlay.is_none() && !tab.face.shows_files() && panes.read(cx).initial_shell_pending(cx)
+        {
+            overlay = Some(Overlay::StartingShell { steps: shell_steps });
+        }
+        let retry_panes = panes.clone();
+        let host = tab.host.clone();
+        let overlay = overlay.map(|overlay| {
+            session_overlay::render(
+                overlay,
+                Surface {
+                    heading,
+                    reconnecting,
+                    docked: false,
+                    background: theme.scrim,
+                    focus,
+                    extra_steps: if tab.face.shows_files() { 0 } else { 1 },
+                    owner: cx.entity_id(),
+                },
+                &theme,
+                window,
+                cx,
+                cx.listener(move |this, _, _, cx| {
+                    this.stop_reconnecting(&host, cx);
+                    retry_panes.update(cx, |panes, cx| panes.retry(cx));
+                }),
+            )
+        });
+        let content = match tab.files.clone().filter(|_| tab.face.shows_files()) {
             Some(files) if alone => files.into_any_element(),
             Some(files) => div()
                 .size_full()
@@ -2374,7 +2442,13 @@ impl Workspace {
                 .child(div().flex_1().min_w_0().h_full().child(files))
                 .into_any_element(),
             None => panes.into_any_element(),
-        }
+        };
+        div()
+            .relative()
+            .size_full()
+            .child(content)
+            .children(overlay)
+            .into_any_element()
     }
 
     /// In the middle of the top of the window: leads to the palette, where typing happens. Around
@@ -2556,7 +2630,7 @@ impl Render for Workspace {
         let sidebar_amount = self.sidebar_amount;
         let dock_amount = self.dock_reveal.value();
         let sidebar_size = self.state.read(cx).settings.sidebar_width + 8.;
-        let content = self.tab_content(cx);
+        let content = self.tab_content(window, cx);
         // A view chosen with the mouse fades in. Only then: tabs and the keyboard change at once.
         let fade = self
             .active
