@@ -59,6 +59,7 @@ pub trait ModalView:
 }
 
 type Cancel = Rc<dyn Fn(&mut Window, &mut gpui::App)>;
+type CurrentFocus = Box<dyn Fn(&gpui::App) -> Option<FocusHandle>>;
 type InlineLogin = Box<
     dyn Fn(
         &shcp_core::HostId,
@@ -74,7 +75,7 @@ struct Active {
     view: AnyView,
     entrance: bool,
     focus: FocusHandle,
-    current_focus: Box<dyn Fn(&gpui::App) -> Option<FocusHandle>>,
+    current_focus: CurrentFocus,
     cancel: Cancel,
     dirty: Box<dyn Fn(&gpui::App) -> bool>,
     inline_login: InlineLogin,
