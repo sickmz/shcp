@@ -8,7 +8,6 @@ use crate::modals::{
     confirm::ConfirmModal,
     host_commands::HostCommandsModal,
     host_editor::{ConnectHandler, HostEditor},
-    host_settings::{HostPage, HostSettingsModal},
     key_setup::KeySetupModal,
     login::LoginModal,
     palette::{CommandPalette, PaletteItem},
@@ -41,8 +40,8 @@ use gpui::{
     WindowControlArea, div, px, relative,
 };
 use shcp_core::{
-    ConnectErrorKind, Event, ForwardState, HostConfig, HostId, HostSource, NoticeLevel, SavedPane,
-    SavedTab, SavedTabs, SavedWindow, SessionId, SessionState, SplitAxis, TransferState,
+    ConnectErrorKind, Event, ForwardState, HostId, NoticeLevel, SavedPane, SavedTab, SavedTabs,
+    SavedWindow, SessionId, SessionState, SplitAxis, TransferState,
 };
 use shcp_core::{SharedTab, SharedTabs, TerminalId};
 use std::{
@@ -933,7 +932,12 @@ impl Workspace {
         let prompt = cx.new(|cx| LoginPrompt::new(engine, session, ask, retry, window, cx));
         self.state
             .update(cx, |s, cx| s.set_login_prompt(host, prompt.clone(), cx));
-        if !self.tabs.iter().any(|tab| tab.host == *host) {
+        if self.modals.update(cx, |modals, cx| {
+            modals.inline_login(host, prompt.clone(), window, cx)
+        }) {
+            return;
+        }
+        if self.modals.read(cx).is_open() || !self.tabs.iter().any(|tab| tab.host == *host) {
             self.show_login_modal(host, prompt, session, window, cx);
         }
     }
@@ -948,9 +952,8 @@ impl Workspace {
     ) {
         let alias = self.alias(host, cx);
         let modal = cx.new(|cx| LoginModal::new(alias, prompt, cx));
-        self.modals.update(cx, |m, cx| {
-            m.show_for_session(modal, Some(session), window, cx)
-        });
+        self.modals
+            .update(cx, |m, cx| m.show_front(modal, Some(session), window, cx));
     }
 
     fn on_core_event(
@@ -1456,33 +1459,16 @@ impl Workspace {
 
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let state = self.state.clone();
-        let workspace = cx.entity().downgrade();
-        let open_host = std::rc::Rc::new(move |host: HostId, window: &mut Window, cx: &mut App| {
-            workspace
-                .update(cx, |workspace, cx| {
-                    workspace.host_settings(&host, window, cx)
-                })
-                .ok();
-        });
-        let modal = cx.new(|cx| SettingsModal::new(state, open_host, window, cx));
+        let modals = self.modals.clone();
+        let modal = cx.new(|cx| SettingsModal::new(state, modals, window, cx));
         self.modals.update(cx, |m, cx| m.show(modal, window, cx));
     }
 
-    /// All that belongs to a host, from its menu or from the settings.
+    /// The host menu opens its page inside Settings, with navigation back to Hosts.
     fn host_settings(&mut self, host: &HostId, window: &mut Window, cx: &mut Context<Self>) {
         let (state, host) = (self.state.clone(), host.clone());
-        let workspace = cx.entity().downgrade();
-        let target = host.clone();
-        let open = std::rc::Rc::new(move |page: HostPage, window: &mut Window, cx: &mut App| {
-            workspace
-                .update(cx, |workspace, cx| match page {
-                    HostPage::Connection => workspace.edit_host(&target, window, cx),
-                    HostPage::KeyLogin => workspace.set_up_key(&target, window, cx),
-                    HostPage::Commands => workspace.edit_commands(&target, window, cx),
-                })
-                .ok();
-        });
-        let modal = cx.new(|cx| HostSettingsModal::new(state, host, open, cx));
+        let modals = self.modals.clone();
+        let modal = cx.new(|cx| SettingsModal::for_host(state, modals, host, window, cx));
         self.modals.update(cx, |m, cx| m.show(modal, window, cx));
     }
 
@@ -1774,19 +1760,6 @@ impl Workspace {
         } else if let Some(folder) = path.parent().filter(|folder| folder.exists()) {
             cx.open_with_system(folder);
         }
-    }
-
-    fn edit_host(&mut self, id: &HostId, window: &mut Window, cx: &mut Context<Self>) {
-        let host: Option<HostConfig> = self
-            .state
-            .read(cx)
-            .host(id)
-            .filter(|h| h.source == HostSource::App)
-            .cloned();
-        let Some(host) = host else { return };
-        let (state, modals) = (self.state.clone(), self.modals.clone());
-        let editor = cx.new(|cx| HostEditor::new(state, modals.clone(), Some(host), window, cx));
-        modals.update(cx, |m, cx| m.show(editor, window, cx));
     }
 
     // ---- rendering ----

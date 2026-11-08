@@ -1,7 +1,7 @@
 //! What a host runs: the command every new terminal starts with, and the saved commands the
 //! palette offers. A modal of its own, because `HostEditor` never opens for the read-only
 //! `~/.ssh/config` hosts.
-use super::{button_row, card, title};
+use super::{button_row, editor_frame, title};
 use crate::state::AppState;
 use crate::theme::{ActiveTheme as _, ui_px};
 use crate::widgets::button::{Button, ButtonStyle};
@@ -22,6 +22,7 @@ struct Row {
 }
 
 pub struct HostCommandsModal {
+    embedded: bool,
     state: Entity<AppState>,
     host: HostId,
     alias: String,
@@ -41,6 +42,11 @@ impl Focusable for HostCommandsModal {
 }
 
 impl HostCommandsModal {
+    pub fn embedded(mut self) -> Self {
+        self.embedded = true;
+        self
+    }
+
     pub fn new(
         state: Entity<AppState>,
         host: HostId,
@@ -73,6 +79,7 @@ impl HostCommandsModal {
         });
         let subscriptions = vec![Self::watch(&startup, window, cx)];
         let mut this = Self {
+            embedded: false,
             state,
             host,
             alias,
@@ -209,8 +216,10 @@ impl Render for HostCommandsModal {
             })
             .collect();
         let empty = rows.is_empty();
-        card(&theme, 620.)
-            .child(title(&theme, format!("Commands of {}", self.alias)))
+        editor_frame(&theme, 620., self.embedded)
+            .when(!self.embedded, |this| {
+                this.child(title(&theme, format!("Commands of {}", self.alias)))
+            })
             .child(label("Run in every new terminal"))
             .child(div().child(self.startup.clone()))
             .child(label("Saved commands. Ctrl+Shift+K finds and runs them"))

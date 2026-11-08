@@ -1,5 +1,15 @@
 //! Settings dialog: categories on the left, every change applied and saved immediately.
+#[path = "settings_hosts.rs"]
+mod hosts;
 use super::theme_browser::{ThemeBrowser, ThemeBrowserEvent};
+use super::{
+    ModalLayer, ModalView,
+    confirm::ConfirmModal,
+    host_commands::HostCommandsModal,
+    host_editor::HostEditor,
+    host_settings::{HostPage, HostSettingsModal},
+    key_setup::KeySetupModal,
+};
 use crate::actions::{self, SHORTCUTS, Shortcut};
 use crate::state::AppState;
 use crate::theme::icon_theme::{IconTheme, IconThemeCatalog};
@@ -12,9 +22,9 @@ use crate::widgets::text_input::{TextInput, TextInputEvent};
 use crate::widgets::tooltip::tooltip;
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    KeyDownEvent, PathPromptOptions, SharedString, Subscription, Task, Window, anchored, deferred,
-    div, img, px, relative,
+    AnyElement, AnyView, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    KeyDownEvent, PathPromptOptions, ScrollHandle, SharedString, Subscription, Task, Window,
+    anchored, deferred, div, img, px, relative,
 };
 use shcp_core::{Accent, CursorStyle, Density, HostId, KnownHost, NoticeLevel, Settings};
 use std::{path::PathBuf, rc::Rc, time::Duration};
@@ -71,12 +81,34 @@ const FIXED_SHORTCUTS: [(&str, &str); 8] = [
 
 /// Applies one value of a setting (from a click) to the settings and saves them.
 pub(super) type Setter<T> = Rc<dyn Fn(T, &mut Window, &mut App)>;
-/// Opens the settings of a host. Only one modal shows at a time, so this one closes first.
-pub type OpenHostSettings = Rc<dyn Fn(HostId, &mut Window, &mut App)>;
+#[derive(Clone, Copy)]
+enum HostSection {
+    Overview,
+    Editor(HostPage),
+}
+
+struct HostDetail {
+    host: HostId,
+    section: HostSection,
+    view: AnyView,
+    focus: FocusHandle,
+    key_setup: Option<Entity<KeySetupModal>>,
+    dirty: Box<dyn Fn(&App) -> bool>,
+    _subscriptions: Vec<Subscription>,
+}
+
+#[derive(Clone, Copy)]
+enum Destination {
+    Back,
+    Category(Page),
+}
 
 pub struct SettingsModal {
     state: Entity<AppState>,
-    open_host: OpenHostSettings,
+    modals: Entity<ModalLayer>,
+    host_detail: Option<HostDetail>,
+    list_scroll: ScrollHandle,
+    detail_scroll: ScrollHandle,
     page: Page,
     search: Entity<TextInput>,
     editor: Entity<TextInput>,
@@ -108,14 +140,22 @@ impl EventEmitter<super::CancelEvent> for SettingsModal {}
 
 impl Focusable for SettingsModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.search.focus_handle(cx)
+        self.host_detail.as_ref().map_or_else(
+            || self.search.focus_handle(cx),
+            |detail| {
+                detail
+                    .key_setup
+                    .as_ref()
+                    .map_or_else(|| detail.focus.clone(), |view| view.focus_handle(cx))
+            },
+        )
     }
 }
 
 impl SettingsModal {
     pub fn new(
         state: Entity<AppState>,
-        open_host: OpenHostSettings,
+        modals: Entity<ModalLayer>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -139,7 +179,7 @@ impl SettingsModal {
         let icon_themes_dir = state.read(cx).engine.paths().config_dir.join("icon-themes");
         let icon_theme_browser =
             cx.new(|cx| ThemeBrowser::new(ThemeKind::Icon, icon_themes_dir, window, cx));
-        let subscriptions =
+        let mut subscriptions =
             vec![
                 cx.subscribe_in(
                     &theme_browser,
@@ -188,9 +228,13 @@ impl SettingsModal {
                     },
                 ),
             ];
+        subscriptions.push(cx.observe(&state, |_, _, cx| cx.notify()));
         Self {
             state,
-            open_host,
+            modals,
+            host_detail: None,
+            list_scroll: ScrollHandle::new(),
+            detail_scroll: ScrollHandle::new(),
             page: Page::Appearance,
             search,
             editor,
@@ -1172,13 +1216,11 @@ impl SettingsModal {
                     &theme,
                     host.alias,
                     Some(help.into()),
-                    Button::new(("host-open-settings", index))
+                    Button::new(("host-edit", index))
                         .keyboard_focus()
-                        .label("Settings")
+                        .label("Edit")
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.close(cx);
-                            let open = this.open_host.clone();
-                            open(id.clone(), window, cx);
+                            this.open_host_detail(id.clone(), window, cx)
                         })),
                 )
             })
@@ -1939,11 +1981,12 @@ impl SettingsModal {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme().clone();
-        let active = !searching
-            && (self.page == page
-                || (matches!(self.page, Page::ThemeBrowser | Page::IconThemeBrowser)
-                    && page == Page::Appearance)
-                || (self.page == Page::KnownHosts && page == Page::Connections));
+        let active = (self.host_detail.is_some() && page == Page::Hosts)
+            || (!searching
+                && (self.page == page
+                    || (matches!(self.page, Page::ThemeBrowser | Page::IconThemeBrowser)
+                        && page == Page::Appearance)
+                    || (self.page == Page::KnownHosts && page == Page::Connections)));
         let (hover, press) = (theme.hover, theme.active);
         div()
             .id(label)
@@ -1961,10 +2004,7 @@ impl SettingsModal {
                 s.hover(move |s| s.bg(hover)).active(move |s| s.bg(press))
             })
             .on_click(cx.listener(move |this, _, window, cx| {
-                this.page = page;
-                this.search.update(cx, |input, cx| input.set_text("", cx));
-                this.search.read(cx).focus(window);
-                cx.notify();
+                this.navigate(Destination::Category(page), window, cx);
             }))
             .child(Icon::new(icon).color(if active {
                 theme.accent
@@ -2024,23 +2064,49 @@ impl Render for SettingsModal {
             .paths()
             .config_dir
             .join("settings.toml");
-        let title = if searching {
-            "Search results"
+        let host_alias: Option<SharedString> = self.host_detail.as_ref().map(|detail| {
+            self.state
+                .read(cx)
+                .host(&detail.host)
+                .map_or(detail.host.0.clone(), |host| host.alias.clone())
+                .into()
+        });
+        let back_label: SharedString = if self
+            .host_detail
+            .as_ref()
+            .is_some_and(|detail| matches!(detail.section, HostSection::Overview))
+        {
+            "Hosts".into()
+        } else {
+            host_alias.clone().unwrap_or_else(|| "Hosts".into())
+        };
+        let title: SharedString = if let Some(detail) = &self.host_detail {
+            match detail.section {
+                HostSection::Overview => host_alias.clone().unwrap_or_else(|| "Host".into()),
+                HostSection::Editor(HostPage::Connection) => "Connection".into(),
+                HostSection::Editor(HostPage::Commands) => "Commands".into(),
+                HostSection::Editor(HostPage::KeyLogin) => "Key login".into(),
+            }
+        } else if searching {
+            "Search results".into()
         } else if self.page == Page::About {
-            "About"
+            "About".into()
         } else if self.page == Page::ThemeBrowser {
-            "Browse themes"
+            "Browse themes".into()
         } else if self.page == Page::IconThemeBrowser {
-            "Browse file icon themes"
+            "Browse file icon themes".into()
         } else if self.page == Page::KnownHosts {
-            "Trusted servers"
+            "Trusted servers".into()
         } else {
             PAGES
                 .iter()
                 .find(|(page, ..)| *page == self.page)
                 .map_or("Settings", |(_, label, _)| *label)
+                .into()
         };
-        let content: Vec<AnyElement> = if searching {
+        let content: Vec<AnyElement> = if let Some(detail) = &self.host_detail {
+            vec![detail.view.clone().into_any_element()]
+        } else if searching {
             self.search_results(&query, cx)
         } else if self.page == Page::About {
             vec![self.about(cx)]
@@ -2092,7 +2158,14 @@ impl Render for SettingsModal {
                     .bg(theme.surface)
                     .border_r_1()
                     .border_color(theme.border)
-                    .child(div().pb(px(10.)).child(self.search.clone()))
+                    .child(
+                        div()
+                            .pb(px(10.))
+                            .when(self.host_detail.is_none(), |this| {
+                                this.child(self.search.clone())
+                            })
+                            .when(self.host_detail.is_some(), |this| this.h(px(38.))),
+                    )
                     .children(nav)
                     .child(div().flex_1())
                     .child(about),
@@ -2106,32 +2179,99 @@ impl Render for SettingsModal {
                     .child(
                         div()
                             .flex()
+                            .flex_col()
                             .flex_none()
-                            .items_center()
-                            .justify_between()
+                            .gap(px(8.))
+                            .w_full()
+                            .min_w_0()
                             .pt(px(14.))
-                            .pb(px(6.))
+                            .pb(px(if self.host_detail.is_some() { 12. } else { 6. }))
                             .pl(px(24.))
                             .pr(px(12.))
                             .child(
                                 div()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_size(ui_px(17.))
-                                    .child(title),
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(12.))
+                                    .when(self.host_detail.is_some(), |this| {
+                                        this.child(
+                                            div().min_w_0().ml(px(-10.)).child(
+                                                Button::new("settings-host-back")
+                                                    .keyboard_focus()
+                                                    .icon(IconName::ArrowLeft)
+                                                    .label(back_label)
+                                                    .style(ButtonStyle::Ghost)
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.navigate(
+                                                                Destination::Back,
+                                                                window,
+                                                                cx,
+                                                            )
+                                                        },
+                                                    )),
+                                            ),
+                                        )
+                                    })
+                                    .when(self.host_detail.is_none(), |this| {
+                                        this.child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .truncate()
+                                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                .text_size(ui_px(17.))
+                                                .child(title.clone()),
+                                        )
+                                    })
+                                    .child(
+                                        Button::new("settings-close")
+                                            .keyboard_focus()
+                                            .icon(IconName::Close)
+                                            .tooltip("Close (Esc)")
+                                            .style(ButtonStyle::Ghost)
+                                            .on_click(cx.listener(|_, _, _, cx| {
+                                                cx.emit(super::CancelEvent)
+                                            })),
+                                    ),
                             )
-                            .child(
-                                Button::new("settings-close")
-                                    .keyboard_focus()
-                                    .icon(IconName::Close)
-                                    .tooltip("Close (Esc)")
-                                    .style(ButtonStyle::Ghost)
-                                    .on_click(cx.listener(|this, _, _, cx| this.close(cx))),
+                            .when(
+                                self.host_detail.as_ref().is_some_and(|detail| {
+                                    matches!(detail.section, HostSection::Editor(_))
+                                }),
+                                |this| {
+                                    this.child(
+                                        div()
+                                            .w_full()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(4.))
+                                            .pr(px(12.))
+                                            .child(
+                                                div()
+                                                    .w_full()
+                                                    .min_w_0()
+                                                    .flex_none()
+                                                    .whitespace_normal()
+                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                    .text_size(ui_px(17.))
+                                                    .child(title),
+                                            ),
+                                    )
+                                },
                             ),
                     )
                     .child(
                         // Not a flex column: that would squeeze the rows instead of scrolling.
                         div()
                             .id("settings-content")
+                            .track_scroll(if self.host_detail.is_some() {
+                                &self.detail_scroll
+                            } else {
+                                &self.list_scroll
+                            })
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()
@@ -2162,15 +2302,34 @@ impl Render for SettingsModal {
                                             .child(error),
                                     )
                             })
-                            .when(self.error.is_none(), |this| {
-                                this.child(Icon::new(IconName::Check).color(theme.success))
-                                    .child(
+                            .when(
+                                self.error.is_none()
+                                    && !self.host_detail.as_ref().is_some_and(|detail| {
+                                        matches!(detail.section, HostSection::Editor(_))
+                                    }),
+                                |this| {
+                                    this.child(Icon::new(IconName::Check).color(theme.success))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .text_color(theme.text_muted)
+                                                .child("Changes are saved automatically"),
+                                        )
+                                },
+                            )
+                            .when(
+                                self.host_detail.as_ref().is_some_and(|detail| {
+                                    matches!(detail.section, HostSection::Editor(_))
+                                }),
+                                |this| {
+                                    this.child(
                                         div()
                                             .flex_1()
                                             .text_color(theme.text_muted)
-                                            .child("Changes are saved automatically"),
+                                            .child("Save to apply changes"),
                                     )
-                            })
+                                },
+                            )
                             .child(
                                 Button::new("open-settings-file")
                                     .label("Open settings.toml")
@@ -2185,11 +2344,32 @@ impl Render for SettingsModal {
 }
 
 impl super::ModalView for SettingsModal {
-    fn cancel(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn inline_login(
+        &mut self,
+        host: &HostId,
+        prompt: Entity<crate::login_prompt::LoginPrompt>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(detail) = &self.host_detail else {
+            return false;
+        };
+        let Some(key_setup) = detail.key_setup.clone().filter(|_| detail.host == *host) else {
+            return false;
+        };
+        key_setup.update(cx, |view, cx| view.show_login(prompt, window, cx));
+        cx.notify();
+        true
+    }
+    fn has_unsaved_changes(&self, _: &[String], cx: &App) -> bool {
+        self.host_has_edits(cx)
+    }
+    fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.open_dropdown.is_some() {
             self.open_dropdown = None;
             cx.notify();
         } else {
+            self.cancel_key_login(window, cx);
             self.close(cx);
         }
     }

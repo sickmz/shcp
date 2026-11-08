@@ -1,5 +1,6 @@
 //! Guided move from a password to a key: creates the key if needed and installs it on the server.
-use super::{button_row, card, title};
+use super::{button_row, editor_frame, title};
+use crate::login_prompt::LoginPrompt;
 use crate::state::AppState;
 use crate::theme::{ActiveTheme as _, ui_px};
 use crate::widgets::button::{Button, ButtonStyle};
@@ -17,9 +18,12 @@ use std::path::{Path, PathBuf};
 const DEFAULT_KEYS: [&str; 3] = ["id_ed25519", "id_ecdsa", "id_rsa"];
 
 pub struct KeySetupModal {
+    embedded: bool,
     state: Entity<AppState>,
     host: HostConfig,
     session: SessionId,
+    login: Option<Entity<LoginPrompt>>,
+    login_subscription: Option<Subscription>,
     path: Entity<TextInput>,
     passphrase: Entity<TextInput>,
     /// The installation under way, and the key it is for.
@@ -34,11 +38,46 @@ impl EventEmitter<super::CancelEvent> for KeySetupModal {}
 
 impl Focusable for KeySetupModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.path.focus_handle(cx)
+        self.login.as_ref().map_or_else(
+            || self.path.focus_handle(cx),
+            |prompt| prompt.focus_handle(cx),
+        )
     }
 }
 
 impl KeySetupModal {
+    pub fn show_login(
+        &mut self,
+        prompt: Entity<LoginPrompt>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        prompt.read(cx).set_owner(cx.entity_id());
+        self.login_subscription =
+            Some(
+                cx.subscribe_in(&prompt, window, |this, _, _: &DismissEvent, window, cx| {
+                    this.login = None;
+                    window.focus(&this.path.focus_handle(cx));
+                    cx.notify();
+                }),
+            );
+        window.focus(&prompt.focus_handle(cx));
+        self.login = Some(prompt);
+        cx.notify();
+    }
+
+    pub fn cancel_login(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(prompt) = self.login.take() {
+            prompt.update(cx, |prompt, cx| prompt.answer(false, window, cx));
+        }
+        self.login_subscription = None;
+    }
+
+    pub fn embedded(mut self) -> Self {
+        self.embedded = true;
+        self
+    }
+
     pub fn new(
         state: Entity<AppState>,
         host: HostConfig,
@@ -59,6 +98,7 @@ impl KeySetupModal {
         });
         let passphrase = cx.new(|cx| TextInput::new("Passphrase, optional", true, cx));
         let subscriptions = vec![
+            cx.observe(&state, |_, _, cx| cx.notify()),
             cx.subscribe_in(&path, window, Self::on_input),
             cx.subscribe_in(&passphrase, window, Self::on_input),
             cx.subscribe(&state, |this, _, event: &Event, cx| {
@@ -66,9 +106,12 @@ impl KeySetupModal {
             }),
         ];
         Self {
+            embedded: false,
             state,
             host,
             session,
+            login: None,
+            login_subscription: None,
             path,
             passphrase,
             pending: None,
@@ -93,6 +136,14 @@ impl KeySetupModal {
     }
 
     fn on_event(&mut self, event: &Event, cx: &mut Context<Self>) {
+        if let Event::Session { id, state, .. } = event
+            && *id == self.session
+            && crate::login_prompt::LoginAsk::from_state(state).is_none()
+        {
+            self.login = None;
+            self.login_subscription = None;
+            cx.notify();
+        }
         let Event::OpDone { req, result } = event else {
             return;
         };
@@ -139,6 +190,14 @@ impl KeySetupModal {
 
     fn install(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if self.pending.is_some() || self.finished.is_some() {
+            return;
+        }
+        if !self
+            .state
+            .read(cx)
+            .session(self.session)
+            .is_some_and(|info| matches!(info.state, shcp_core::SessionState::Connected))
+        {
             return;
         }
         let typed = self.path.read(cx).text().trim().to_string();
@@ -200,10 +259,23 @@ pub(super) fn expand(typed: &str, ssh: &Path) -> PathBuf {
 impl Render for KeySetupModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        if let Some(prompt) = &self.login {
+            return editor_frame(&theme, 560., self.embedded)
+                .when(!self.embedded, |this| {
+                    this.child(title(&theme, format!("Sign in to {}", self.host.alias)))
+                })
+                .child(prompt.clone())
+                .into_any_element();
+        }
         let typed = self.path.read(cx).text().trim().to_string();
         let key = expand(&typed, &ssh_folder(&self.state, cx));
         let exists = !typed.is_empty() && key.exists();
         let working = self.pending.is_some();
+        let connected = self
+            .state
+            .read(cx)
+            .session(self.session)
+            .is_some_and(|info| matches!(info.state, shcp_core::SessionState::Connected));
         let finished = self.finished.clone();
         let target = format!("{}@{}", self.host.user, self.host.hostname);
         let label = |text: &'static str| {
@@ -213,8 +285,11 @@ impl Render for KeySetupModal {
                 .text_color(theme.text_muted)
                 .child(text)
         };
-        card(&theme, 560.)
-            .child(title(&theme, format!("Set up key login for {}", self.host.alias)))
+        editor_frame(&theme, 560., self.embedded)
+            .when(self.embedded && !connected, |this| this.child(div().text_color(theme.text_muted).child("Connect to the server to install a key. Complete any sign-in prompt to continue.")))
+            .when(!self.embedded, |this| {
+                this.child(title(&theme, format!("Set up key login for {}", self.host.alias)))
+            })
             .child(div().text_color(theme.text_muted).child(format!(
                 "A key replaces the password. Its public half goes in ~/.ssh/authorized_keys of {target}, \
                  through this connection, and the private one stays on this PC."
@@ -289,13 +364,14 @@ impl Render for KeySetupModal {
                                     "Create and install"
                                 })
                                 .style(ButtonStyle::Primary)
-                                .disabled(working)
+                                .disabled(working || !connected)
                                 .on_click(
                                     cx.listener(|this, _, window, cx| this.install(window, cx)),
                                 ),
                         )
                     }),
             )
+            .into_any_element()
     }
 }
 

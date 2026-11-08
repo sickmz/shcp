@@ -3,7 +3,7 @@
 //! have editors of their own, which take its place.
 use super::host_appearance::AppearancePicker;
 use super::settings::{Setter, row, switch};
-use super::{button_row, card, title};
+use super::{button_row, editor_frame, title};
 use crate::state::AppState;
 use crate::theme::ActiveTheme as _;
 use crate::widgets::button::{Button, ButtonStyle};
@@ -28,6 +28,7 @@ pub enum HostPage {
 pub type OpenHostPage = Rc<dyn Fn(HostPage, &mut Window, &mut App)>;
 
 pub struct HostSettingsModal {
+    embedded: bool,
     state: Entity<AppState>,
     host: HostId,
     picker: Entity<AppearancePicker>,
@@ -46,6 +47,11 @@ impl Focusable for HostSettingsModal {
 }
 
 impl HostSettingsModal {
+    pub fn embedded(mut self) -> Self {
+        self.embedded = true;
+        self
+    }
+
     pub fn new(
         state: Entity<AppState>,
         host: HostId,
@@ -67,6 +73,7 @@ impl HostSettingsModal {
             cx.observe(&state, |_, _, cx| cx.notify()),
         ];
         Self {
+            embedded: false,
             state,
             host,
             picker,
@@ -77,7 +84,9 @@ impl HostSettingsModal {
     }
 
     fn go_to(&mut self, page: HostPage, window: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(DismissEvent);
+        if !self.embedded {
+            cx.emit(DismissEvent);
+        }
         let open = self.open.clone();
         open(page, window, cx);
     }
@@ -135,11 +144,8 @@ impl Render for HostSettingsModal {
                 state.logs_sessions(&self.host),
             )
         };
-        let connection_help = if editable {
-            address
-        } else {
-            format!("{address}. It comes from ~/.ssh/config: change it there")
-        };
+        let connection_help: Option<SharedString> =
+            (!editable).then(|| "Managed in ~/.ssh/config".into());
         let toggle = |toggle: fn(&mut AppState, &HostId, &mut Context<AppState>)| -> Setter<bool> {
             let (state, host) = (self.state.clone(), self.host.clone());
             Rc::new(move |_, _, cx: &mut App| {
@@ -148,44 +154,85 @@ impl Render for HostSettingsModal {
         };
         let keep_switch = toggle(AppState::toggle_keep_terminals);
         let log_switch = toggle(AppState::toggle_session_log);
-        card(&theme, 520.)
+        editor_frame(&theme, 520., self.embedded)
             .track_focus(&self.focus)
-            .child(title(&theme, format!("Settings of {alias}")))
+            .when(!self.embedded, |this| {
+                this.child(title(&theme, format!("Settings of {alias}")))
+            })
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .child(row(
-                        &theme,
-                        "Connection",
-                        Some(connection_help.into()),
+                    .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(4.))
+                            .gap(px(16.))
+                            .min_h(px(48.))
+                            .py(px(8.))
+                            .border_b_1()
+                            .border_color(theme.hover)
                             .child(
-                                Button::new("host-copy-target")
-                                    .keyboard_focus()
-                                    .icon(IconName::Copy)
-                                    .tooltip("Copy user@host")
-                                    .style(ButtonStyle::Ghost)
-                                    .on_click(move |_, _, cx| {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            target.clone(),
-                                        ));
-                                    }),
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_wrap()
+                                            .items_center()
+                                            .gap(px(6.))
+                                            .child(
+                                                div()
+                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                    .child(alias),
+                                            )
+                                            .child(div().text_color(theme.text_muted).child("•"))
+                                            .child(
+                                                div()
+                                                    .min_w_0()
+                                                    .text_color(theme.text_muted)
+                                                    .child(address),
+                                            ),
+                                    )
+                                    .children(connection_help.map(|help| {
+                                        div()
+                                            .text_size(crate::theme::ui_px(12.))
+                                            .text_color(theme.text_muted)
+                                            .child(help)
+                                    })),
                             )
-                            .when(editable, |this| {
-                                this.child(
-                                    Button::new("host-edit-connection")
-                                        .keyboard_focus()
-                                        .label("Edit")
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.go_to(HostPage::Connection, window, cx)
-                                        })),
-                                )
-                            }),
-                    ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.))
+                                    .child(
+                                        Button::new("host-copy-target")
+                                            .keyboard_focus()
+                                            .icon(IconName::Copy)
+                                            .tooltip("Copy user@host")
+                                            .style(ButtonStyle::Ghost)
+                                            .on_click(move |_, _, cx| {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                                    target.clone(),
+                                                ));
+                                            }),
+                                    )
+                                    .when(editable, |this| {
+                                        this.child(
+                                            Button::new("host-edit-connection")
+                                                .keyboard_focus()
+                                                .label("Edit")
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.go_to(HostPage::Connection, window, cx)
+                                                })),
+                                        )
+                                    }),
+                            ),
+                    )
                     .child(row(
                         &theme,
                         "Key login",
@@ -227,15 +274,17 @@ impl Render for HostSettingsModal {
                     )),
             )
             .child(self.picker.clone())
-            .child(
-                button_row().child(
-                    Button::new("host-settings-close")
-                        .keyboard_focus()
-                        .label("Close")
-                        .style(ButtonStyle::Primary)
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
-                ),
-            )
+            .when(!self.embedded, |this| {
+                this.child(
+                    button_row().child(
+                        Button::new("host-settings-close")
+                            .keyboard_focus()
+                            .label("Close")
+                            .style(ButtonStyle::Primary)
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                    ),
+                )
+            })
     }
 }
 

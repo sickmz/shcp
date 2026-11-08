@@ -1,7 +1,7 @@
 //! Create / edit an app host (SSH config hosts are read-only and never reach this modal). The
 //! address comes first and is often all it takes: the rest has a default and appears when asked for.
 use super::key_setup::{expand, ssh_folder};
-use super::{ModalLayer, button_row, card, title};
+use super::{ModalLayer, button_row, editor_frame, title};
 use crate::modals::confirm::ConfirmModal;
 use crate::modals::host_appearance::AppearancePicker;
 use crate::state::AppState;
@@ -65,6 +65,7 @@ enum RowState {
 }
 
 pub struct HostEditor {
+    embedded: bool,
     state: Entity<AppState>,
     modals: Entity<ModalLayer>,
     /// The host being edited; `None` when creating.
@@ -114,6 +115,11 @@ impl Focusable for HostEditor {
 }
 
 impl HostEditor {
+    pub fn embedded(mut self) -> Self {
+        self.embedded = true;
+        self
+    }
+
     /// A new app host starting as a copy of another, which `~/.ssh/config` hosts can be too.
     pub fn duplicate(
         state: Entity<AppState>,
@@ -232,6 +238,7 @@ impl HostEditor {
         });
         let show_appearance = saved != HostAppearance::default() && original.is_some();
         Self {
+            embedded: false,
             state,
             modals,
             template: None,
@@ -711,28 +718,44 @@ impl HostEditor {
         };
         let state = self.state.clone();
         let name = id.0.clone();
+        let editor = cx.weak_entity();
+        let embedded = self.embedded;
         let confirm = cx.new(|cx| {
             ConfirmModal::new(
                 "Delete host",
                 format!("Delete \"{name}\"? This only removes it from shcp."),
                 "Delete",
                 move |_, cx| {
-                    state.update(cx, |state, cx| {
+                    let deleted = state.update(cx, |state, cx| {
                         if let Err(error) = state.engine.delete_host(&id) {
                             state.push_notice(
                                 NoticeLevel::Error,
                                 format!("Could not delete host: {error:#}"),
                                 cx,
                             );
+                            return false;
                         }
-                    })
+                        state.hosts = state.engine.hosts();
+                        cx.notify();
+                        true
+                    });
+                    if embedded && deleted {
+                        editor.update(cx, |_, cx| cx.emit(DismissEvent)).ok();
+                    }
                 },
                 cx,
             )
         });
-        self.modals
-            .update(cx, |layer, cx| layer.show(confirm, window, cx));
-        cx.emit(DismissEvent);
+        self.modals.update(cx, |layer, cx| {
+            if embedded {
+                layer.show_front(confirm, None, window, cx)
+            } else {
+                layer.show(confirm, window, cx)
+            }
+        });
+        if !embedded {
+            cx.emit(DismissEvent);
+        }
     }
 }
 
@@ -1439,9 +1462,10 @@ impl Render for HostEditor {
                 }),
             )
         });
-        card(&theme, 640.)
-            .max_w(relative(0.96))
-            .max_h(relative(0.96))
+        editor_frame(&theme, 640., self.embedded)
+            .when(!self.embedded, |this| {
+                this.max_w(relative(0.96)).max_h(relative(0.96))
+            })
             .child(
                 div()
                     .flex()

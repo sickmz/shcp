@@ -33,6 +33,17 @@ pub trait ModalView:
     /// Whether it fades in. Not what is opened all day from the keyboard.
     const ENTRANCE: bool = true;
 
+    /// A page that owns a connection flow can display its sign-in prompt inline.
+    fn inline_login(
+        &mut self,
+        _host: &shcp_core::HostId,
+        _prompt: Entity<crate::login_prompt::LoginPrompt>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> bool {
+        false
+    }
+
     /// Editable values before saving. UI-only state does not count as a change.
     fn draft(&self, _cx: &gpui::App) -> Vec<String> {
         Vec::new()
@@ -48,6 +59,14 @@ pub trait ModalView:
 }
 
 type Cancel = Rc<dyn Fn(&mut Window, &mut gpui::App)>;
+type InlineLogin = Box<
+    dyn Fn(
+        &shcp_core::HostId,
+        Entity<crate::login_prompt::LoginPrompt>,
+        &mut Window,
+        &mut gpui::App,
+    ) -> bool,
+>;
 
 struct Active {
     id: EntityId,
@@ -55,8 +74,10 @@ struct Active {
     view: AnyView,
     entrance: bool,
     focus: FocusHandle,
+    current_focus: Box<dyn Fn(&gpui::App) -> Option<FocusHandle>>,
     cancel: Cancel,
     dirty: Box<dyn Fn(&gpui::App) -> bool>,
+    inline_login: InlineLogin,
     _cancel_subscription: Subscription,
     _subscription: Subscription,
 }
@@ -71,6 +92,19 @@ pub struct ModalLayer {
 }
 
 impl ModalLayer {
+    pub fn inline_login(
+        &self,
+        host: &shcp_core::HostId,
+        prompt: Entity<crate::login_prompt::LoginPrompt>,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> bool {
+        self.stack
+            .iter()
+            .rev()
+            .any(|active| (active.inline_login)(host, prompt.clone(), window, cx))
+    }
+
     pub fn is_open(&self) -> bool {
         !self.stack.is_empty()
     }
@@ -110,6 +144,9 @@ impl ModalLayer {
         );
         let focus = modal.focus_handle(cx);
         let weak = modal.downgrade();
+        let current_focus =
+            Box::new(move |cx: &gpui::App| weak.upgrade().map(|modal| modal.focus_handle(cx)));
+        let weak = modal.downgrade();
         let cancel = Rc::new(move |window: &mut Window, cx: &mut gpui::App| {
             weak.update(cx, |modal, cx| modal.cancel(window, cx)).ok();
         });
@@ -128,14 +165,23 @@ impl ModalLayer {
                 }
             },
         );
+        let weak = modal.downgrade();
+        let inline_login = Box::new(
+            move |host: &shcp_core::HostId, prompt, window: &mut Window, cx: &mut gpui::App| {
+                weak.update(cx, |modal, cx| modal.inline_login(host, prompt, window, cx))
+                    .unwrap_or(false)
+            },
+        );
         self.stack.push(Active {
             id,
             session,
             view: modal.into(),
             entrance: M::ENTRANCE && !std::mem::take(&mut self.skip_next_entrance),
             focus,
+            current_focus,
             cancel,
             dirty,
+            inline_login,
             _cancel_subscription: cancel_subscription,
             _subscription: subscription,
         });
@@ -162,6 +208,20 @@ impl ModalLayer {
         }
     }
 
+    /// Interrupt the current page with a confirmation or an authentication prompt.
+    pub fn show_front<M: ModalView>(
+        &mut self,
+        modal: Entity<M>,
+        session: Option<shcp_core::SessionId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_for_session(modal, session, window, cx);
+        let front = self.stack.pop().unwrap();
+        window.focus(&front.focus);
+        self.stack.insert(0, front);
+    }
+
     fn request_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(active) = self.stack.first() else {
             return;
@@ -181,11 +241,7 @@ impl ModalLayer {
                 cx,
             )
         });
-        self.show_for_session(confirm, session, window, cx);
-        // Unlike queued session prompts, this confirmation must precede its editor.
-        let confirmation = self.stack.pop().unwrap();
-        window.focus(&confirmation.focus);
-        self.stack.insert(0, confirmation);
+        self.show_front(confirm, session, window, cx);
     }
 
     fn step_focus(&self, reverse: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -211,7 +267,9 @@ impl ModalLayer {
         self.stack.retain(|a| a.id != id);
         if was_front {
             match self.stack.first() {
-                Some(next) => window.focus(&next.focus),
+                Some(next) => {
+                    window.focus(&(next.current_focus)(cx).unwrap_or_else(|| next.focus.clone()))
+                }
                 None => {
                     if let Some(restore) = self.restore.take() {
                         window.focus(&restore);
@@ -324,6 +382,15 @@ pub fn card(theme: &Theme, width: f32) -> Div {
         .shadow(crate::theme::float_shadow())
         .text_size(crate::theme::ui_px(13.))
         .text_color(theme.text)
+}
+
+/// An editor can also occupy the content pane of Settings, without a second card.
+pub fn editor_frame(theme: &Theme, width: f32, embedded: bool) -> Div {
+    if embedded {
+        div().w_full().min_w_0().flex().flex_col().gap(px(12.))
+    } else {
+        card(theme, width)
+    }
 }
 
 pub fn title(theme: &Theme, text: impl Into<gpui::SharedString>) -> Div {
