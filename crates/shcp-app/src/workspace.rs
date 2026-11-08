@@ -759,10 +759,6 @@ impl Workspace {
             }
             SidebarEvent::NewHost => self.new_host(window, cx),
             SidebarEvent::OpenSettings => self.open_settings(window, cx),
-            SidebarEvent::HideSidebar => {
-                self.arm_sidebar(cx);
-                self.toggle_sidebar(window, cx)
-            }
             SidebarEvent::RestartForUpdate => self.confirm_update_restart(window, cx),
             SidebarEvent::NewTab(host) => self.open_terminal(host.clone(), window, cx),
             SidebarEvent::ActivateTab(id) => {
@@ -2024,7 +2020,24 @@ impl Workspace {
         )
     }
 
-    /// The top of the window: where this tab is, how it shows it, and what acts on that.
+    /// Keep the panel header's height consistent even without an open tab.
+    fn panel_header(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let location = self.location_bar(cx);
+        div()
+            .h(row_px(LOCATION_HEIGHT))
+            .flex_none()
+            .flex()
+            .items_center()
+            .pl(px(10.))
+            .gap(px(4.))
+            .border_b_1()
+            .border_color(theme.border)
+            .children(location)
+            .into_any_element()
+    }
+
+    /// Where this tab is, how it shows it, and what acts on that.
     fn location_bar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let index = self.active?;
         let theme = cx.theme().clone();
@@ -2098,16 +2111,13 @@ impl Workspace {
         });
         Some(
             div()
-                .h(row_px(LOCATION_HEIGHT))
-                .w_full()
-                .flex_none()
+                .h_full()
+                .min_w_0()
+                .flex_1()
                 .flex()
                 .items_center()
                 .gap(px(4.))
-                .pl(px(10.))
                 .pr(px(8.))
-                .border_b_1()
-                .border_color(theme.border)
                 .children(nav)
                 .child(
                     div()
@@ -2589,7 +2599,7 @@ impl Render for Workspace {
             .into_any_element(),
             None => content,
         };
-        let location = self.location_bar(cx);
+        let location = self.panel_header(cx);
         let status_bar = self.status_bar(cx);
         let has_status_bar = status_bar.is_some();
         div()
@@ -2749,29 +2759,7 @@ impl Render for Workspace {
                             .flex()
                             .items_center()
                             .pr(px(title_bar::captions_width() + 8.))
-                            .window_control_area(WindowControlArea::Drag)
-                            .when(!self.sidebar_visible, |this| {
-                                this.pl(px(6.)).child(
-                                    // Occluding: this row drags the window everywhere else.
-                                    div()
-                                        .id("tab-row-sidebar-actions")
-                                        .occlude()
-                                        .flex()
-                                        .flex_none()
-                                        .gap(px(2.))
-                                        .pr(px(8.))
-                                        .child(
-                                            Button::new("show-sidebar")
-                                                .icon(IconName::PanelLeft)
-                                                .tooltip("Show sidebar (Ctrl+Shift+B)")
-                                                .style(ButtonStyle::Ghost)
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.arm_sidebar(cx);
-                                                    this.toggle_sidebar(window, cx)
-                                                })),
-                                        ),
-                                )
-                            }),
+                            .window_control_area(WindowControlArea::Drag),
                     )
                     .child(
                         div()
@@ -2787,7 +2775,7 @@ impl Render for Workspace {
                                     .flex_1()
                                     .min_h_0()
                                     .overflow_hidden()
-                                    .children(location)
+                                    .child(location)
                                     .child(div().flex_1().min_h_0().child(content))
                                     .when(dock_amount > 0., |this| {
                                         let measured = self.dock_height.clone();
@@ -2821,6 +2809,32 @@ impl Render for Workspace {
                             ),
                     )
                     .children(status_bar),
+            )
+            .child(
+                // Fixed at the original logo's center, outside the animated columns.
+                div()
+                    .id("window-sidebar-toggle")
+                    .absolute()
+                    .top_0()
+                    .left(px(16. + (19. - 28.) / 2.))
+                    .h(px(title_bar::HEIGHT))
+                    .flex()
+                    .items_center()
+                    .occlude()
+                    .child(
+                        Button::new("toggle-sidebar")
+                            .icon(IconName::PanelLeft)
+                            .tooltip(if self.sidebar_visible {
+                                "Hide sidebar (Ctrl+Shift+B)"
+                            } else {
+                                "Show sidebar (Ctrl+Shift+B)"
+                            })
+                            .style(ButtonStyle::Ghost)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.arm_sidebar(cx);
+                                this.toggle_sidebar(window, cx)
+                            })),
+                    ),
             )
             .children(self.tab_menu.clone().map(|menu| {
                 let this = cx.entity().downgrade();

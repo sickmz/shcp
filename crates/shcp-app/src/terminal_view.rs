@@ -28,6 +28,9 @@ use shcp_core::{
 };
 use std::{cell::Cell, collections::HashSet, rc::Rc, time::Duration};
 
+/// Inset above the first terminal row, also used to align the sidebar's groups.
+pub(crate) const CONTENT_TOP_PADDING: f32 = 14.;
+
 struct Selecting {
     origin: GridPoint,
     started: bool,
@@ -806,7 +809,7 @@ impl Render for TerminalView {
                 div()
                     .size_full()
                     .px(px(18.))
-                    .pt(px(14.))
+                    .pt(px(CONTENT_TOP_PADDING))
                     .pb(px(18.))
                     .child(element),
             );

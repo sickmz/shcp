@@ -34,7 +34,6 @@ pub enum SidebarEvent {
     Connect(HostId),
     NewHost,
     OpenSettings,
-    HideSidebar,
     RestartForUpdate,
     /// A new terminal on a host.
     NewTab(HostId),
@@ -156,7 +155,7 @@ struct DropLine {
 
 /// The space between the rows of the list, where the line goes.
 const ROW_GAP: Pixels = px(2.);
-/// How tall the title of a group is, the row a list usually starts with.
+/// How tall the title of a group is.
 const FIRST_ROW_HEIGHT: f32 = 24.;
 const HOST_HEIGHT: f32 = 28.;
 const TAB_HEIGHT: f32 = 26.;
@@ -1345,23 +1344,33 @@ impl Render for Sidebar {
                     .justify_between()
                     .h(px(title_bar::HEIGHT))
                     .pl(px(6.))
-                    .window_control_area(WindowControlArea::Drag)
-                    .child(title_bar::logo(px(19.), theme.text))
+                    .window_control_area(WindowControlArea::Drag),
+            )
+            .child(
+                div()
+                    .h(row_px(crate::workspace::LOCATION_HEIGHT))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .child(
-                        // Occluding: this header drags the window everywhere else.
                         div()
-                            .id("sidebar-header-actions")
-                            .occlude()
-                            .flex_none()
-                            .child(
-                                Button::new("hide-sidebar")
-                                    .icon(IconName::PanelLeft)
-                                    .tooltip("Hide sidebar (Ctrl+Shift+B)")
-                                    .style(ghost)
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        cx.emit(SidebarEvent::HideSidebar)
-                                    })),
-                            ),
+                            .id("new-host")
+                            .w_full()
+                            .h(px(28.))
+                            .px(px(6.))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .rounded(px(6.))
+                            .text_color(theme.text_muted)
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(theme.hover))
+                            .active(move |style| style.bg(theme.active))
+                            .tooltip(tooltip("New host (Ctrl+Shift+N)"))
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::NewHost)))
+                            .child(div().flex_1().min_w_0().truncate().child("New host"))
+                            .child(Icon::new(IconName::Plus).size(px(12.))),
                     ),
             )
             .child(
@@ -1371,10 +1380,8 @@ impl Render for Sidebar {
                     .relative()
                     .flex_1()
                     .min_h_0()
-                    // The first row is on the line of the bar beside it.
-                    .mt(row_px(crate::workspace::LOCATION_HEIGHT / 2.)
-                        - px(FIRST_ROW_HEIGHT / 2.)
-                        - ROW_GAP)
+                    // Start the groups beside the first terminal row, below the panel header.
+                    .mt(px(1. + crate::terminal_view::CONTENT_TOP_PADDING) - ROW_GAP)
                     // The drop line of the first and of the last row needs a gap there too.
                     .pt(ROW_GAP)
                     .mb(px(8.) - ROW_GAP)
@@ -1485,14 +1492,7 @@ impl Render for Sidebar {
                             ),
                     )
                     .child(div().flex_1())
-                    .children(update)
-                    .child(
-                        Button::new("new-host")
-                            .icon(IconName::Plus)
-                            .tooltip("New host (Ctrl+Shift+N)")
-                            .style(ghost)
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::NewHost))),
-                    ),
+                    .children(update),
             )
             .children(self.menu.clone().map(|menu| {
                 let this = cx.entity().downgrade();
