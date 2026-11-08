@@ -4,7 +4,6 @@ mod ime;
 
 use crate::actions::{CopySelection, FindInTerminal, PasteClipboard};
 use crate::clipboard::{self, Clip};
-use crate::login_prompt::present;
 use crate::session_overlay::{self, Overlay, Surface};
 use crate::state::AppState;
 use crate::terminal_element::{SharedMetrics, TerminalElement};
@@ -131,7 +130,20 @@ impl TerminalView {
             .open_terminal(session, 80, 24, persist);
         let search_input = cx.new(|cx| TextInput::new("Find", false, cx));
         let focus = cx.focus_handle();
+        let mut viewport_size = window.viewport_size();
+        let mut scale_factor = window.scale_factor();
         let subscriptions = vec![
+            cx.observe_window_bounds(window, move |this, window, cx| {
+                let size = window.viewport_size();
+                let scale = window.scale_factor();
+                if size != viewport_size || scale != scale_factor {
+                    viewport_size = size;
+                    scale_factor = scale;
+                    // Moving between monitors must not reuse the previous display's grid.
+                    this.metrics.set(None);
+                    cx.notify();
+                }
+            }),
             cx.on_focus(&focus, window, |_, _, cx| cx.notify()),
             cx.on_blur(&focus, window, |this, _, cx| {
                 this.cursor_blink = None;
@@ -312,7 +324,7 @@ impl TerminalView {
             .detach_terminal(self.terminal.id());
     }
 
-    fn retry(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn retry(&mut self, cx: &mut Context<Self>) {
         // The user asks for a shell after the last one ended: a new one, not a closed one.
         let known = !self.shell_gone(cx) && self.expects_shell();
         // Still connecting from an automatic attempt: this terminal is already queued on it.
@@ -322,6 +334,14 @@ impl TerminalView {
         if session != self.session || !self.terminal.is_alive() {
             self.attach(session, known, cx);
         }
+    }
+
+    pub(crate) fn shell_started(&self) -> bool {
+        self.terminal.shell_started()
+    }
+
+    pub(crate) fn starting_shell(&self) -> bool {
+        !self.terminal.shell_started() && !self.had_session && self.terminal.is_alive()
     }
 
     fn open_search(&mut self, _: &FindInTerminal, window: &mut Window, cx: &mut Context<Self>) {
@@ -698,18 +718,11 @@ impl Render for TerminalView {
             style: FontStyle::Normal,
         };
         let font_size = px(state.settings.terminal_font_size);
-        let overlay = if self.terminal.is_alive() {
-            session_overlay::overlay_for(state.session(self.session))
-        } else {
-            session_overlay::overlay_for(state.session(self.session))
-                .or(Some(Overlay::Closed("Shell exited".into())))
-        };
-        // Only for a tab that lost its session: a shell that exited needs the user.
-        let overlay = if self.session_is_gone(cx) {
-            session_overlay::with_reconnect(overlay, state.reconnect_attempt(&self.host))
-        } else {
-            overlay
-        };
+        // SSH progress and sign-in cover the whole tab, above every split.
+        let connection_busy = !matches!(
+            state.host_session(&self.host).map(|session| &session.state),
+            Some(SessionState::Connected)
+        ) || state.login_prompt(&self.host, cx).is_some();
         let shell_started = self.terminal.shell_started();
         self.had_session |= shell_started
             && matches!(
@@ -717,21 +730,16 @@ impl Render for TerminalView {
                 Some(SessionState::Connected)
             );
         let heading = state.host(&self.host).map(session_overlay::heading);
-        let steps = session_overlay::steps_of(state.host_session(&self.host));
         let shell_steps = session_overlay::shell_steps(state.host_session(&self.host));
-        // A retry may have started a new session: what it asks is for this tab as well.
-        let overlay = match state.login_prompt(&self.host, cx) {
-            Some(prompt) => {
-                let own = present(&prompt, cx.entity_id(), &self.focus, window, cx);
-                Some(Overlay::Login { steps, prompt, own })
-            }
-            None => overlay,
-        };
-        // A terminal that already showed a shell gets its new one without a word.
-        let overlay = overlay.or_else(|| {
-            (!shell_started && !self.had_session && self.terminal.is_alive())
+        let overlay = if connection_busy {
+            None
+        } else if !self.terminal.is_alive() {
+            Some(Overlay::Closed("Shell exited".into()))
+        } else {
+            // A new split can wait for its own shell after the shared connection is ready.
+            self.starting_shell()
                 .then_some(Overlay::StartingShell { steps: shell_steps })
-        });
+        };
         let focused = self.focus.is_focused(window);
         if focused != self.was_focused {
             self.was_focused = focused;
@@ -747,7 +755,7 @@ impl Render for TerminalView {
                 shcp_core::CursorStyle::Underline => Some(term::CursorShape::Underline),
             },
         );
-        if blinks && focused && window.is_window_active() && overlay.is_none() {
+        if blinks && focused && window.is_window_active() && overlay.is_none() && !connection_busy {
             if self.cursor_blink.is_none() {
                 self.start_cursor_blink(cx);
             }

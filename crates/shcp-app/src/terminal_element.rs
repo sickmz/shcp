@@ -194,8 +194,13 @@ impl Element for TerminalElement {
         let line_height = (self.font_size * 1.56).round().max(px(1.));
 
         let previous = self.metrics.get();
+        let layout_moving = crate::motion::layout_moving();
+        if layout_moving {
+            // Redraw this terminal too, so it sends the final size when the animation settles.
+            window.request_animation_frame();
+        }
         // While a panel glides past, the terminal keeps its size, cut off by the panel if need be.
-        let (cols, rows) = match previous.filter(|_| crate::motion::layout_moving()) {
+        let (cols, rows) = match previous.filter(|_| layout_moving) {
             Some(metrics) => (metrics.cols, metrics.rows),
             None => (
                 ((bounds.size.width / cell_width).floor() as u16).max(2),

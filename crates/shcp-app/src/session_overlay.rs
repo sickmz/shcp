@@ -4,7 +4,7 @@ use crate::login_prompt::LoginPrompt;
 use crate::motion::{self, Beat};
 use crate::state::SessionInfo;
 use crate::theme::{PANEL_INNER_RADIUS, Theme, ui_font, ui_px};
-use crate::widgets::button::Button;
+use crate::widgets::button::{Button, ButtonStyle};
 use crate::widgets::icon::{Icon, IconName};
 use gpui::prelude::*;
 use gpui::{
@@ -256,7 +256,7 @@ fn step_line(
     )
 }
 
-/// The panes of a window draw this at the same time: each keeps its own animations.
+/// Views that share a session keep independent animation identities.
 fn element_key(owner: EntityId, part: u64) -> u64 {
     owner.as_u64().wrapping_mul(4096).wrapping_add(part)
 }
@@ -415,26 +415,47 @@ pub fn render(
         extra_steps,
         owner,
     } = surface;
-    // Nothing to read here that the terminal does not keep showing: a strip that floats over it.
-    if let Overlay::Reconnecting { attempt } = overlay {
+    // Keep the status and its action together, above the output retained by the terminal.
+    let banner = match &overlay {
+        Overlay::Reconnecting { attempt } => {
+            Some(("Reconnecting…", format!("Attempt {attempt}"), true))
+        }
+        Overlay::Closed(reason) if docked => Some((
+            "Disconnected",
+            if reason == "Disconnected" {
+                "Reconnect to resume this session.".to_string()
+            } else {
+                reason.clone()
+            },
+            false,
+        )),
+        _ => None,
+    };
+    if let Some((title, detail, reconnecting)) = banner {
         return div()
             .absolute()
-            .top(px(12.))
+            .top_0()
+            .bottom_0()
             .left_0()
             .right_0()
+            .occlude()
+            .bg(theme.scrim)
             .flex()
+            .items_center()
             .justify_center()
+            .p(px(12.))
             .font_family(ui_font())
             .child(
                 div()
-                    .id("reconnecting")
+                    .id("reconnect-banner")
                     .occlude()
+                    .w(px(420.))
+                    .min_w_0()
+                    .max_w_full()
                     .flex()
                     .items_center()
                     .gap(px(12.))
-                    .pl(px(14.))
-                    .pr(px(7.))
-                    .py(px(7.))
+                    .p(px(12.))
                     .rounded(px(11.))
                     .bg(theme.elevated)
                     .border_1()
@@ -443,14 +464,40 @@ pub fn render(
                     .text_size(ui_px(13.))
                     .text_color(theme.text)
                     .child(
-                        Icon::new(IconName::Refresh)
+                        div().flex_none().child(
+                            Icon::new(if reconnecting {
+                                IconName::Refresh
+                            } else {
+                                IconName::Warning
+                            })
+                            .size(px(18.))
                             .color(theme.warning)
-                            .spin(),
+                            .when(reconnecting, |icon| icon.spin()),
+                        ),
                     )
-                    .child(format!(
-                        "Connection lost. Reconnecting (attempt {attempt}). What you see stays as it is."
-                    ))
-                    .child(Button::new("retry").label("Try now").on_click(on_retry)),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .text_size(ui_px(12.))
+                                    .text_color(theme.text_muted)
+                                    .child(detail),
+                            ),
+                    )
+                    .child(
+                        Button::new("retry")
+                            .label(if reconnecting { "Try now" } else { "Reconnect" })
+                            .style(ButtonStyle::Primary)
+                            .on_click(on_retry),
+                    ),
             )
             .into_any_element();
     }

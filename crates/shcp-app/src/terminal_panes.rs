@@ -3,6 +3,8 @@
 use crate::actions::{
     FocusPaneDown, FocusPaneLeft, FocusPaneRight, FocusPaneUp, SplitDown, SplitRight,
 };
+use crate::login_prompt::present;
+use crate::session_overlay::{self, Overlay, Surface};
 use crate::state::AppState;
 use crate::terminal_view::TerminalView;
 use crate::theme::ActiveTheme as _;
@@ -13,9 +15,9 @@ use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle, Entity, EntityId, EventEmitter,
     FocusHandle, Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, SharedString, Window, canvas, div, px, relative,
+    Point, SharedString, Subscription, Window, canvas, div, px, relative,
 };
-use shcp_core::{HostId, SavedPane, SplitAxis, TerminalId};
+use shcp_core::{HostId, SavedPane, SessionState, SplitAxis, TerminalId};
 use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
@@ -169,6 +171,9 @@ pub struct TerminalPanes {
     active: Entity<TerminalView>,
     dragging: Option<Path>,
     menu: Option<OpenMenu>,
+    /// The shared status becomes a strip after this tab has shown a shell.
+    had_session: bool,
+    _state_subscription: Subscription,
 }
 
 impl Focusable for TerminalPanes {
@@ -199,6 +204,7 @@ impl TerminalPanes {
         let mut leaves = Vec::new();
         root.leaves(&mut leaves);
         let active = leaves.remove(0);
+        let subscription = cx.observe(&state, |_, _, cx| cx.notify());
         Self {
             state,
             host,
@@ -206,6 +212,8 @@ impl TerminalPanes {
             active,
             dragging: None,
             menu: None,
+            had_session: false,
+            _state_subscription: subscription,
         }
     }
 
@@ -826,6 +834,55 @@ impl Render for TerminalPanes {
         {
             self.active = focused.clone();
         }
+        let theme = cx.theme().clone();
+        let focus = self.active.focus_handle(cx);
+        let state = self.state.read(cx);
+        let session = state.host_session(&self.host);
+        self.had_session |= matches!(
+            session.map(|session| &session.state),
+            Some(SessionState::Connected)
+        ) && leaves.iter().any(|view| view.read(cx).shell_started());
+        let heading = state.host(&self.host).map(session_overlay::heading);
+        let steps = session_overlay::steps_of(session);
+        let shell_steps = session_overlay::shell_steps(session);
+        let prompt = state.login_prompt(&self.host, cx);
+        let overlay = session_overlay::with_reconnect(
+            session_overlay::overlay_for(session),
+            state.reconnect_attempt(&self.host),
+        );
+        let overlay = match prompt {
+            Some(prompt) => {
+                let own = present(&prompt, cx.entity_id(), &focus, window, cx);
+                Some(Overlay::Login { steps, prompt, own })
+            }
+            None => overlay,
+        };
+        let overlay = overlay.or_else(|| {
+            (!self.had_session && leaves.iter().any(|view| view.read(cx).starting_shell()))
+                .then_some(Overlay::StartingShell { steps: shell_steps })
+        });
+        let overlay = overlay.map(|overlay| {
+            session_overlay::render(
+                overlay,
+                Surface {
+                    heading,
+                    docked: self.had_session,
+                    background: theme.terminal_bg,
+                    focus,
+                    extra_steps: 1,
+                    owner: cx.entity_id(),
+                },
+                &theme,
+                window,
+                cx,
+                cx.listener(|this, _, window, cx| {
+                    for view in this.leaves() {
+                        view.update(cx, |view, cx| view.retry(cx));
+                    }
+                    window.focus(&this.active.focus_handle(cx));
+                }),
+            )
+        });
         let several = leaves.len() > 1;
         let root = self.root.take();
         let content = root
@@ -835,6 +892,7 @@ impl Render for TerminalPanes {
         let dragging = self.dragging.is_some();
         div()
             .size_full()
+            .relative()
             .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 if this.menu.is_some() && event.keystroke.key == "escape" {
                     this.menu = None;
@@ -881,6 +939,7 @@ impl Render for TerminalPanes {
                 )
             })
             .children(content)
+            .children(overlay)
             .children(self.menu.clone().map(|menu| {
                 let this = cx.entity().downgrade();
                 ContextMenu::new(
