@@ -2470,7 +2470,7 @@ impl Workspace {
                 div()
                     .id("window-search")
                     .occlude()
-                    .w(px(420.))
+                    .w(px(300.))
                     .max_w(relative(0.4))
                     .h(px(28.))
                     .pl(px(10.))
