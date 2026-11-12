@@ -16,8 +16,6 @@ pub enum Face {
 }
 
 impl Face {
-    pub const ALL: [Face; 2] = [Face::Terminal, Face::Files];
-
     pub fn label(self) -> &'static str {
         match self {
             Face::Terminal => "Terminal",
@@ -29,14 +27,6 @@ impl Face {
         match self {
             Face::Terminal => IconName::Terminal,
             Face::Files => IconName::Folder,
-        }
-    }
-
-    /// What says it in a row of the sidebar.
-    pub fn letter(self) -> &'static str {
-        match self {
-            Face::Terminal => "t",
-            Face::Files => "f",
         }
     }
 

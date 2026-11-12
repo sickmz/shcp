@@ -130,10 +130,13 @@ impl TerminalView {
             .engine
             .open_terminal(session, 80, 24, persist);
         let search_input = cx.new(|cx| TextInput::new("Find", false, cx));
+        let search_focus = search_input.focus_handle(cx);
         let focus = cx.focus_handle();
         let mut viewport_size = window.viewport_size();
         let mut scale_factor = window.scale_factor();
         let subscriptions = vec![
+            cx.on_focus(&search_focus, window, |_, _, cx| cx.notify()),
+            cx.on_blur(&search_focus, window, |_, _, cx| cx.notify()),
             cx.observe_window_bounds(window, move |this, window, cx| {
                 let size = window.viewport_size();
                 let scale = window.scale_factor();
@@ -259,10 +262,6 @@ impl TerminalView {
                 .search_input
                 .focus_handle(cx)
                 .contains_focused(window, cx)
-    }
-
-    pub fn search_is_open(&self) -> bool {
-        self.search_open
     }
 
     pub fn selected_text(&self) -> Option<String> {
@@ -814,7 +813,7 @@ impl Render for TerminalView {
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_mouse_down))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
-            // Lined up with the panel header's text.
+            // Clear of the edges of its card.
             .child(
                 div()
                     .size_full()
@@ -893,10 +892,15 @@ impl Render for TerminalView {
                                 .px(px(8.))
                                 .py(px(3.))
                                 .truncate()
-                                .rounded(px(6.))
-                                .border_1()
-                                .border_color(theme.border)
-                                .bg(theme.elevated)
+                                .rounded(px(crate::theme::RADIUS_SMALL))
+                                .map(|this| {
+                                    crate::panel::floating(
+                                        this,
+                                        &theme,
+                                        crate::theme::RADIUS_SMALL,
+                                        theme.border,
+                                    )
+                                })
                                 .text_size(crate::theme::ui_px(12.))
                                 .text_color(theme.text_muted)
                                 .child(format!("Ctrl+click to open {url}")),
@@ -917,10 +921,19 @@ impl Render for TerminalView {
                         .flex()
                         .items_center()
                         .gap(px(2.))
-                        .rounded(px(8.))
-                        .border_1()
-                        .border_color(if missed { theme.error } else { theme.border })
-                        .bg(theme.elevated)
+                        .rounded(px(crate::theme::RADIUS_CARD))
+                        .map(|this| {
+                            crate::panel::floating(
+                                this,
+                                &theme,
+                                crate::theme::RADIUS_CARD,
+                                if missed { theme.error } else { theme.border },
+                            )
+                        })
+                        // The material has no border to turn red.
+                        .when(missed && theme.material().is_some(), |this| {
+                            this.border_1().border_color(theme.error)
+                        })
                         .shadow(crate::theme::float_shadow())
                         .text_size(crate::theme::ui_px(12.))
                         .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {

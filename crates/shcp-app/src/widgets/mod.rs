@@ -6,7 +6,7 @@ pub mod icon;
 pub mod pill;
 pub mod progress;
 pub mod scrollbar;
-pub mod segmented;
 pub mod status;
 pub mod text_input;
+pub mod tile;
 pub mod tooltip;

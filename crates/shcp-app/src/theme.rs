@@ -6,6 +6,7 @@ pub mod icon_theme;
 pub mod open_vsx;
 mod vscode;
 
+use crate::terminal_material::Material;
 use crate::widgets::host_color::HostColor;
 use gpui::{
     App, BoxShadow, Global, Hsla, Pixels, SharedString, WindowAppearance,
@@ -63,8 +64,6 @@ pub struct Theme {
     pub panel_alpha: f32,
     /// The groove the tabs sit in.
     pub track: Hsla,
-    /// Fill of the current item in chrome.
-    pub raised: Hsla,
     pub terminal_bg: Hsla,
     pub terminal_selection: Hsla,
     pub terminal_cursor: Hsla,
@@ -89,6 +88,105 @@ impl Theme {
         };
         builtin::oklch(self.lit_l, chroma, color.hue(), 1.)
     }
+
+    /// The smoked glass of the cards and of the window. Prune has the reference's own warm
+    /// colors. Nocturne has the same effects in its own cool hue, and a window lighter than its
+    /// cards, as it always was. A theme from a file has them in its accent, thinned into its own
+    /// background, over a window that keeps most of its own color. With the effects off in
+    /// Settings no theme has it. The strengths are in `Material::smoked`.
+    pub fn material(&self) -> Option<Material> {
+        if !EFFECTS.load(Ordering::Relaxed) {
+            return None;
+        }
+        let material = Material {
+            alpha: self.panel_alpha,
+            radius: RADIUS_CARD,
+            ..Material::smoked(self.terminal_bg)
+        };
+        if self.file.is_some() {
+            let accent = Hsla {
+                a: 1.,
+                ..self.accent
+            };
+            let (near, far) = (
+                vscode::mix(accent, self.terminal_bg, 0.5),
+                vscode::mix(accent, self.terminal_bg, 0.3),
+            );
+            let window = Hsla {
+                a: 0.6,
+                ..self.window_bg
+            };
+            // On a light surface the crests are white and the line around a card is faint.
+            let (glass, line) = if self.is_light {
+                (gpui::white(), 0.10)
+            } else {
+                (self.text, 0.4)
+            };
+            return Some(Material {
+                separation: Hsla {
+                    a: line,
+                    ..gpui::black()
+                },
+                ..material.recolored([near, far, near, far], glass, window)
+            });
+        }
+        if self.name == builtin::PRUNE {
+            Some(material)
+        } else if self.name == builtin::NOCTURNE {
+            let hue = builtin::HUE;
+            Some(material.recolored(
+                [
+                    builtin::oklch(0.50, 0.07, hue, 1.),
+                    builtin::oklch(0.36, 0.07, hue - 18., 1.),
+                    builtin::oklch(0.46, 0.07, hue + 17., 1.),
+                    builtin::oklch(0.42, 0.06, hue - 18., 1.),
+                ],
+                builtin::oklch(0.93, 0.015, hue, 1.),
+                Hsla {
+                    a: 0.04,
+                    ..gpui::white()
+                },
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// The tile a session shows its host's color on, and the deck of a split one.
+    pub fn tile_colors(&self) -> TileColors {
+        TileColors {
+            fill: Hsla {
+                a: 0.08,
+                ..self.text
+            },
+            back: Hsla {
+                a: if self.is_light { 0.15 } else { 0.18 },
+                ..self.text
+            },
+        }
+    }
+
+    /// The color under a row of the sidebar, made solid: the surface, or the fill of the current
+    /// row over it. For what has to hide something on that row and still look like the row.
+    pub fn row_fill(&self, current: bool) -> Hsla {
+        if current {
+            let solid = Hsla {
+                a: 1.,
+                ..self.active
+            };
+            vscode::mix(solid, self.surface, self.active.a)
+        } else {
+            self.surface
+        }
+    }
+}
+
+/// See `Theme::tile_colors`.
+pub struct TileColors {
+    /// The tile: see-through, so it reads the same on any row.
+    pub fill: Hsla,
+    /// The card behind the tile of a split session: see-through too, a little stronger.
+    pub back: Hsla,
 }
 
 impl Global for Theme {}
@@ -114,7 +212,7 @@ impl ThemeCatalog {
     /// Reads the bundled themes and `dir`. A user theme replaces a bundled one of the same name.
     /// Returns the catalog and one message per file that could not be read.
     pub fn load(dir: &Path) -> (Self, Vec<String>) {
-        let mut themes: Vec<Theme> = [builtin::NOCTURNE, builtin::PORCELAIN]
+        let mut themes: Vec<Theme> = [builtin::NOCTURNE, builtin::PRUNE]
             .into_iter()
             .map(|name| builtin::build(name, shcp_core::Accent::default()))
             .collect();
@@ -181,6 +279,7 @@ pub fn with_accent(theme: Theme, settings: &Settings) -> Theme {
 
 /// Makes `settings` take effect: theme, terminal colors, font and row scale.
 pub fn apply(settings: &Settings, engine: &EngineHandle, cx: &mut App) {
+    EFFECTS.store(settings.glass_effects, Ordering::Relaxed);
     let appearance = cx.window_appearance();
     let name = active_name(settings, appearance);
     let themes = &cx.global::<ThemeCatalog>().themes;
@@ -199,8 +298,8 @@ pub fn apply(settings: &Settings, engine: &EngineHandle, cx: &mut App) {
         .unwrap_or_else(vscode::fallback);
     theme = with_accent(theme, settings);
     if settings.translucent_window {
-        theme.window_bg.a = if theme.is_light { 0.9 } else { 0.88 };
-        theme.panel_alpha = if theme.is_light { 0.96 } else { 0.95 };
+        theme.window_bg.a = if theme.is_light { 0.88 } else { 0.84 };
+        theme.panel_alpha = if theme.is_light { 0.93 } else { 0.86 };
     }
     engine.set_terminal_palette(theme.palette.clone());
     cx.set_global(theme);
@@ -223,10 +322,17 @@ pub fn apply(settings: &Settings, engine: &EngineHandle, cx: &mut App) {
     cx.refresh_windows();
 }
 
-/// Corner radius of the floating panels.
-pub const PANEL_RADIUS: f32 = 12.;
-/// Radius for what fills a panel up to its edge, so it stays inside the panel's border.
-pub const PANEL_INNER_RADIUS: f32 = 11.;
+// The scale of corner radii. Something inset by about 4 inside a surface takes the next step
+// down. What you go somewhere with, the rows of the sidebar and the command field, is a capsule
+// (`rounded_full`) instead.
+/// Cards, modals, menus and whatever else floats.
+pub const RADIUS_CARD: f32 = 12.;
+/// Buttons, inputs, menu items and the rows of a list inside a surface.
+pub const RADIUS_CONTROL: f32 = 8.;
+/// Tiles, chips, key caps and tiny buttons.
+pub const RADIUS_SMALL: f32 = 6.;
+/// Radius for what fills a card up to its edge, so it stays inside the card's border.
+pub const PANEL_INNER_RADIUS: f32 = RADIUS_CARD - 1.;
 
 /// What the window asks of the system behind it.
 pub fn window_background(settings: &Settings) -> WindowBackgroundAppearance {
@@ -271,6 +377,8 @@ pub fn load_fonts(cx: &App) {
 const UI_FAMILY: &str = "Instrument Sans";
 pub const MONO_FAMILY: &str = "Geist Mono";
 
+/// The user wants the materials of the themes: see `Theme::material`.
+static EFFECTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static UI_SCALE: AtomicU32 = AtomicU32::new(1f32.to_bits());
 static ROW_SCALE: AtomicU32 = AtomicU32::new(1f32.to_bits());
 

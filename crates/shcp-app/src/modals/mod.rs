@@ -376,10 +376,19 @@ pub fn card(theme: &Theme, width: f32) -> Div {
         .flex()
         .flex_col()
         .gap(px(12.))
-        .rounded(px(14.))
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.elevated)
+        .rounded(px(crate::theme::RADIUS_CARD))
+        // In a theme with a material a dialog is a card of it, lit.
+        .map(|this| match theme.material() {
+            Some(material) => this.relative().child(crate::terminal_material::layers(
+                material.opaque(),
+                true,
+                true,
+            )),
+            None => this
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.elevated),
+        })
         .shadow(crate::theme::float_shadow())
         .text_size(crate::theme::ui_px(13.))
         .text_color(theme.text)

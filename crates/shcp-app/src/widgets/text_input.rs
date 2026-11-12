@@ -399,7 +399,7 @@ impl Render for TextInput {
             .items_center()
             .h(px(28.))
             .px(px(8.))
-            .rounded(px(7.))
+            .rounded(px(crate::theme::RADIUS_CONTROL))
             .border_1()
             .border_color(if self.bare {
                 transparent_black()

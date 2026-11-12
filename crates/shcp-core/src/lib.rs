@@ -10,6 +10,7 @@ mod host_key;
 mod key_setup;
 mod known_hosts;
 mod logging;
+mod login_shell;
 mod paste;
 mod proxy;
 mod secrets;

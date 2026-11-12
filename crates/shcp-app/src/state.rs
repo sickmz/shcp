@@ -45,6 +45,9 @@ pub struct SessionInfo {
     /// The secret asked for last, and whether the answer before this one was wrong.
     last_asked: Option<String>,
     pub retrying: bool,
+    /// The shell the user logs in with there, by name, once the server has said. Not what runs
+    /// in a terminal later: a shell started from it does not change it.
+    pub login_shell: Option<String>,
 }
 
 impl SessionInfo {
@@ -59,6 +62,7 @@ impl SessionInfo {
             pacing: false,
             last_asked: None,
             retrying: false,
+            login_shell: None,
         }
     }
 }
@@ -347,6 +351,19 @@ impl AppState {
             .is_some_and(|saved| saved.contains(spec))
     }
 
+    /// Gives a port of `host` the name the user knows it by; an empty one takes it away.
+    pub fn name_port(
+        &mut self,
+        host: &HostId,
+        spec: &ForwardSpec,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.set_port_name(host, spec, name);
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
     /// Closes a tunnel added from the sidebar and stops remembering it.
     pub fn forget_forward(
         &mut self,
@@ -361,6 +378,8 @@ impl AppState {
                 self.settings.extra_forwards.remove(&host.0);
             }
         }
+        // Its name goes with it: the port is no longer in any list to be read from.
+        self.settings.set_port_name(host, spec, "");
         self.persist_settings(cx);
         if let Some(info) = self.sessions.get_mut(&session)
             && let Some(index) = info.forwards.iter().position(|f| &f.spec == spec)
@@ -436,22 +455,6 @@ impl AppState {
         self.settings.rename_group(old, new);
         self.persist_settings(cx);
         cx.notify();
-    }
-
-    pub fn toggle_host_collapsed(&mut self, host: &HostId, cx: &mut Context<Self>) {
-        if !self.settings.collapsed_hosts.remove(&host.0) {
-            self.settings.collapsed_hosts.insert(host.0.clone());
-        }
-        self.persist_settings(cx);
-        cx.notify();
-    }
-
-    /// Shows the tabs of a host: one of them is about to be on screen.
-    pub fn expand_host(&mut self, host: &HostId, cx: &mut Context<Self>) {
-        if self.settings.collapsed_hosts.remove(&host.0) {
-            self.persist_settings(cx);
-            cx.notify();
-        }
     }
 
     pub fn toggle_group_collapsed(&mut self, group: &str, cx: &mut Context<Self>) {
@@ -849,18 +852,6 @@ impl AppState {
     }
 
     /// Toggles dot files in every Files tab and persists the choice.
-    pub fn set_file_details_width(&mut self, width: f32, cx: &mut Context<Self>) {
-        self.settings.file_details_width = width;
-        self.persist_settings(cx);
-        cx.notify();
-    }
-
-    pub fn toggle_file_details(&mut self, cx: &mut Context<Self>) {
-        self.settings.show_file_details = !self.settings.show_file_details;
-        self.persist_settings(cx);
-        cx.notify();
-    }
-
     pub fn toggle_hidden_files(&mut self, cx: &mut Context<Self>) {
         self.settings.show_hidden_files = !self.settings.show_hidden_files;
         if let Err(error) = self.engine.save_settings(self.settings.clone()) {
@@ -985,6 +976,11 @@ impl AppState {
             Event::Notice { level, message } => self.push_notice(*level, message.clone(), cx),
             // The option goes back off: it never worked, and the server would say so at every
             // connection. Installing tmux, the user can ask for it again.
+            Event::LoginShell { session, shell } => {
+                if let Some(info) = self.sessions.get_mut(session) {
+                    info.login_shell = Some(shell.clone());
+                }
+            }
             Event::TmuxFound { host } => {
                 self.tmux_hosts.insert(host.clone(), true);
             }

@@ -98,6 +98,17 @@ pub struct ForwardSpec {
     pub kind: ForwardKind,
 }
 impl ForwardSpec {
+    /// What tells this port from the others of its host, for `Settings::port_names`: which side
+    /// listens and on which port. Where it goes can change and the name stays.
+    pub fn name_key(&self) -> String {
+        let side = match self.kind {
+            ForwardKind::Local => 'L',
+            ForwardKind::Remote => 'R',
+            ForwardKind::Dynamic => 'D',
+        };
+        format!("{side}{}", self.bind_port)
+    }
+
     pub fn socks(bind_addr: String, bind_port: u16) -> Self {
         Self {
             bind_addr,
@@ -146,6 +157,9 @@ pub struct Settings {
     pub style_version: u32,
     /// Lets the desktop show through the window, blurred.
     pub translucent_window: bool,
+    /// The smoked glass of the themes that have one: the shaded surfaces and the light along
+    /// their edges. Off, every theme is flat.
+    pub glass_effects: bool,
     /// The highlight glides to the tab or host picked with the mouse, instead of jumping there.
     pub animated_selection: bool,
     /// Open the `LocalForward` tunnels on connecting; otherwise they wait for a click, so the
@@ -157,7 +171,7 @@ pub struct Settings {
     pub show_hidden_files: bool,
     /// Names of the folders a search of the subfolders does not enter.
     pub search_skip_folders: Vec<String>,
-    /// Show the details of the selection beside the files, when there is room.
+    /// Show the details of the selection in a card under the files. Off until asked for.
     pub show_file_details: bool,
     /// How wide those details are.
     pub file_details_width: f32,
@@ -214,6 +228,10 @@ pub struct Settings {
     pub host_groups: BTreeMap<String, String>,
     /// Sent to every new terminal of a host, by host id.
     pub startup_commands: BTreeMap<String, String>,
+    /// What the user calls a forwarded port, by host id and then by `ForwardSpec::name_key`. Here
+    /// and not in the port itself: one from `~/.ssh/config` is read-only, and a name must not
+    /// make two ports different.
+    pub port_names: BTreeMap<String, BTreeMap<String, String>>,
     /// Commands the palette can run.
     pub snippets: Vec<Snippet>,
 }
@@ -234,7 +252,7 @@ impl Settings {
         }
         let renamed = |name: &mut String| match name.as_str() {
             "Dark" => *name = "Nocturne".into(),
-            "Light" => *name = "Porcelain".into(),
+            "Light" => *name = "Nocturne".into(),
             _ => {}
         };
         renamed(&mut self.theme);
@@ -324,10 +342,40 @@ impl Settings {
         if let Some(command) = self.startup_commands.remove(&old.0) {
             self.startup_commands.insert(new.0.clone(), command);
         }
+        if let Some(names) = self.port_names.remove(&old.0) {
+            let kept = self.port_names.entry(new.0.clone()).or_default();
+            for (key, name) in names {
+                kept.entry(key).or_insert(name);
+            }
+        }
         for snippet in &mut self.snippets {
             if snippet.host.as_deref() == Some(&old.0) {
                 snippet.host = Some(new.0.clone());
             }
+        }
+    }
+    /// What the user calls this port of `host`, if anything.
+    pub fn port_name(&self, host: &HostId, spec: &ForwardSpec) -> Option<&str> {
+        self.port_names
+            .get(&host.0)?
+            .get(&spec.name_key())
+            .map(String::as_str)
+    }
+    /// Names this port of `host`. An empty name takes it away.
+    pub fn set_port_name(&mut self, host: &HostId, spec: &ForwardSpec, name: &str) {
+        let (key, name) = (spec.name_key(), name.trim());
+        if name.is_empty() {
+            if let Some(names) = self.port_names.get_mut(&host.0) {
+                names.remove(&key);
+                if names.is_empty() {
+                    self.port_names.remove(&host.0);
+                }
+            }
+        } else {
+            self.port_names
+                .entry(host.0.clone())
+                .or_default()
+                .insert(key, name.to_string());
         }
     }
     /// The commands the palette offers on a host.
@@ -570,12 +618,13 @@ impl Default for Settings {
             theme: "Nocturne".into(),
             sync_theme: false,
             dark_theme: "Nocturne".into(),
-            light_theme: "Porcelain".into(),
+            light_theme: "Nocturne".into(),
             icon_theme: String::new(),
             density: Density::Default,
             accent: Accent::Blue,
             style_version: STYLE_VERSION,
             translucent_window: false,
+            glass_effects: true,
             animated_selection: true,
             auto_open_forwards: false,
             auto_open_transfers: true,
@@ -599,7 +648,7 @@ impl Default for Settings {
             ]
             .map(String::from)
             .to_vec(),
-            show_file_details: true,
+            show_file_details: false,
             file_details_width: 344.,
             editor: String::new(),
             auto_reconnect: true,
@@ -626,6 +675,7 @@ impl Default for Settings {
             host_appearance: BTreeMap::new(),
             host_groups: BTreeMap::new(),
             startup_commands: BTreeMap::new(),
+            port_names: BTreeMap::new(),
             snippets: Vec::new(),
         }
     }
@@ -698,6 +748,13 @@ pub enum Event {
     /// The server said it has no tmux that can keep terminals running.
     TmuxMissing {
         host: HostId,
+    },
+    /// The shell the user logs in with on the host of a session, by its name: `bash`, `zsh`. Comes
+    /// once per connection, and not at all when the server does not say. It is the login shell,
+    /// not what runs in a terminal later.
+    LoginShell {
+        session: SessionId,
+        shell: String,
     },
     RemotePath {
         req: RequestId,

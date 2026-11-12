@@ -563,10 +563,15 @@ impl SettingsModal {
                         .p(px(4.))
                         .flex()
                         .flex_col()
-                        .rounded(px(9.))
-                        .border_1()
-                        .border_color(theme.border)
-                        .bg(theme.elevated)
+                        .rounded(px(crate::theme::RADIUS_CARD))
+                        .map(|this| {
+                            crate::panel::floating(
+                                this,
+                                &theme,
+                                crate::theme::RADIUS_CARD,
+                                theme.border,
+                            )
+                        })
                         .shadow(crate::theme::float_shadow())
                         .text_size(ui_px(13.))
                         .text_color(theme.text)
@@ -596,7 +601,7 @@ impl SettingsModal {
                     .items_center()
                     .justify_between()
                     .gap(px(6.))
-                    .rounded(px(6.))
+                    .rounded(px(crate::theme::RADIUS_CONTROL))
                     .border_1()
                     .border_color(theme.border)
                     .bg(theme.input_bg)
@@ -985,7 +990,7 @@ fn segmented<T: Copy + PartialEq + 'static>(
         .flex_none()
         .p(px(2.))
         .gap(px(1.))
-        .rounded(px(9.))
+        .rounded(px(crate::theme::RADIUS_CONTROL))
         .bg(theme.track)
         .children(options.iter().enumerate().map(|(index, (option, label))| {
             let (option, set) = (*option, set.clone());
@@ -997,7 +1002,7 @@ fn segmented<T: Copy + PartialEq + 'static>(
                 .px(px(10.))
                 .flex()
                 .items_center()
-                .rounded(px(7.))
+                .rounded(px(crate::theme::RADIUS_SMALL))
                 .text_size(ui_px(13.))
                 .cursor_pointer()
                 .when(active, |s| {
@@ -1045,7 +1050,7 @@ fn stepper<T: Copy + 'static>(
         .h(px(28.))
         .flex()
         .items_center()
-        .rounded(px(6.))
+        .rounded(px(crate::theme::RADIUS_CONTROL))
         .border_1()
         .border_color(theme.border)
         .bg(theme.input_bg)
@@ -1082,7 +1087,7 @@ fn dropdown_item(
         .flex()
         .items_center()
         .gap(px(8.))
-        .rounded(px(5.))
+        .rounded(px(crate::theme::RADIUS_CONTROL))
         .cursor_pointer()
         .hover(move |style| style.bg(hover))
         .active(move |style| style.bg(press))
@@ -1107,7 +1112,7 @@ fn dropdown_action(
         .flex()
         .items_center()
         .gap(px(8.))
-        .rounded(px(5.))
+        .rounded(px(crate::theme::RADIUS_CONTROL))
         .text_color(ui.text_muted)
         .cursor_pointer()
         .hover(move |style| style.bg(hover))
@@ -1176,10 +1181,20 @@ fn icon_samples(ui: &Theme, item: Option<&IconTheme>) -> impl IntoElement + use<
     div().flex().flex_none().gap(px(4.)).children(samples)
 }
 
-/// A theme's main colors, as overlapping dots.
+/// A theme's main colors, as overlapping dots. One of the app's own with a material shows the
+/// tints of it instead: its other colors are close from one to the other and would tell nothing.
 fn theme_dots(ui: &Theme, item: &Theme) -> impl IntoElement + use<> {
     let border = ui.border;
-    let dots = [item.bg, item.surface, item.accent, item.success]
+    let colors = match item.material().filter(|_| item.file.is_none()) {
+        Some(material) => [
+            item.terminal_bg,
+            material.top[0].color,
+            material.left[0].color,
+            material.bottom.color,
+        ],
+        None => [item.bg, item.surface, item.accent, item.success],
+    };
+    let dots = colors
         .into_iter()
         .enumerate()
         .map(move |(position, color)| {
@@ -1283,6 +1298,16 @@ impl SettingsModal {
                         "translucent-window",
                         settings.translucent_window,
                         self.setter(|s, v| s.translucent_window = v, cx),
+                    ),
+                );
+                add(
+                    "Glass effects",
+                    "Shaded surfaces and light along the edges, in the themes that have them",
+                    switch(
+                        &theme,
+                        "glass-effects",
+                        settings.glass_effects,
+                        self.setter(|s, v| s.glass_effects = v, cx),
                     ),
                 );
                 add(
@@ -1996,21 +2021,17 @@ impl SettingsModal {
             .flex()
             .items_center()
             .gap(px(9.))
-            .rounded(px(6.))
+            .rounded(px(crate::theme::RADIUS_CONTROL))
             .cursor_pointer()
             .text_color(if active { theme.text } else { theme.text_muted })
-            .when(active, |s| s.bg(theme.selected))
+            .when(active, |s| s.bg(theme.active))
             .when(!active, |s| {
                 s.hover(move |s| s.bg(hover)).active(move |s| s.bg(press))
             })
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.navigate(Destination::Category(page), window, cx);
             }))
-            .child(Icon::new(icon).color(if active {
-                theme.accent
-            } else {
-                theme.text_muted
-            }))
+            .child(Icon::new(icon).color(if active { theme.text } else { theme.text_muted }))
             .child(label)
             .into_any_element()
     }
@@ -2138,10 +2159,20 @@ impl Render for SettingsModal {
             .max_w(relative(0.96))
             .max_h(relative(0.96))
             .flex()
-            .rounded(px(15.))
-            .border_1()
-            .border_color(theme.strong_border)
-            .bg(theme.elevated)
+            .rounded(px(crate::theme::RADIUS_CARD))
+            // In a theme with a material the dialog is a card of it, lit: the same field as
+            // the cards behind, where it floats.
+            .map(|this| match theme.material() {
+                Some(material) => this.relative().child(crate::terminal_material::layers(
+                    material.opaque(),
+                    true,
+                    true,
+                )),
+                None => this
+                    .border_1()
+                    .border_color(theme.strong_border)
+                    .bg(theme.elevated),
+            })
             .shadow(crate::theme::float_shadow())
             .text_size(ui_px(13.))
             .text_color(theme.text)
@@ -2154,8 +2185,13 @@ impl Render for SettingsModal {
                     .flex_col()
                     .gap(px(1.))
                     .p(px(8.))
-                    .rounded_l(px(14.))
-                    .bg(theme.surface)
+                    .rounded_l(px(crate::theme::PANEL_INNER_RADIUS))
+                    // Over a material, a shade of it and not a color of its own.
+                    .bg(if theme.material().is_some() {
+                        gpui::black().opacity(0.14)
+                    } else {
+                        theme.surface
+                    })
                     .border_r_1()
                     .border_color(theme.border)
                     .child(

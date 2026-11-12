@@ -1,12 +1,11 @@
-//! Bottom dock with two tabs: transfers (progress, speed, ETA, cancel) and ports.
+//! Bottom dock with two faces: transfers (progress, speed, ETA, cancel) and ports. The buttons of
+//! the status row and the palette pick which one shows.
 use crate::ports_panel::PortsPanel;
 use crate::state::AppState;
 use crate::theme::{ActiveTheme as _, Theme, row_px};
 use crate::widgets::button::{Button, ButtonStyle};
 use crate::widgets::icon::{Icon, IconName};
-use crate::widgets::pill::SlidingPill;
 use crate::widgets::progress::ProgressBar;
-use crate::widgets::segmented::{groove, segment};
 use crate::widgets::status::badge;
 use gpui::prelude::*;
 use gpui::{Context, Entity, EventEmitter, Subscription, Window, div, px};
@@ -24,7 +23,6 @@ pub struct TransfersEvent;
 pub struct TransfersPanel {
     state: Entity<AppState>,
     tab: DockTab,
-    pill: SlidingPill,
     ports: Entity<PortsPanel>,
     _subscription: Subscription,
 }
@@ -72,7 +70,6 @@ impl TransfersPanel {
         Self {
             state,
             tab: DockTab::Transfers,
-            pill: SlidingPill::default(),
             ports,
             _subscription: subscription,
         }
@@ -113,7 +110,7 @@ impl TransfersPanel {
             .flex()
             .items_center()
             .gap(px(14.))
-            .rounded(px(7.))
+            .rounded(px(crate::theme::RADIUS_CONTROL))
             .child(
                 Icon::new(match info.direction {
                     Direction::Upload => IconName::Upload,
@@ -186,47 +183,12 @@ impl Render for TransfersPanel {
         let transfers = self.state.read(cx).transfers.clone();
         let active = self.state.read(cx).active_transfers();
         let can_add = self.ports.read(cx).target(cx).is_some();
-        let current_child = match self.tab {
-            DockTab::Transfers => 1,
-            DockTab::Ports => 2,
-        };
-        let segments = groove(&theme)
-            .on_children_prepainted(self.pill.measure(Some(current_child)))
-            .child(self.pill.raised(&theme, 7.))
-            .child(
-                segment(
-                    "dock-transfers",
-                    Some(IconName::Swap),
-                    Some("Transfers"),
-                    self.tab == DockTab::Transfers,
-                    cx,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.pill.arm(&this.state.read(cx).settings);
-                    this.show(DockTab::Transfers, cx)
-                })),
-            )
-            .child(
-                segment(
-                    "dock-ports",
-                    Some(IconName::Link),
-                    Some("Ports"),
-                    self.tab == DockTab::Ports,
-                    cx,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.pill.arm(&this.state.read(cx).settings);
-                    this.show(DockTab::Ports, cx)
-                })),
-            );
         div()
             .flex()
             .flex_col()
             .flex_none()
             // As tall as its content, up to this; then its list scrolls.
             .max_h(px(280.))
-            .border_t_1()
-            .border_color(theme.border)
             .text_size(crate::theme::ui_px(13.))
             .child(
                 div()
@@ -237,7 +199,23 @@ impl Render for TransfersPanel {
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    .child(segments)
+                    // Which of the two it is showing: the status row's buttons pick it.
+                    .child(
+                        Icon::new(match self.tab {
+                            DockTab::Transfers => IconName::Swap,
+                            DockTab::Ports => IconName::Link,
+                        })
+                        .size(px(13.))
+                        .color(theme.text_muted),
+                    )
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(match self.tab {
+                                DockTab::Transfers => "Transfers",
+                                DockTab::Ports => "Ports",
+                            }),
+                    )
                     .when(self.tab == DockTab::Transfers && active > 0, |this| {
                         this.child(badge(format!("{active} active"), theme.accent))
                     })

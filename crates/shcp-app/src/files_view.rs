@@ -4,29 +4,28 @@ use crate::files_format as format;
 use crate::modals::{
     ModalLayer, confirm::ConfirmModal, folder_picker::FolderPicker, text_prompt::TextPrompt,
 };
-use crate::motion::Reveal;
 use crate::state::AppState;
 use crate::theme::icon_theme::file_icon;
 use crate::theme::{ActiveTheme as _, row_px};
 use crate::widgets::button::{Button, ButtonStyle};
 use crate::widgets::context_menu::{ContextMenu, MenuAnchor, MenuEntry, OpenMenu, handler};
 use crate::widgets::icon::{Icon, IconName};
-use crate::widgets::progress::ProgressBar;
 use crate::widgets::scrollbar::{ScrollDrag, ScrollMetrics, scrollbar};
 use crate::widgets::text_input::{TextInput, TextInputEvent};
+use crate::widgets::tile::{Mark, tile};
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, ClickEvent, ClipboardItem, Context, Div, Entity, EventEmitter, ExternalPaths,
-    FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, Corner, Div, Entity, EventEmitter,
+    ExternalPaths, FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent,
     PathPromptOptions, Pixels, Point, ScrollStrategy, SharedString, Subscription,
-    UniformListScrollHandle, Window, canvas, div, img, point, px, uniform_list,
+    UniformListScrollHandle, Window, anchored, canvas, deferred, div, img, point, px, uniform_list,
 };
 use shcp_core::{
     EngineHandle, EntryKind, Event, HostId, NoticeLevel, RemoteEntry, RequestId, SearchScope,
     SessionId, SessionState, TransferId, TransferState, archive_stem,
 };
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     collections::HashSet,
     ops::Range,
@@ -47,15 +46,7 @@ const SIZE_W: f32 = 76.;
 const MODIFIED_W: f32 = 92.;
 const PERMS_W: f32 = 96.;
 const COLUMN_GAP: f32 = 14.;
-/// The details beside the list, on their own or next to a terminal.
-const INSPECTOR_W: f32 = 344.;
-/// From this width the details lay themselves out for the room they have.
-const WIDE_DETAILS: f32 = 520.;
-/// What dragging the line leaves to each side.
-const MIN_DETAILS: f32 = 260.;
-const MIN_LIST: f32 = 320.;
-/// Below these widths, a column or the details give way.
-const INSPECTOR_FROM: f32 = 600.;
+/// Below these widths, a column gives way.
 const PERMS_FROM: f32 = 620.;
 const MODIFIED_FROM: f32 = 400.;
 /// Lines of a file the preview draws.
@@ -70,6 +61,8 @@ const TYPE_AHEAD: Duration = Duration::from_millis(800);
 pub enum FilesEvent {
     OpenTerminalHere(String),
     GoHereInTerminal(String),
+    /// The files follow the folder of the terminal, or stop following it.
+    ToggleFollow,
 }
 
 /// Where a key moves the cursor on a list of `len` rows.
@@ -178,12 +171,14 @@ pub struct FilesView {
     total_space: Option<u64>,
     /// How wide the view is, which decides the columns and the details.
     width: Rc<Cell<f32>>,
-    /// Where the view ends on the right, to turn a drag of the line into a width.
-    right_edge: Rc<Cell<f32>>,
-    /// The width of the details while their line is being dragged.
-    dragging_details: Option<f32>,
-    /// How much of the details shows.
-    details_reveal: Reveal,
+    /// The preview of the selected file floats over the list.
+    looking: bool,
+    /// Opened from the menu, it fades in: the how-manyth opening, for its animation.
+    look_fade: Option<u64>,
+    look_count: u64,
+    perms: Option<PermsOpen>,
+    /// Where the permissions cell of each row on screen is, for the popover to open under it.
+    perm_cells: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
     /// The file the details are showing the start of.
     preview: Option<Preview>,
     /// For the menu of the selection, wherever its button is.
@@ -204,14 +199,14 @@ pub struct FilesView {
     sort: SortKey,
     ascending: bool,
     menu: Option<OpenMenu>,
-    add_anchor: MenuAnchor,
-    upload_anchor: MenuAnchor,
     more_anchor: MenuAnchor,
     /// The toolbar button that opened `menu`.
     menu_button: Option<ToolbarMenu>,
     /// The toolbar menu open when the mouse went down: that press closes it, and the click that
     /// follows on its button must not open it again.
     closing_menu: Option<ToolbarMenu>,
+    /// The files follow the folder of the terminal. Set by the workspace, for the menu.
+    pub follows: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -219,8 +214,16 @@ pub struct FilesView {
 struct Preview {
     path: String,
     req: RequestId,
-    /// `None` while waiting, or for what is not text.
+    /// `None` while waiting, or for what is not text: `arrived` tells which.
     text: Option<String>,
+    arrived: bool,
+}
+
+/// The permissions of an entry, open in their popover.
+struct PermsOpen {
+    path: String,
+    /// Where to show them when the list has no cell for them, as on a narrow card.
+    at: Point<Pixels>,
 }
 
 /// A search of the subfolders of the folder on screen.
@@ -251,8 +254,6 @@ impl FileSearch {
 /// The menus that open from a button of the toolbar.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ToolbarMenu {
-    Add,
-    Upload,
     Folder,
     Selection,
 }
@@ -280,9 +281,12 @@ impl FilesView {
                 .clearable()
         });
         let filter_focus = filter_input.focus_handle(cx);
+        let focus = cx.focus_handle();
         let show_hidden = state.read(cx).settings.show_hidden_files;
-        let details_open = state.read(cx).settings.show_file_details;
         let subscriptions = vec![
+            cx.on_focus(&focus, window, |_, _, cx| cx.notify()),
+            cx.on_blur(&focus, window, |_, _, cx| cx.notify()),
+            cx.on_focus(&filter_focus, window, |_, _, cx| cx.notify()),
             cx.subscribe(&state, |this, _, event: &Event, cx| {
                 this.on_event(event, cx)
             }),
@@ -349,17 +353,19 @@ impl FilesView {
             pending_links: HashMap::new(),
             free_space: None,
             total_space: None,
-            width: Rc::new(Cell::new(INSPECTOR_FROM)),
-            right_edge: Rc::new(Cell::new(0.)),
-            dragging_details: None,
-            details_reveal: Reveal::new(details_open),
+            width: Rc::new(Cell::new(PERMS_FROM)),
+            looking: false,
+            look_fade: None,
+            look_count: 0,
+            perms: None,
+            perm_cells: Default::default(),
             preview: None,
             selection_anchor: MenuAnchor::default(),
             pending_space: None,
             start_path: None,
             picked: None,
             loading: true,
-            focus: cx.focus_handle(),
+            focus,
             home_requested: false,
             pending_home: None,
             pending_list: None,
@@ -368,11 +374,10 @@ impl FilesView {
             sort: SortKey::Name,
             ascending: true,
             menu: None,
-            add_anchor: MenuAnchor::default(),
-            upload_anchor: MenuAnchor::default(),
             more_anchor: MenuAnchor::default(),
             menu_button: None,
             closing_menu: None,
+            follows: true,
             _subscriptions: subscriptions,
         };
         if this.session_connected(cx) {
@@ -388,6 +393,24 @@ impl FilesView {
     /// The folder on screen; empty until the first listing arrives.
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    /// The keyboard is in the list or in the header's filter, which is outside the list's focus
+    /// subtree: the card is the lit one.
+    pub fn contains_focus(&self, window: &Window, cx: &App) -> bool {
+        self.focus.contains_focused(window, cx)
+            || self
+                .filter_input
+                .focus_handle(cx)
+                .contains_focused(window, cx)
+    }
+
+    /// Its card keeps the tools in sight without the pointer, so nothing goes from under the
+    /// user's hands: the filter has the keyboard or some text, or the menu of the tools is open.
+    pub fn holds_tools(&self, window: &Window, cx: &App) -> bool {
+        self.filter_input.focus_handle(cx).is_focused(window)
+            || !self.filter_input.read(cx).text().trim().is_empty()
+            || (self.menu.is_some() && self.menu_button == Some(ToolbarMenu::Folder))
     }
 
     fn session_connected(&self, cx: &App) -> bool {
@@ -449,6 +472,9 @@ impl FilesView {
         if self.search.is_some() {
             self.close_search(cx);
         }
+        // What floats over the list is about this folder.
+        self.perms = None;
+        self.looking = false;
         let path = if path.starts_with('/') {
             path
         } else {
@@ -645,6 +671,7 @@ impl FilesView {
             Event::RemoteHead { req, text, .. } => {
                 if let Some(preview) = self.preview.as_mut().filter(|p| p.req == *req) {
                     preview.text = text.clone().ok().flatten();
+                    preview.arrived = true;
                     cx.notify();
                 }
             }
@@ -850,6 +877,17 @@ impl FilesView {
                     .icon(IconName::Terminal)
                     .disabled(!ready),
                 );
+                let path = entry.path.clone();
+                entries.push(
+                    MenuEntry::item(
+                        "Go here in terminal",
+                        handler(this.clone(), move |_, _, cx: &mut Context<Self>| {
+                            cx.emit(FilesEvent::GoHereInTerminal(path.clone()))
+                        }),
+                    )
+                    .icon(IconName::Terminal)
+                    .disabled(!ready),
+                );
             }
             if matches!(entry.kind, EntryKind::Dir | EntryKind::Symlink) && selection == 1 {
                 entries.push(
@@ -878,6 +916,14 @@ impl FilesView {
                     .icon(IconName::File)
                     .shortcut("Enter")
                     .disabled(!ready),
+                );
+                entries.push(
+                    MenuEntry::item(
+                        "Preview",
+                        handler(this.clone(), |v, _, cx| v.open_look(true, cx)),
+                    )
+                    .icon(IconName::Eye)
+                    .shortcut("Space"),
                 );
             }
             entries.push(
@@ -925,9 +971,24 @@ impl FilesView {
                 .disabled(!ready),
             );
             entries.extend(self.archive_entries(cx));
+            // One entry the server gave permissions for: its grid of toggles, under its cell.
+            if selection == 1 && entry.permissions.is_some() {
+                let path = entry.path.clone();
+                entries.push(
+                    MenuEntry::item(
+                        "Permissions…",
+                        handler(this.clone(), move |v, _, cx| {
+                            v.open_perms(path.clone(), position, cx)
+                        }),
+                    )
+                    .icon(IconName::Lock)
+                    .disabled(!ready),
+                );
+            }
+            // Typed in octal: also for several entries, and for the special bits.
             entries.push(
                 MenuEntry::item(
-                    "Permissions",
+                    "Permissions in octal…",
                     handler(this.clone(), |v, w, cx| v.change_permissions(w, cx)),
                 )
                 .icon(IconName::Settings)
@@ -1049,12 +1110,44 @@ impl FilesView {
         ]
     }
 
-    /// What acts on the folder, less often than the buttons in view.
+    /// What acts on the folder, behind the one menu button of the card: what is used most first.
     fn folder_entries(&self, cx: &mut Context<Self>) -> Vec<MenuEntry> {
         let this = cx.entity().downgrade();
         let connected = self.session_connected(cx);
         let ready = !self.path.is_empty() && connected;
-        vec![
+        // A check says what is on; what is off shows nothing there.
+        let checked = |entry: MenuEntry, on: bool| {
+            if on {
+                entry.icon(IconName::Check)
+            } else {
+                entry
+            }
+        };
+        let mut entries = self.add_entries(cx);
+        entries.extend(self.upload_entries(cx));
+        entries.extend([
+            MenuEntry::Separator,
+            checked(
+                MenuEntry::item(
+                    "Follow terminal",
+                    handler(this.clone(), |_, _, cx| cx.emit(FilesEvent::ToggleFollow)),
+                ),
+                self.follows,
+            ),
+            {
+                let here = self.path.clone();
+                MenuEntry::item(
+                    "Go here in terminal",
+                    handler(this.clone(), move |_, _, cx: &mut Context<Self>| {
+                        cx.emit(FilesEvent::GoHereInTerminal(here.clone()))
+                    }),
+                )
+                .icon(IconName::Terminal)
+                .disabled(!ready)
+            },
+            MenuEntry::Separator,
+        ]);
+        entries.extend([
             MenuEntry::item(
                 if self.show_hidden {
                     "Hide hidden files"
@@ -1094,7 +1187,8 @@ impl FilesView {
                 .icon(IconName::Copy)
                 .shortcut("Ctrl+V")
                 .disabled(!ready || self.picked.is_none()),
-        ]
+        ]);
+        entries
     }
 
     /// What acts on the selection, besides the buttons of the selection bar.
@@ -1146,7 +1240,7 @@ impl FilesView {
             .icon(IconName::FolderUp)
             .disabled(!ready),
             MenuEntry::item(
-                "Permissions",
+                "Permissions in octal…",
                 handler(this.clone(), |v, w, cx| v.change_permissions(w, cx)),
             )
             .icon(IconName::Settings)
@@ -1342,10 +1436,31 @@ impl FilesView {
             cx.stop_propagation();
             return;
         }
+        // What floats over the list goes first, the topmost before the other.
+        if key.key == "escape" && (self.perms.is_some() || self.looking) {
+            if self.perms.take().is_none() {
+                self.close_look(cx);
+            }
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         if !self.session_connected(cx) {
             return;
         }
         match key.key.as_str() {
+            // The list's own key: in the filter a space is text.
+            "space"
+                if self.focus.is_focused(window)
+                    && !key.modifiers.control
+                    && !key.modifiers.alt =>
+            {
+                if self.looking {
+                    self.close_look(cx);
+                } else {
+                    self.open_look(false, cx);
+                }
+            }
             "escape" if !self.selected.is_empty() => self.clear_selection(cx),
             "escape" if self.search.is_some() => self.close_search(cx),
             "enter" if self.selected.len() == 1 => {
@@ -1367,6 +1482,8 @@ impl FilesView {
             "up" | "down" | "home" | "end" | "pageup" | "pagedown"
                 if !key.modifiers.control && !key.modifiers.alt =>
             {
+                // The permissions belong to the row the cursor leaves; the preview follows it.
+                self.perms = None;
                 let page = self.page_rows();
                 if let Some(at) =
                     moved_cursor(&key.key, self.cursor_row(), self.entries.len(), page)
@@ -1892,8 +2009,6 @@ impl FilesView {
     /// A button with a menu under it. A press while its menu is open only closes it.
     fn menu_button(&self, which: ToolbarMenu, button: Button, cx: &mut Context<Self>) -> Div {
         let anchor = match which {
-            ToolbarMenu::Add => &self.add_anchor,
-            ToolbarMenu::Upload => &self.upload_anchor,
             ToolbarMenu::Folder => &self.more_anchor,
             ToolbarMenu::Selection => &self.selection_anchor,
         };
@@ -1904,8 +2019,6 @@ impl FilesView {
                 }
                 window.focus(&this.focus);
                 let (anchor, entries) = match which {
-                    ToolbarMenu::Add => (this.add_anchor.clone(), this.add_entries(cx)),
-                    ToolbarMenu::Upload => (this.upload_anchor.clone(), this.upload_entries(cx)),
                     ToolbarMenu::Folder => (this.more_anchor.clone(), this.folder_entries(cx)),
                     ToolbarMenu::Selection => {
                         (this.selection_anchor.clone(), this.selection_entries(cx))
@@ -1920,13 +2033,12 @@ impl FilesView {
             }))
     }
 
-    /// Back and up, at the start of the location bar.
+    /// Back and up, at the start of the header of its card.
     pub fn nav_buttons(&self, cx: &mut Context<Self>) -> AnyElement {
         let connected = self.session_connected(cx);
         let ready = !self.path.is_empty() && connected;
         div()
             .id("files-nav")
-            .occlude()
             .flex()
             .flex_none()
             .items_center()
@@ -1950,7 +2062,7 @@ impl FilesView {
             .into_any_element()
     }
 
-    /// What acts on the folder, at the end of the location bar.
+    /// What acts on the folder, at the end of the header of its card.
     pub fn tools(&self, cx: &mut Context<Self>) -> AnyElement {
         div()
             .flex()
@@ -1959,37 +2071,17 @@ impl FilesView {
             .gap(px(1.))
             .child(
                 div()
-                    .w(px(220.))
+                    .w(px(160.))
                     .mr(px(4.))
                     .flex_none()
                     .child(self.filter_input.clone()),
             )
             .child(
                 self.menu_button(
-                    ToolbarMenu::Add,
-                    Button::new("add")
-                        .icon(IconName::Plus)
-                        .tooltip("New file or folder")
-                        .style(ButtonStyle::Ghost),
-                    cx,
-                ),
-            )
-            .child(
-                self.menu_button(
-                    ToolbarMenu::Upload,
-                    Button::new("upload")
-                        .icon(IconName::Upload)
-                        .tooltip("Upload files or a folder")
-                        .style(ButtonStyle::Ghost),
-                    cx,
-                ),
-            )
-            .child(
-                self.menu_button(
                     ToolbarMenu::Folder,
                     Button::new("folder-more")
                         .icon(IconName::More)
-                        .tooltip("More")
+                        .tooltip("New, upload, details and more")
                         .style(ButtonStyle::Ghost),
                     cx,
                 ),
@@ -2182,7 +2274,7 @@ impl FilesView {
                 .flex_none()
                 .px(px(6.))
                 .py(px(3.))
-                .rounded(px(6.))
+                .rounded(px(crate::theme::RADIUS_SMALL))
                 .cursor_pointer()
                 .hover(move |s| s.bg(hover))
                 .active(move |s| s.bg(press))
@@ -2215,7 +2307,7 @@ impl FilesView {
             crumbs.push(
                 segment(index + 1, label, target)
                     .when(is_last, |this| {
-                        this.font_weight(gpui::FontWeight::MEDIUM)
+                        this.font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(theme.text)
                     })
                     .into_any_element(),
@@ -2223,14 +2315,13 @@ impl FilesView {
         }
         div()
             .id("breadcrumb")
-            .occlude()
             .min_w_0()
             .h(px(28.))
             .gap(px(1.))
             .flex()
             .items_center()
             .overflow_hidden()
-            .rounded(px(6.))
+            .rounded(px(crate::theme::RADIUS_SMALL))
             .text_size(crate::theme::ui_px(13.))
             .text_color(theme.text_muted)
             .tooltip(crate::widgets::tooltip::tooltip(self.path.clone()))
@@ -2251,7 +2342,7 @@ impl FilesView {
             a: 0.35,
             ..theme.accent
         };
-        let width = self.list_width(cx);
+        let width = self.width.get();
         // A link keeps its own icon: being one matters more than what it points to.
         let themed = match entry.kind {
             EntryKind::Symlink => None,
@@ -2288,7 +2379,7 @@ impl FilesView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded(px(5.))
+                .rounded(px(crate::theme::RADIUS_SMALL))
                 .font_family(crate::theme::mono_font())
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_size(px(9.5))
@@ -2319,7 +2410,7 @@ impl FilesView {
                     .flex()
                     .items_center()
                     .gap(px(COLUMN_GAP))
-                    .rounded(px(7.))
+                    .rounded(px(crate::theme::RADIUS_CONTROL))
                     .cursor_pointer()
                     // Cut: it is on its way out, as in Explorer.
                     .when(
@@ -2406,15 +2497,58 @@ impl FilesView {
                         )
                     })
                     .when(width >= PERMS_FROM, |this| {
+                        // What to click to change them: a small control, with the popover under it.
+                        let cells = self.perm_cells.clone();
+                        let key = entry.path.clone();
+                        let path = entry.path.clone();
+                        let open = self.perms.as_ref().is_some_and(|open| open.path == path);
+                        let known = entry.permissions.is_some();
+                        let (hover, raised) = (theme.hover, theme.active);
                         this.child(
-                            div()
-                                .w(px(PERMS_W))
-                                .flex()
-                                .flex_none()
-                                .gap(px(5.))
-                                .font_family(crate::theme::mono_font())
-                                .text_size(crate::theme::ui_px(13.))
-                                .children(permission_triples(entry, &theme)),
+                            div().w(px(PERMS_W)).flex().flex_none().child(
+                                div()
+                                    .flex_none()
+                                    .on_children_prepainted(move |children, _, _| {
+                                        if let Some(cell) = children.first() {
+                                            cells.borrow_mut().insert(key.clone(), *cell);
+                                        }
+                                    })
+                                    .child(
+                                        div()
+                                            .id(("file-perms", index))
+                                            .h(px(22.))
+                                            .ml(px(-6.))
+                                            .px(px(6.))
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(5.))
+                                            .rounded(px(crate::theme::RADIUS_SMALL))
+                                            .font_family(crate::theme::mono_font())
+                                            .text_size(crate::theme::ui_px(13.))
+                                            .when(open, |this| this.bg(raised))
+                                            .when(known, |this| {
+                                                this.cursor_pointer()
+                                                    .hover(move |style| style.bg(hover))
+                                                    .tooltip(crate::widgets::tooltip::tooltip(
+                                                        "Change permissions",
+                                                    ))
+                                                    .on_click(cx.listener(
+                                                        move |this, event: &ClickEvent, _, cx| {
+                                                            cx.stop_propagation();
+                                                            this.selected =
+                                                                HashSet::from([path.clone()]);
+                                                            this.anchor = Some(index);
+                                                            this.open_perms(
+                                                                path.clone(),
+                                                                event.position(),
+                                                                cx,
+                                                            );
+                                                        },
+                                                    ))
+                                            })
+                                            .children(permission_triples(entry, &theme)),
+                                    ),
+                            ),
                         )
                     }),
             )
@@ -2446,7 +2580,7 @@ impl FilesView {
                     s.child(Icon::new(chevron).size(px(11.)).color(theme.text_muted))
                 })
         };
-        let width = self.list_width(cx);
+        let width = self.width.get();
         div()
             .h(row_px(30.))
             .pl(px(12.))
@@ -2479,11 +2613,26 @@ impl FilesView {
             })
     }
 
+    /// The one file selected, which Space would preview.
+    fn previewable(&self) -> Option<&RemoteEntry> {
+        self.inspected()
+            .filter(|entry| entry.kind != EntryKind::Dir)
+    }
+
+    /// What the status bar says after the summary, dimmer: how to preview the file selected.
+    pub fn summary_hint(&self) -> Option<&'static str> {
+        (!self.path.is_empty() && self.previewable().is_some()).then_some("Space to preview")
+    }
+
     /// For the status bar: the selection or what the folder holds, and the room left on the server.
     /// Nothing until the folder has loaded.
     pub fn summary(&self) -> Option<String> {
         if self.path.is_empty() {
             return None;
+        }
+        // One file: what it is, for the hint after it to open its preview.
+        if let Some(file) = self.previewable() {
+            return Some(format!("{} · {}", file.name, format::bytes(file.size)));
         }
         let mut text = if self.selected.is_empty() {
             self.contents_summary()
@@ -2618,7 +2767,7 @@ fn preview_line(line: &str, theme: &crate::theme::Theme) -> Div {
 }
 
 impl FilesView {
-    /// The one file or folder the details are about: what is selected, if it is one.
+    /// The one file or folder selected, if it is one: what the preview is about.
     fn inspected(&self) -> Option<&RemoteEntry> {
         if self.selected.len() != 1 {
             return None;
@@ -2627,21 +2776,18 @@ impl FilesView {
         self.entries.iter().find(|entry| &entry.path == path)
     }
 
-    /// Asks for the start of the file the details are about, when it changes.
+    /// Asks for the start of the file the preview is about, when it changes. Only while the
+    /// preview is open.
     fn want_preview(&mut self, cx: &mut Context<Self>) {
         let wanted = self
-            .inspected()
-            .filter(|entry| entry.kind == EntryKind::File && entry.size > 0)
+            .looked_at()
+            .filter(|entry| entry.kind != EntryKind::Dir && entry.size > 0)
             .map(|entry| entry.path.clone());
         let Some(path) = wanted else {
             self.preview = None;
             return;
         };
-        if self.width.get() < INSPECTOR_FROM
-            || !self.state.read(cx).settings.show_file_details
-            || self.preview.as_ref().is_some_and(|p| p.path == path)
-            || !self.session_connected(cx)
-        {
+        if self.preview.as_ref().is_some_and(|p| p.path == path) || !self.session_connected(cx) {
             return;
         }
         let req = self
@@ -2653,141 +2799,264 @@ impl FilesView {
             path,
             req,
             text: None,
+            arrived: false,
         });
     }
 
-    /// How wide the details are, if they show: the width chosen, as far as the view allows.
-    fn details_width(&self, cx: &App) -> Option<f32> {
-        let width = self.width.get();
-        let settings = &self.state.read(cx).settings;
-        (width >= INSPECTOR_FROM && settings.show_file_details).then(|| self.details_size(cx))
+    /// What the preview shows, while it is open: the one entry selected.
+    fn looked_at(&self) -> Option<&RemoteEntry> {
+        self.looking.then(|| self.inspected()).flatten()
     }
 
-    /// The width chosen for the details, as far as the view allows, whether they show or not.
-    fn details_size(&self, cx: &App) -> f32 {
-        let settings = &self.state.read(cx).settings;
-        self.dragging_details
-            .unwrap_or(settings.file_details_width)
-            .clamp(MIN_DETAILS, (self.width.get() - MIN_LIST).max(MIN_DETAILS))
-    }
-
-    /// What is left for the list. Its columns go by this.
-    fn list_width(&self, cx: &App) -> f32 {
-        let width = self.width.get();
-        if width >= INSPECTOR_FROM {
-            width - self.details_size(cx) * self.details_reveal.value()
-        } else {
-            width
-        }
-    }
-
-    /// The line follows the pointer. A button let go where nothing listens ends the drag here.
-    fn drag_details_line(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        if event.pressed_button != Some(MouseButton::Left) {
-            self.end_details_drag(cx);
+    /// Opens the preview of the file selected; a folder has none. From the menu it may fade in,
+    /// from the keyboard it is just there.
+    fn open_look(&mut self, fade: bool, cx: &mut Context<Self>) {
+        if self
+            .inspected()
+            .is_none_or(|entry| entry.kind == EntryKind::Dir)
+        {
             return;
         }
-        self.dragging_details = Some(self.right_edge.get() - f32::from(event.position.x));
+        self.looking = true;
+        self.look_fade = (fade && self.state.read(cx).settings.animated_selection).then(|| {
+            self.look_count += 1;
+            self.look_count
+        });
         cx.notify();
     }
 
-    fn end_details_drag(&mut self, cx: &mut Context<Self>) {
-        let width = self.details_width(cx);
-        if self.dragging_details.take().is_some()
-            && let Some(width) = width
-        {
-            self.state
-                .update(cx, |state, cx| state.set_file_details_width(width, cx));
-        }
+    fn close_look(&mut self, cx: &mut Context<Self>) {
+        self.looking = false;
+        self.look_fade = None;
         cx.notify();
     }
 
-    /// The line between the list and the details, with more room than a hairline to grab it by.
-    /// Not occluding: the view must keep hearing the pointer on it.
-    fn details_line(&self, details: f32, cx: &mut Context<Self>) -> AnyElement {
-        div()
-            .id("details-line")
-            .absolute()
-            .top_0()
-            .bottom_0()
-            .right(px(details - 4.))
-            .w(px(7.))
-            .cursor(gpui::CursorStyle::ResizeLeftRight)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    this.dragging_details = Some(details);
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
-                if event.click_count() >= 2 {
-                    this.state.update(cx, |state, cx| {
-                        state.set_file_details_width(INSPECTOR_W, cx)
-                    });
-                }
-            }))
-            .into_any_element()
-    }
-
-    /// A circle on the line. With the details closed, half of one against the edge.
-    /// It follows the details on their way, and flattens against the edge in the last stretch.
-    fn details_toggle(&self, showing: f32, cx: &mut Context<Self>) -> AnyElement {
+    /// The preview, floating over the list in the middle of the card: what the file is, and its
+    /// first lines. The selection moving with the arrows takes it along.
+    fn render_look(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let entry = self.looked_at()?.clone();
         let theme = cx.theme().clone();
-        let open = showing >= 14.;
-        div()
-            .id("toggle-file-details")
-            .occlude()
-            .absolute()
-            .top(gpui::relative(0.5))
-            .mt(px(-14.))
-            .h(px(28.))
-            .map(|this| {
-                if open {
-                    this.right(px(showing - 14.)).w(px(28.)).rounded_full()
-                } else {
-                    this.right_0().w(px(14. + showing)).rounded_l(px(14.))
-                }
-            })
+        let is_dir = entry.kind == EntryKind::Dir;
+        let mark = if is_dir {
+            Mark::Icon(IconName::Folder)
+        } else {
+            Mark::Label(format::badge(&entry.name).into())
+        };
+        let meta = if is_dir {
+            format!("Folder · {}", format::modified(entry.modified))
+        } else {
+            format!(
+                "{} · {}",
+                format::bytes(entry.size),
+                format::modified(entry.modified)
+            )
+        };
+        let preview = self.preview.as_ref().filter(|p| p.path == entry.path);
+        let empty = |text: &'static str| {
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .min_h(px(120.))
+                .font_family(crate::theme::ui_font())
+                .text_size(crate::theme::ui_px(13.))
+                .text_color(theme.text_disabled)
+                .child(text)
+        };
+        let body = match preview {
+            _ if is_dir => empty("Folders have no preview"),
+            _ if entry.size == 0 => empty("This file is empty"),
+            Some(Preview {
+                text: Some(text), ..
+            }) => div().flex().flex_col().children(
+                text.lines()
+                    .take(PREVIEW_LINES)
+                    .map(|line| preview_line(line, &theme)),
+            ),
+            Some(Preview { arrived: true, .. }) => empty("No preview: this file is not text"),
+            _ => empty("Loading…"),
+        };
+        let header = div()
+            .h(px(42.))
+            .flex_none()
             .flex()
             .items_center()
-            .justify_center()
-            .bg(theme.bg)
-            .border_1()
-            .border_color(if open {
-                theme.lit_line
-            } else {
-                theme.strong_border
+            .gap(px(10.))
+            .pl(px(10.))
+            .pr(px(6.))
+            .text_size(crate::theme::ui_px(13.))
+            .child(tile(mark, theme.text_muted, None, &theme))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .child(entry.name.clone()),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .whitespace_nowrap()
+                    .text_size(crate::theme::ui_px(12.5))
+                    .text_color(theme.text_disabled)
+                    .child(meta),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(5.))
+                    .py(px(2.))
+                    .rounded(px(crate::theme::RADIUS_SMALL))
+                    .border_1()
+                    .border_color(theme.strong_border)
+                    .font_family(crate::theme::mono_font())
+                    .text_size(crate::theme::ui_px(10.5))
+                    .text_color(theme.text_disabled)
+                    .child("Space"),
+            )
+            .child(
+                Button::new("quick-look-close")
+                    .icon(IconName::Close)
+                    .tooltip("Close (Space, Esc)")
+                    .style(ButtonStyle::Ghost)
+                    .on_click(cx.listener(|this, _, _, cx| this.close_look(cx))),
+            );
+        let panel = div()
+            .id("quick-look")
+            .occlude()
+            .w(px(540.))
+            .max_w_full()
+            .max_h_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .rounded(px(crate::theme::RADIUS_CARD))
+            .map(|this| {
+                crate::panel::floating(this, &theme, crate::theme::RADIUS_CARD, theme.strong_border)
             })
-            .when(!open, |this| this.border_r_0())
-            .cursor_pointer()
-            .tooltip(crate::widgets::tooltip::tooltip(if open {
-                "Hide details"
-            } else {
-                "Show details"
-            }))
-            .on_click(cx.listener(|this, _, _, cx| {
-                if this.state.read(cx).settings.animated_selection {
-                    this.details_reveal.arm();
-                }
-                this.state
-                    .update(cx, |state, cx| state.toggle_file_details(cx));
-                cx.notify();
-            }))
-            .child(if open {
-                Icon::new(IconName::ChevronRight)
-                    .size(px(13.))
-                    .color(theme.accent)
-            } else {
-                Icon::new(IconName::ChevronLeft)
-                    .size(px(11.))
-                    .color(theme.text_muted)
-            })
-            .into_any_element()
+            .shadow(crate::theme::float_shadow())
+            // A press inside belongs to the preview: the list under it keeps its selection.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+            .child(header)
+            .child(
+                div()
+                    .id("quick-look-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .mx(px(4.))
+                    .mb(px(4.))
+                    .px(px(14.))
+                    .py(px(12.))
+                    .rounded(px(crate::theme::RADIUS_CONTROL))
+                    .bg(gpui::Hsla {
+                        a: 0.04,
+                        ..theme.text
+                    })
+                    .font_family(crate::theme::mono_font())
+                    .text_size(crate::theme::ui_px(12.5))
+                    .child(body),
+            );
+        let panel = match self.look_fade {
+            Some(count) => crate::motion::enter(
+                panel,
+                ("quick-look-in", count as usize),
+                crate::motion::MENU,
+            )
+            .into_any_element(),
+            None => panel.into_any_element(),
+        };
+        // Takes no pointer itself: only the panel in its middle does.
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .px(px(16.))
+                .py(px(36.))
+                .child(panel)
+                .into_any_element(),
+        )
     }
 
-    /// Flips one permission of the file in the details.
+    /// Opens the permissions of an entry, under its cell in the list or, where the list does not
+    /// show them, at `at`.
+    fn open_perms(&mut self, path: String, at: Point<Pixels>, cx: &mut Context<Self>) {
+        self.menu = None;
+        self.perms = Some(PermsOpen { path, at });
+        cx.notify();
+    }
+
+    /// The permissions of one entry, floating under its cell: the grid of toggles the details
+    /// had.
+    fn render_perms(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let open = self.perms.as_ref()?;
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.path == open.path)?
+            .clone();
+        let (position, corner) = match self.perm_cells.borrow().get(&entry.path) {
+            Some(cell) => (
+                cell.bottom_right() + point(px(0.), px(4.)),
+                Corner::TopRight,
+            ),
+            None => (open.at, Corner::TopLeft),
+        };
+        let grid = self.permissions_grid(&entry, cx)?;
+        let theme = cx.theme().clone();
+        let panel = div()
+            .id("permissions-popover")
+            .occlude()
+            .w(px(264.))
+            .p(px(10.))
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .rounded(px(crate::theme::RADIUS_CARD))
+            .map(|this| {
+                crate::panel::floating(this, &theme, crate::theme::RADIUS_CARD, theme.strong_border)
+            })
+            .shadow(crate::theme::float_shadow())
+            .text_size(crate::theme::ui_px(13.))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.perms = None;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .px(px(2.))
+                    .truncate()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .child(entry.name.clone()),
+            )
+            .child(grid);
+        Some(
+            deferred(
+                anchored()
+                    .anchor(corner)
+                    .position(position)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(crate::motion::enter(
+                        panel,
+                        "permissions-in",
+                        crate::motion::MENU,
+                    )),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
+
+    /// Flips one permission of an entry.
     fn toggle_permission(&mut self, path: String, bit: u32, cx: &mut Context<Self>) {
         let Some(mode) = self
             .all_entries
@@ -2816,292 +3085,15 @@ impl FilesView {
         cx.notify();
     }
 
-    fn fact(label: &'static str, value: String, theme: &crate::theme::Theme) -> Div {
-        div()
-            .w_full()
-            .flex()
-            .justify_between()
-            .gap(px(16.))
-            .text_size(crate::theme::ui_px(13.))
-            .child(
-                div()
-                    .flex_none()
-                    .text_color(theme.text_disabled)
-                    .child(label),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .text_color(theme.text)
-                    .child(value),
-            )
-    }
-
-    fn inspector_head(
-        name: String,
-        folder: String,
-        mark: AnyElement,
-        theme: &crate::theme::Theme,
-    ) -> Div {
-        div()
-            .flex()
-            .flex_none()
-            .items_start()
-            .gap(px(11.))
-            .px(px(16.))
-            .pt(px(14.))
-            .pb(px(12.))
-            .child(
-                div()
-                    .size(px(40.))
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(11.))
-                    .child(mark),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_size(crate::theme::ui_px(15.))
-                            .text_color(theme.text)
-                            .child(name),
-                    )
-                    .child(
-                        div()
-                            .truncate()
-                            .font_family(crate::theme::mono_font())
-                            .text_size(crate::theme::ui_px(12.))
-                            .text_color(theme.text_disabled)
-                            .child(folder),
-                    ),
-            )
-    }
-
-    /// Beside the list: what the selected file or folder is, or the folder on screen.
-    fn inspector(&mut self, details: f32, cx: &mut Context<Self>) -> AnyElement {
-        let wide = details >= WIDE_DETAILS;
+    /// Who may read, write and run an entry, as a grid of toggles. Each changes its one bit on
+    /// the server at once. `None` when the server did not say.
+    fn permissions_grid(&self, entry: &RemoteEntry, cx: &mut Context<Self>) -> Option<Div> {
         let theme = cx.theme().clone();
         let ready = !self.path.is_empty() && self.session_connected(cx);
-        let frame = div()
-            .id("file-details")
-            .h_full()
-            .flex()
-            .flex_col()
-            .border_l_1()
-            .border_color(theme.border)
-            .overflow_y_scroll()
-            .w(px(details))
-            .flex_none();
-        let Some(entry) = self.inspected().cloned() else {
-            let folder = self.path.clone();
-            let name = self.folder_name().unwrap_or("").to_string();
-            let target = folder.clone();
-            let mark = Icon::new(IconName::Folder)
-                .size(px(22.))
-                .color(theme.accent)
-                .into_any_element();
-            let used = self
-                .free_space
-                .zip(self.total_space)
-                .map(|(free, total)| (free, total, 1. - free as f32 / total as f32));
-            return frame
-                .child(Self::inspector_head(name, folder, mark, &theme))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_none()
-                        .px(px(16.))
-                        .pb(px(14.))
-                        .when(wide, |this| this.items_start())
-                        .child(
-                            Button::new("details-terminal-here")
-                                .icon(IconName::Terminal)
-                                .label("Go here in terminal")
-                                .style(ButtonStyle::Primary)
-                                .disabled(!ready)
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    cx.emit(FilesEvent::GoHereInTerminal(target.clone()))
-                                })),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_none()
-                        .px(px(16.))
-                        .child(Self::fact("Contents", self.contents_summary(), &theme)),
-                )
-                .children(used.map(|(free, total, used)| {
-                    div()
-                        .flex_none()
-                        .flex()
-                        .flex_col()
-                        .gap(px(8.))
-                        .px(px(16.))
-                        .pt(px(16.))
-                        .child(Self::fact(
-                            "Free space",
-                            format!("{} of {}", format::bytes(free), format::bytes(total)),
-                            &theme,
-                        ))
-                        .child(ProgressBar::new(used))
-                }))
-                .into_any_element();
-        };
-        let is_dir = entry.kind == EntryKind::Dir;
-        let row = self.entries.iter().position(|e| e.path == entry.path);
-        let mark = if is_dir {
-            Icon::new(IconName::Folder)
-                .size(px(22.))
-                .color(theme.accent)
-                .into_any_element()
-        } else {
-            div()
-                .size(px(40.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(11.))
-                .bg(gpui::Hsla {
-                    a: 0.075,
-                    ..theme.text
-                })
-                .font_family(crate::theme::mono_font())
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_size(crate::theme::ui_px(12.))
-                .text_color(theme.text_muted)
-                .child(format::badge(&entry.name))
-                .into_any_element()
-        };
-        let preview_text = self
-            .preview
-            .as_ref()
-            .filter(|preview| preview.path == entry.path)
-            .and_then(|preview| preview.text.clone());
-        let lines: Vec<String> = preview_text
-            .map(|text| {
-                text.lines()
-                    .take(PREVIEW_LINES)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let folder = entry.path.clone();
-        let primary = Button::new("details-open")
-            .icon(if is_dir {
-                IconName::Terminal
-            } else {
-                IconName::ExternalLink
-            })
-            .label(if is_dir {
-                "Go here in terminal"
-            } else {
-                "Edit in local editor"
-            })
-            .style(ButtonStyle::Primary)
-            .disabled(!ready)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if is_dir {
-                    cx.emit(FilesEvent::GoHereInTerminal(folder.clone()));
-                } else if let Some(row) = row {
-                    this.open(row, cx);
-                }
-            }));
-        // In a narrow column the main action has a row of its own. With room, they all share one.
-        let fit = |button: Button| if wide { button } else { button.share() };
-        let (above, beside) = if wide {
-            (None, Some(primary))
-        } else {
-            (Some(primary.whole()), None)
-        };
-        let actions = div()
-            .flex()
-            .flex_none()
-            .flex_col()
-            .gap(px(6.))
-            .px(px(16.))
-            .pb(px(14.))
-            .children(above)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .children(beside)
-                    .child(fit(Button::new("details-download")
-                        .icon(IconName::Download)
-                        .label("Download")
-                        .disabled(!ready)
-                        .on_click(cx.listener(|this, _, _, cx| this.download(cx)))))
-                    .child(fit(Button::new("details-copy-path")
-                        .icon(IconName::Copy)
-                        .label("Copy path")
-                        .on_click(cx.listener(|this, _, _, cx| this.copy_paths(cx)))))
-                    .child(
-                        self.menu_button(
-                            ToolbarMenu::Selection,
-                            Button::new("details-more")
-                                .icon(IconName::More)
-                                .tooltip("More")
-                                .style(ButtonStyle::Ghost),
-                            cx,
-                        ),
-                    ),
-            );
-        let preview_height = if wide { px(560.) } else { px(232.) };
-        let preview_size = if wide { 12.5 } else { 11. };
-        let preview = (!lines.is_empty()).then(|| {
-            div().flex_none().px(px(16.)).child(
-                div()
-                    .id("file-preview")
-                    .max_h(preview_height)
-                    .overflow_y_scroll()
-                    .overflow_x_hidden()
-                    .px(px(12.))
-                    .py(px(10.))
-                    .rounded(px(9.))
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(gpui::Hsla {
-                        a: 0.04,
-                        ..theme.text
-                    })
-                    .font_family(crate::theme::mono_font())
-                    .text_size(px(preview_size))
-                    .flex()
-                    .flex_col()
-                    .children(lines.iter().map(|line| preview_line(line, &theme))),
-            )
-        });
-        let mut facts = div()
-            .flex()
-            .flex_none()
-            .flex_col()
-            .gap(px(6.))
-            .px(px(16.))
-            .pt(px(14.))
-            .when(wide, |this| this.max_w(px(492.)));
-        if !is_dir {
-            facts = facts.child(Self::fact("Size", format::bytes(entry.size), &theme));
-        }
-        facts = facts.child(Self::fact(
-            "Modified",
-            format::modified(entry.modified),
-            &theme,
-        ));
-        let grid = entry.permissions.map(|mode| {
+        entry.permissions.map(|mode| {
             let path = entry.path.clone();
             let octal = format!("{:o}", mode & 0o777);
-            let bit = |who: usize, what: usize, this: &mut Self, cx: &mut Context<Self>| {
+            let bit = |who: usize, what: usize, cx: &mut Context<Self>| {
                 let mask = 1u32 << (8 - (who * 3 + what));
                 let on = mode & mask != 0;
                 let path = path.clone();
@@ -3115,7 +3107,6 @@ impl FilesView {
                         theme.strong_border,
                     )
                 };
-                let _ = this;
                 div()
                     .id(("permission", who * 3 + what))
                     .w(px(34.))
@@ -3124,7 +3115,7 @@ impl FilesView {
                     .flex_none()
                     .items_center()
                     .justify_center()
-                    .rounded(px(6.))
+                    .rounded(px(crate::theme::RADIUS_SMALL))
                     .border_1()
                     .border_color(if on { lit_line } else { border })
                     .when(on, |this| this.bg(lit_fill))
@@ -3156,12 +3147,7 @@ impl FilesView {
                 .flex_none()
                 .flex_col()
                 .gap(px(4.))
-                .m(px(16.))
-                .pt(px(14.))
-                .border_t_1()
-                .border_color(theme.border)
                 .text_size(crate::theme::ui_px(13.))
-                .when(wide, |this| this.max_w(px(460.)))
                 .child(
                     div()
                         .flex()
@@ -3187,11 +3173,7 @@ impl FilesView {
                         .child(heading("run", &theme)),
                 );
             for (who, label) in ["Owner", "Group", "Others"].into_iter().enumerate() {
-                let (a, b, c) = (
-                    bit(who, 0, self, cx),
-                    bit(who, 1, self, cx),
-                    bit(who, 2, self, cx),
-                );
+                let (a, b, c) = (bit(who, 0, cx), bit(who, 1, cx), bit(who, 2, cx));
                 grid = grid.child(
                     div()
                         .flex()
@@ -3204,41 +3186,20 @@ impl FilesView {
                 );
             }
             grid
-        });
-        frame
-            .child(Self::inspector_head(
-                entry.name.clone(),
-                format::parent(&entry.path),
-                mark,
-                &theme,
-            ))
-            .child(actions)
-            .children(preview)
-            .child(facts)
-            .children(grid)
-            .into_any_element()
+        })
     }
 }
 
 impl Render for FilesView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        self.want_preview(cx);
-        let width = self.width.get();
-        let measured = self.width.clone();
-        let right_edge = self.right_edge.clone();
-        let details = self.details_width(cx);
-        let details_size = self.details_size(cx);
-        let shown = self.state.read(cx).settings.show_file_details;
-        self.details_reveal.set(shown);
-        if self.details_reveal.moving() {
-            window.request_animation_frame();
+        // The preview closes once the selection is no longer one entry.
+        if self.looking && self.inspected().is_none() {
+            self.looking = false;
         }
-        // How much of them is on screen right now, on their way in or out.
-        let details_now = (width >= INSPECTOR_FROM)
-            .then(|| details_size * self.details_reveal.value())
-            .filter(|width| *width >= 1.);
-        let list_width = width - details_now.unwrap_or(0.);
+        self.want_preview(cx);
+        let measured = self.width.clone();
+        let list_width = self.width.get();
         let drop_highlight = theme.selected;
         let bar = {
             let (metrics, moved) = (self.list_scroll.clone(), self.list_scroll.clone());
@@ -3277,18 +3238,6 @@ impl Render for FilesView {
         let view = div()
             .id("files-view")
             .track_focus(&self.focus)
-            .when(self.dragging_details.is_some(), |this| {
-                this.cursor(gpui::CursorStyle::ResizeLeftRight)
-                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                        this.drag_details_line(event, cx)
-                    }))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
-                            this.end_details_drag(cx)
-                        }),
-                    )
-            })
             .on_key_down(cx.listener(Self::on_key_down))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 this.upload_paths(paths.paths().to_vec(), cx)
@@ -3303,7 +3252,6 @@ impl Render for FilesView {
                 // Knows how wide the view is. A change shows at the next frame.
                 canvas(
                     move |bounds, window, _| {
-                        right_edge.set(f32::from(bounds.right()));
                         let width = f32::from(bounds.size.width);
                         if (measured.get() - width).abs() > 0.5 {
                             measured.set(width);
@@ -3320,90 +3268,53 @@ impl Render for FilesView {
             })
             .children(self.search_bar(cx))
             .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .flex()
-                    .child(
-                        div()
-                            .h_full()
-                            .flex()
-                            .flex_col()
-                            .min_w_0()
-                            .flex_1()
-                            // Clear of the half circle that opens the details again.
-                            .when(width >= INSPECTOR_FROM, |this| {
-                                this.pr(px(14. * (1. - self.details_reveal.value())))
-                            })
-                            .child(self.header(cx))
-                            .child(
-                                div()
-                                    .id("file-list-area")
-                                    .relative()
-                                    .flex_1()
-                                    .min_h_0()
-                                    .w_full()
-                                    .on_click(cx.listener(
-                                        |this, event: &ClickEvent, window, cx| {
-                                            // Clicks that reach here missed every row: clear the selection.
-                                            window.focus(&this.focus);
-                                            if !event.modifiers().control
-                                                && !event.modifiers().shift
-                                            {
-                                                this.selected.clear();
-                                                this.anchor = None;
-                                                cx.notify();
-                                            }
-                                        },
-                                    ))
-                                    .on_mouse_down(
-                                        MouseButton::Right,
-                                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                                            window.focus(&this.focus);
-                                            this.open_menu(event.position, None, cx);
+                div().flex_1().min_h_0().w_full().flex().child(
+                    div()
+                        .h_full()
+                        .flex()
+                        .flex_col()
+                        .min_w_0()
+                        .flex_1()
+                        .child(self.header(cx))
+                        .child(
+                            div()
+                                .id("file-list-area")
+                                .relative()
+                                .flex_1()
+                                .min_h_0()
+                                .w_full()
+                                .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                                    // Clicks that reach here missed every row: clear the selection.
+                                    window.focus(&this.focus);
+                                    if !event.modifiers().control && !event.modifiers().shift {
+                                        this.selected.clear();
+                                        this.anchor = None;
+                                        cx.notify();
+                                    }
+                                }))
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                        window.focus(&this.focus);
+                                        this.open_menu(event.position, None, cx);
+                                    }),
+                                )
+                                .child(
+                                    uniform_list(
+                                        "file-list",
+                                        self.entries.len(),
+                                        cx.processor(|this, range: Range<usize>, _window, cx| {
+                                            range
+                                                .map(|i| this.render_row(i, cx))
+                                                .collect::<Vec<_>>()
                                         }),
                                     )
-                                    .child(
-                                        uniform_list(
-                                            "file-list",
-                                            self.entries.len(),
-                                            cx.processor(
-                                                |this, range: Range<usize>, _window, cx| {
-                                                    range
-                                                        .map(|i| this.render_row(i, cx))
-                                                        .collect::<Vec<_>>()
-                                                },
-                                            ),
-                                        )
-                                        .track_scroll(self.list_scroll.clone())
-                                        .size_full(),
-                                    )
-                                    .child(bar),
-                            ),
-                    )
-                    .when_some(
-                        details_now.filter(|_| !self.path.is_empty()),
-                        |this, now| {
-                            // Cut off on its way, keeping its layout instead of squeezing it.
-                            this.child(
-                                div()
-                                    .h_full()
-                                    .flex_none()
-                                    .overflow_hidden()
-                                    .w(px(now))
-                                    .child(self.inspector(details_size, cx)),
-                            )
-                        },
-                    )
-                    .when_some(
-                        details.filter(|_| !self.path.is_empty() && !self.details_reveal.moving()),
-                        |this, details| this.relative().child(self.details_line(details, cx)),
-                    )
-                    .when(width >= INSPECTOR_FROM && !self.path.is_empty(), |this| {
-                        this.relative()
-                            .child(self.details_toggle(details_now.unwrap_or(0.), cx))
-                    }),
+                                    .track_scroll(self.list_scroll.clone())
+                                    .size_full(),
+                                )
+                                .child(bar),
+                        ),
+                ),
             )
             .children(empty_message.map(|m| {
                 div()
@@ -3430,7 +3341,14 @@ impl Render for FilesView {
                     }),
                 )
             }));
-        div().relative().size_full().child(view)
+        let look = self.render_look(cx);
+        let perms = self.render_perms(cx);
+        div()
+            .relative()
+            .size_full()
+            .child(view)
+            .children(look)
+            .children(perms)
     }
 }
 

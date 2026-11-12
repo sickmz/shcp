@@ -3,17 +3,20 @@
 use crate::actions::{
     FocusPaneDown, FocusPaneLeft, FocusPaneRight, FocusPaneUp, SplitDown, SplitRight,
 };
+use crate::motion::HoverFade;
 use crate::state::AppState;
 use crate::terminal_view::TerminalView;
-use crate::theme::ActiveTheme as _;
+use crate::theme::{ActiveTheme as _, RADIUS_SMALL, Theme};
 use crate::widgets::button::{Button, ButtonStyle};
 use crate::widgets::context_menu::{ContextMenu, MenuEntry, OpenMenu, handler};
 use crate::widgets::icon::IconName;
+use crate::widgets::tile::shell_tile;
+use crate::widgets::tooltip::tooltip;
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle, Entity, EntityId, EventEmitter,
-    FocusHandle, Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, SharedString, Subscription, Window, canvas, div, px, relative,
+    AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Entity, EntityId,
+    EventEmitter, FocusHandle, Focusable, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, Subscription, Window, canvas, div, px, relative,
 };
 use shcp_core::{HostId, SavedPane, SplitAxis, TerminalId};
 use std::{
@@ -156,6 +159,10 @@ impl Node {
 pub enum PanesEvent {
     /// Show the files next to the terminals.
     Browse,
+    /// Show the files, or hide them if they show.
+    ToggleFiles,
+    /// The last terminal was closed from its card: the tab goes.
+    CloseTab,
 }
 
 impl EventEmitter<PanesEvent> for TerminalPanes {}
@@ -171,6 +178,10 @@ pub struct TerminalPanes {
     menu: Option<OpenMenu>,
     /// Initial shells have finished starting; later splits use their own local status.
     had_session: bool,
+    /// The tab shows its files beside the terminals. Set by the workspace, for the cards' button.
+    pub files_shown: bool,
+    /// The tools of each card, coming and going with the pointer.
+    fades: HashMap<EntityId, HoverFade>,
     _state_subscription: Subscription,
 }
 
@@ -211,6 +222,8 @@ impl TerminalPanes {
             dragging: None,
             menu: None,
             had_session: false,
+            files_shown: false,
+            fades: HashMap::new(),
             _state_subscription: subscription,
         }
     }
@@ -293,6 +306,11 @@ impl TerminalPanes {
 
     pub fn active(&self) -> &Entity<TerminalView> {
         &self.active
+    }
+
+    /// More than one terminal side by side.
+    pub fn is_split(&self) -> bool {
+        matches!(self.root, Some(Node::Split { .. }))
     }
 
     pub fn title(&self, cx: &App) -> Option<String> {
@@ -692,27 +710,142 @@ impl TerminalPanes {
         }
     }
 
+    /// The header of a terminal's card: its host and folder, and what acts on it.
+    fn card_header(
+        &self,
+        view: &Entity<TerminalView>,
+        tools_shown: f32,
+        several: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let state = self.state.read(cx);
+        let host = state.host(&self.host);
+        let who = host.map_or(self.host.0.clone(), |host| {
+            format!("{}@{}", host.user, host.alias)
+        });
+        let target = host.map(|host| format!("{}@{}", host.user, host.hostname));
+        let color = theme.host_color(state.host_color(&self.host));
+        let user = host.map(|host| host.user.clone()).unwrap_or_default();
+        let shell = state
+            .host_session(&self.host)
+            .and_then(|session| session.login_shell.clone());
+        let folder = view
+            .read(cx)
+            .cwd()
+            .map(|folder| folder_crumbs(view, &folder, &theme));
+        let id = view.entity_id().as_u64() as usize;
+        let split = |axis: SplitAxis| {
+            let target = view.clone();
+            cx.listener(move |this: &mut Self, _: &ClickEvent, window, cx| {
+                this.active = target.clone();
+                this.split(axis, window, cx);
+            })
+        };
+        let closing = view.clone();
+        let files_shown = self.files_shown;
+        let tools = vec![
+            Button::new(("pane-split-right", id))
+                .icon(IconName::SplitRight)
+                .tooltip("Split right (Ctrl+Shift+D)")
+                .style(ButtonStyle::Ghost)
+                .on_click(split(SplitAxis::Row))
+                .into_any_element(),
+            Button::new(("pane-split-down", id))
+                .icon(IconName::SplitDown)
+                .tooltip("Split down (Ctrl+Shift+S)")
+                .style(ButtonStyle::Ghost)
+                .on_click(split(SplitAxis::Column))
+                .into_any_element(),
+            Button::new(("pane-files", id))
+                .icon(IconName::Folder)
+                .tooltip(if files_shown {
+                    "Hide the files"
+                } else {
+                    "Files beside the terminal (Ctrl+Shift+E)"
+                })
+                .style(ButtonStyle::Ghost)
+                .active(files_shown)
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(PanesEvent::ToggleFiles)))
+                .into_any_element(),
+            Button::new(("pane-close", id))
+                .icon(IconName::Close)
+                .tooltip(if several {
+                    "Close terminal (Ctrl+Shift+W)"
+                } else {
+                    "Close tab (Ctrl+Shift+W)"
+                })
+                .style(ButtonStyle::Ghost)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if !this.close_pane(closing.clone(), window, cx) {
+                        cx.emit(PanesEvent::CloseTab);
+                    }
+                }))
+                .into_any_element(),
+        ];
+        let lead = vec![
+            shell_tile(
+                ("pane-tile", id),
+                shell.as_deref(),
+                &user,
+                color,
+                None,
+                &theme,
+            ),
+            div()
+                .id(("pane-host", id))
+                .flex_none()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.text)
+                .when_some(target, |this, target| this.tooltip(tooltip(target)))
+                .child(who)
+                .into_any_element(),
+        ]
+        .into_iter()
+        .chain(folder)
+        .collect();
+        crate::panel::header(tools_shown, lead, tools).into_any_element()
+    }
+
     fn render_node(
         &self,
         node: &Node,
         path: Path,
         several: bool,
+        tools: &HashMap<EntityId, f32>,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match node {
             Node::Leaf(view) => {
                 let id = view.entity_id().as_u64() as usize;
-                let group = SharedString::from(format!("pane-{id}"));
+                let entity = view.entity_id();
                 let target = view.clone();
-                let closing = view.clone();
-                let can_close = several && !view.read(cx).search_is_open();
-                // The cursor tells the terminal in use: outlined in the others.
-                let pane = div().relative().size_full().child(view.clone());
-                div()
+                let shown = tools.get(&entity).copied().unwrap_or(0.);
+                let header = self.card_header(view, shown, several, cx);
+                let theme = cx.theme().clone();
+                let active = view.read(cx).contains_focus(window, cx);
+                let frame = match theme.material() {
+                    // Alone, a card has nothing to stand out from.
+                    Some(material) => crate::terminal_material::frame(
+                        material,
+                        active,
+                        active && (several || self.files_shown),
+                    ),
+                    None => crate::panel::frame(&theme, theme.terminal_bg),
+                };
+                frame
                     .id(("pane", id))
-                    .group(group.clone())
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        let animated = this.state.read(cx).settings.animated_selection;
+                        this.fades
+                            .entry(entity)
+                            .or_default()
+                            .hover(*hovered, animated);
+                        cx.notify();
+                    }))
                     .size_full()
-                    .relative()
+                    .overflow_hidden()
                     // Before the terminal, which may keep the click for the program in it.
                     .capture_any_mouse_down(cx.listener(
                         move |this, event: &MouseDownEvent, _, cx| {
@@ -725,35 +858,15 @@ impl TerminalPanes {
                             }
                         },
                     ))
-                    .child(pane)
-                    .when(can_close, |this| {
-                        this.child(
-                            div()
-                                .id(("pane-close-area", id))
-                                // Not occluding: the pointer must stay "on the pane" here, or
-                                // the button would hide itself. So it keeps its own clicks.
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-                                .on_mouse_down(MouseButton::Middle, |_, _, cx| {
-                                    cx.stop_propagation()
-                                })
-                                .absolute()
-                                .top(px(4.))
-                                .right(px(4.))
-                                .invisible()
-                                .group_hover(group, |style| style.visible())
-                                .child(
-                                    Button::new(("pane-close", id))
-                                        .icon(IconName::Close)
-                                        .tooltip("Close terminal (Ctrl+Shift+W)")
-                                        .style(ButtonStyle::Ghost)
-                                        .compact()
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.close_pane(closing.clone(), window, cx);
-                                        })),
-                                ),
-                        )
-                    })
+                    .child(header)
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_h_0()
+                            .w_full()
+                            .child(view.clone()),
+                    )
                     .into_any_element()
             }
             Node::Split {
@@ -767,10 +880,10 @@ impl TerminalPanes {
                 let (mut first_path, mut second_path) = (path.clone(), path.clone());
                 first_path.push(false);
                 second_path.push(true);
-                let first = self.render_node(first, first_path, several, cx);
-                let second = self.render_node(second, second_path, several, cx);
+                let first = self.render_node(first, first_path, several, tools, window, cx);
+                let second = self.render_node(second, second_path, several, tools, window, cx);
                 let cell = bounds.clone();
-                let line = cx.theme().border;
+                let gap = px(crate::panel::CARD_GAP);
                 div()
                     .size_full()
                     .relative()
@@ -790,31 +903,22 @@ impl TerminalPanes {
                             .child(first),
                     )
                     .child(
-                        // A hairline, with more room than that to grab it by.
+                        // The gap between the two cards is what to grab.
                         div()
                             .relative()
                             .flex_none()
-                            .bg(line)
-                            .when(row, |this| this.w(px(1.)).h_full())
-                            .when(!row, |this| this.h(px(1.)).w_full())
+                            .when(row, |this| this.w(gap).h_full())
+                            .when(!row, |this| this.h(gap).w_full())
                             .child(
                                 div()
                                     .id(gpui::SharedString::from(format!("divider-{path:?}")))
                                     .absolute()
                                     .occlude()
-                                    .when(row, |this| {
-                                        this.top_0()
-                                            .bottom_0()
-                                            .left(px(-3.))
-                                            .w(px(7.))
-                                            .cursor(CursorStyle::ResizeLeftRight)
-                                    })
-                                    .when(!row, |this| {
-                                        this.left_0()
-                                            .right_0()
-                                            .top(px(-3.))
-                                            .h(px(7.))
-                                            .cursor(CursorStyle::ResizeUpDown)
+                                    .size_full()
+                                    .cursor(if row {
+                                        CursorStyle::ResizeLeftRight
+                                    } else {
+                                        CursorStyle::ResizeUpDown
                                     })
                                     .on_mouse_down(
                                         MouseButton::Left,
@@ -840,6 +944,81 @@ impl TerminalPanes {
     }
 }
 
+/// The path of a terminal, each folder a way to go there with `cd` in that terminal. Always in
+/// sight: a narrow card cuts it from the left, keeping where the terminal is.
+fn folder_crumbs(view: &Entity<TerminalView>, folder: &str, theme: &Theme) -> AnyElement {
+    let (hover, press) = (theme.track, theme.active);
+    let from_home = folder.starts_with('~');
+    let names: Vec<&str> = folder
+        .split('/')
+        .filter(|name| !name.is_empty() && *name != "~")
+        .collect();
+    let last = names.len().checked_sub(1);
+    let crumb = |id: usize, label: String, current: bool, command: String| {
+        let view = view.clone();
+        div()
+            .id(("terminal-crumb", id))
+            .flex_none()
+            .px(px(4.))
+            .py(px(2.))
+            .rounded(px(RADIUS_SMALL))
+            .cursor_pointer()
+            .text_color(if current {
+                theme.text_muted
+            } else {
+                theme.text_disabled
+            })
+            .hover(move |style| style.bg(hover))
+            .active(move |style| style.bg(press))
+            .tooltip(tooltip(format!("Run: {command}")))
+            .on_click(move |_, window, cx| {
+                view.update(cx, |view, cx| view.run_command(&command, cx));
+                window.focus(&view.focus_handle(cx));
+            })
+            .child(label)
+    };
+    let separator = || div().flex_none().text_color(theme.text_disabled).child("/");
+    let mut crumbs: Vec<AnyElement> = Vec::new();
+    crumbs.push(separator().into_any_element());
+    if from_home {
+        crumbs.push(
+            crumb(0, "~".to_string(), names.is_empty(), "cd ~".to_string()).into_any_element(),
+        );
+    }
+    let mut reached = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        reached.push(*name);
+        let quoted = shcp_core::shell_quote(&reached.join("/"));
+        let command = if from_home {
+            format!("cd ~/{quoted}")
+        } else {
+            format!(
+                "cd {}",
+                shcp_core::shell_quote(&format!("/{}", reached.join("/")))
+            )
+        };
+        if index > 0 || from_home {
+            crumbs.push(separator().into_any_element());
+        }
+        crumbs.push(
+            crumb(index + 1, (*name).to_string(), Some(index) == last, command).into_any_element(),
+        );
+    }
+    div()
+        .id("terminal-crumbs")
+        .flex()
+        // As wide as the path while it fits; narrower, it loses its start, not its end.
+        .min_w_0()
+        .justify_end()
+        .items_center()
+        .gap(px(1.))
+        .overflow_hidden()
+        .font_family(crate::theme::mono_font())
+        .text_size(crate::theme::ui_px(12.))
+        .children(crumbs)
+        .into_any_element()
+}
+
 impl Render for TerminalPanes {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let leaves = self.leaves();
@@ -849,6 +1028,16 @@ impl Render for TerminalPanes {
             .find(|view| view.read(cx).contains_focus(window, cx))
         {
             self.active = focused.clone();
+        }
+        // How much of its tools each card shows, with the pointer over it or on its way out.
+        let live: HashSet<EntityId> = leaves.iter().map(|view| view.entity_id()).collect();
+        self.fades.retain(|id, _| live.contains(id));
+        let tools: HashMap<EntityId, f32> = live
+            .iter()
+            .map(|id| (*id, self.fades.entry(*id).or_default().value(false)))
+            .collect();
+        if self.fades.values().any(HoverFade::moving) {
+            window.request_animation_frame();
         }
         self.had_session |= leaves.iter().any(|view| view.read(cx).shell_started())
             && !leaves.iter().any(|view| view.read(cx).starting_shell());
@@ -860,7 +1049,7 @@ impl Render for TerminalPanes {
         let root = self.root.take();
         let content = root
             .as_ref()
-            .map(|root| self.render_node(root, Vec::new(), several, cx));
+            .map(|root| self.render_node(root, Vec::new(), several, &tools, window, cx));
         self.root = root;
         let dragging = self.dragging.is_some();
         div()

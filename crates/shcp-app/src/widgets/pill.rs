@@ -4,7 +4,8 @@ use crate::motion::PillMotion;
 use crate::theme::Theme;
 use gpui::prelude::*;
 use gpui::{
-    App, BorderStyle, Bounds, Hsla, Pixels, Window, canvas, point, px, quad, transparent_black,
+    App, BorderStyle, Bounds, Edges, Hsla, Pixels, Window, canvas, point, px, quad,
+    transparent_black,
 };
 use shcp_core::Settings;
 use std::{cell::RefCell, rc::Rc, time::Instant};
@@ -22,7 +23,7 @@ impl SlidingPill {
         }
     }
 
-    /// For `on_children_prepainted` of the list. The first child must be `self.element()`, and
+    /// For `on_children_prepainted` of the list. The first child must be the pill itself, and
     /// `item` is the index among the children of the current item.
     pub fn measure(
         &self,
@@ -41,16 +42,29 @@ impl SlidingPill {
         }
     }
 
-    pub fn element(&self, theme: &Theme, radius: f32) -> impl IntoElement + use<> {
-        self.painted(theme.raised, None, radius)
+    /// Without the accent: the neutral fill of the current item, with a faint edge. In a theme
+    /// with a material it has the crests of a card too: light along the top, less at the bottom.
+    pub fn neutral(&self, theme: &Theme, radius: f32) -> impl IntoElement + use<> {
+        self.painted(
+            theme.active,
+            Some(Hsla {
+                a: 0.05,
+                ..theme.text
+            }),
+            theme
+                .material()
+                .map(|material| (material.top_crest, material.bottom_crest)),
+            radius,
+        )
     }
 
-    /// The raised choice of a row of them: the color of what is under the groove, with an edge.
-    pub fn raised(&self, theme: &Theme, radius: f32) -> impl IntoElement + use<> {
-        self.painted(theme.bg, Some(theme.border), radius)
-    }
-
-    fn painted(&self, fill: Hsla, border: Option<Hsla>, radius: f32) -> impl IntoElement + use<> {
+    fn painted(
+        &self,
+        fill: Hsla,
+        border: Option<Hsla>,
+        crests: Option<(Hsla, Hsla)>,
+        radius: f32,
+    ) -> impl IntoElement + use<> {
         let motion = self.0.clone();
         canvas(
             |_, _, _| {},
@@ -80,6 +94,25 @@ impl SlidingPill {
                         border,
                         BorderStyle::Solid,
                     ));
+                }
+                // A border on one side tapers to nothing around the pill's ends.
+                if let Some((top, bottom)) = crests {
+                    let (none, line) = (px(0.), px(1.));
+                    for (color, top, bottom) in [(top, line, none), (bottom, none, line)] {
+                        window.paint_quad(quad(
+                            pill,
+                            px(radius),
+                            transparent_black(),
+                            Edges {
+                                top,
+                                bottom,
+                                left: none,
+                                right: none,
+                            },
+                            color,
+                            BorderStyle::Solid,
+                        ));
+                    }
                 }
                 if moving {
                     window.request_animation_frame();

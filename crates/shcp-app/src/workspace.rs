@@ -1,5 +1,5 @@
-//! Root view: sidebar with the tabs, location bar, the panel with the content, dock, notices and
-//! modals.
+//! Root view: the sidebar with the sessions and hosts, the cards of the open tab, the dock, the
+//! status row, notices and modals.
 use crate::actions::*;
 use crate::files_view::{FilesEvent, FilesView};
 use crate::login_prompt::{LoginAsk, LoginPrompt};
@@ -14,7 +14,7 @@ use crate::modals::{
     settings::SettingsModal,
     text_prompt::TextPrompt,
 };
-use crate::motion::{self, Beat};
+use crate::motion::{self, Beat, HoverFade};
 use crate::notices;
 use crate::panel;
 use crate::session_overlay::{self, Overlay, Surface};
@@ -22,17 +22,16 @@ use crate::sidebar::{OpenTab, Sidebar, SidebarEvent};
 use crate::state::{AppState, NoticeAction};
 use crate::tabs::{self, Face, Tab};
 use crate::terminal_panes::{PanesEvent, TerminalPanes};
-use crate::theme::{self, ActiveTheme as _, row_px};
+use crate::theme::{self, ActiveTheme as _};
 use crate::title_bar::{self, WindowControls};
 use crate::transfers_panel::{DockTab, TransfersEvent, TransfersPanel};
 use crate::widgets::button::{Button, ButtonStyle};
 use crate::widgets::context_menu::{ContextMenu, OpenMenu, handler};
 use crate::widgets::icon::Icon;
 use crate::widgets::icon::IconName;
-use crate::widgets::pill::SlidingPill;
 use crate::widgets::progress::ProgressRing;
-use crate::widgets::segmented::{groove, segment};
 use crate::widgets::status::status_dot;
+use crate::widgets::tile::{Mark, tile};
 use crate::widgets::tooltip::tooltip;
 use gpui::prelude::*;
 use gpui::{
@@ -55,8 +54,6 @@ const RECONNECT_DELAYS: [u64; 5] = [2, 5, 10, 20, 30];
 /// Then it stops: about nine minutes without a connection.
 const RECONNECT_ATTEMPTS: u32 = 20;
 const STATUS_BAR_HEIGHT: f32 = 32.;
-/// Height of the bar over the content of a tab.
-pub const LOCATION_HEIGHT: f32 = 46.;
 /// With both views showing, neither gets less than this share.
 const MIN_BOTH_RATIO: f32 = 0.15;
 
@@ -110,10 +107,10 @@ pub struct Workspace {
     sidebar_amount: f32,
     /// How tall the dock is when open.
     dock_height: std::rc::Rc<std::cell::Cell<f32>>,
-    /// The pill behind the current view of a tab.
-    face_pill: SlidingPill,
     /// The tab whose view the mouse last changed, and how many times: its content fades in.
     face_fade: Option<(u64, u64)>,
+    /// The tools of the files card, coming and going with the pointer.
+    files_fade: HoverFade,
     /// Where the two views were last drawn, to turn a drag into a share.
     both_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     /// This run of the app, as the other PCs on a host see it.
@@ -184,8 +181,8 @@ impl Workspace {
             dock_reveal: motion::Reveal::new(false),
             sidebar_amount: 1.,
             dock_height: Default::default(),
-            face_pill: SlidingPill::default(),
             face_fade: None,
+            files_fade: HoverFade::default(),
             both_bounds: Default::default(),
             writer: shcp_core::new_terminal_key(),
             shared: HashMap::new(),
@@ -760,6 +757,10 @@ impl Workspace {
             SidebarEvent::NewHost => self.new_host(window, cx),
             SidebarEvent::OpenSettings => self.open_settings(window, cx),
             SidebarEvent::RestartForUpdate => self.confirm_update_restart(window, cx),
+            SidebarEvent::HideSidebar => {
+                self.arm_sidebar(cx);
+                self.toggle_sidebar(window, cx);
+            }
             SidebarEvent::NewTab(host) => self.open_terminal(host.clone(), window, cx),
             SidebarEvent::ActivateTab(id) => {
                 if let Some(index) = self.tabs.iter().position(|tab| tab.id == *id) {
@@ -785,10 +786,10 @@ impl Workspace {
 
     /// From one of the app's themes to the other, leaving the system's light and dark out of it.
     fn toggle_theme(&mut self, cx: &mut Context<Self>) {
-        let target = if cx.theme().is_light {
+        let target = if cx.theme().name == theme::builtin::PRUNE {
             theme::builtin::NOCTURNE
         } else {
-            theme::builtin::PORCELAIN
+            theme::builtin::PRUNE
         };
         self.state.update(cx, |state, cx| {
             let mut settings = state.settings.clone();
@@ -1091,7 +1092,7 @@ impl Workspace {
 
     /// Shows a tab's place another way. The files are made the first time, at the folder of the
     /// terminal. The terminal is left alone: it may be running something, and a `cd` typed into
-    /// that would go to the program. The path in the location bar is there to send one.
+    /// that would go to the program.
     pub(crate) fn set_face(
         &mut self,
         index: usize,
@@ -1216,7 +1217,7 @@ impl Workspace {
         self.push_tab(host, label, panes, window, cx);
     }
 
-    /// "Browse this folder" in a terminal.
+    /// What the terminals of a tab ask of it: its files, or to go.
     fn on_panes_event(
         &mut self,
         panes: &Entity<TerminalPanes>,
@@ -1224,12 +1225,20 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let PanesEvent::Browse = event;
-        // Next to the terminal it was asked from.
-        let index = self.tabs.iter().position(|tab| tab.panes == *panes);
-        if let Some(index) = index {
-            self.activate(index, window, cx);
-            self.set_face(index, Face::Files, window, cx);
+        let Some(index) = self.tabs.iter().position(|tab| tab.panes == *panes) else {
+            return;
+        };
+        match event {
+            // Next to the terminal it was asked from.
+            PanesEvent::Browse => {
+                self.activate(index, window, cx);
+                self.set_face(index, Face::Files, window, cx);
+            }
+            PanesEvent::ToggleFiles => {
+                self.activate(index, window, cx);
+                self.toggle_files(index, window, cx);
+            }
+            PanesEvent::CloseTab => self.close_tab(index, window, cx),
         }
     }
 
@@ -1258,6 +1267,18 @@ impl Workspace {
                 let command = format!("cd {}", shcp_core::shell_quote(folder));
                 terminal.update(cx, |terminal, cx| terminal.run_command(&command, cx));
                 window.focus(&terminal.focus_handle(cx));
+            }
+            FilesEvent::ToggleFollow => {
+                if let Some(tab) = self
+                    .tabs
+                    .iter_mut()
+                    .find(|tab| tab.files.as_ref() == Some(view))
+                {
+                    tab.linked = !tab.linked;
+                    // Back on: the files catch up with the terminal at the next draw.
+                    tab.followed = None;
+                    cx.notify();
+                }
             }
         }
     }
@@ -1371,10 +1392,6 @@ impl Workspace {
             return;
         }
         self.active = Some(index);
-        // A tab on screen is one you can see in the list.
-        let host = self.tabs[index].host.clone();
-        self.state
-            .update(cx, |state, cx| state.expand_host(&host, cx));
         self.focus_active(window, cx);
         cx.notify();
     }
@@ -1651,12 +1668,12 @@ impl Workspace {
             handler(this.clone(), |w, window, cx| w.new_host(window, cx)),
         );
         command(
-            if cx.theme().is_light {
+            if cx.theme().name == theme::builtin::PRUNE {
                 "Switch to Nocturne"
             } else {
-                "Switch to Porcelain"
+                "Switch to Prune"
             },
-            if cx.theme().is_light {
+            if cx.theme().name == theme::builtin::PRUNE {
                 IconName::Moon
             } else {
                 IconName::Sun
@@ -1802,9 +1819,12 @@ impl Workspace {
         let target = state
             .host(&tab.host)
             .map(|h| format!("{}@{}", h.user, h.hostname));
-        let summary = match (&tab.files, tab.face.shows_files()) {
-            (Some(view), true) => view.read(cx).summary(),
-            _ => None,
+        let (summary, hint) = match (&tab.files, tab.face.shows_files()) {
+            (Some(view), true) => {
+                let view = view.read(cx);
+                (view.summary(), view.summary_hint())
+            }
+            _ => (None, None),
         };
         Some(
             div()
@@ -1831,8 +1851,16 @@ impl Workspace {
                     div()
                         .min_w_0()
                         .truncate()
+                        // A file selected stands out from the hint after it.
+                        .when(hint.is_some(), |this| this.text_color(theme.text_muted))
                         .child(summary.or(target).unwrap_or_default()),
                 )
+                .children(hint.map(|hint| {
+                    div()
+                        .flex_none()
+                        .text_color(theme.text_disabled)
+                        .child(hint)
+                }))
                 .child(div().flex_1().min_w_0())
                 .child(self.dock_buttons(&tab.host, cx))
                 .into_any_element(),
@@ -1857,12 +1885,14 @@ impl Workspace {
             div()
                 .id(id)
                 .h(px(24.))
-                .px(px(8.))
+                .min_w(px(26.))
+                .px(px(6.))
+                .justify_center()
                 .flex()
                 .flex_none()
                 .items_center()
                 .gap(px(6.))
-                .rounded(px(7.))
+                .rounded(px(crate::theme::RADIUS_CONTROL))
                 .cursor_pointer()
                 .text_color(theme.text_muted)
                 .when(shown, |this| this.bg(active).text_color(text))
@@ -1896,13 +1926,12 @@ impl Workspace {
             .gap(px(4.))
             .child(
                 pill("toggle-ports", ports_shown)
-                    .tooltip(tooltip("Show or hide the ports"))
+                    .tooltip(tooltip("Ports"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.arm_dock(cx);
                         this.toggle_dock(DockTab::Ports, cx)
                     }))
                     .child(Icon::new(IconName::Link).size(px(13.)))
-                    .child("Ports")
                     .when(open_tunnels > 0, |this| {
                         this.child(count(open_tunnels.to_string()))
                     }),
@@ -1910,253 +1939,93 @@ impl Workspace {
             .child(
                 pill("toggle-transfers", transfers_shown)
                     .tooltip(tooltip(if transfers_shown {
-                        "Hide transfers (Ctrl+Shift+J)"
+                        "Hide the transfers (Ctrl+Shift+J)"
                     } else {
-                        "Show transfers (Ctrl+Shift+J)"
+                        "Transfers (Ctrl+Shift+J)"
                     }))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.arm_dock(cx);
                         this.toggle_dock(DockTab::Transfers, cx)
                     }))
                     .child(leading)
-                    .child("Transfers")
                     .children(figure.map(count)),
             )
     }
 
-    /// The path of a terminal, each folder a way to go there with `cd`.
-    fn terminal_crumbs(&self, tab: &Tab, cx: &Context<Self>) -> Option<AnyElement> {
-        let panes = tab.panes.clone();
-        let folder = tab.terminal_folder(cx)?;
-        let theme = cx.theme().clone();
-        let (hover, press) = (theme.track, theme.active);
-        let from_home = folder.starts_with('~');
-        let names: Vec<&str> = folder
-            .split('/')
-            .filter(|name| !name.is_empty() && *name != "~")
-            .collect();
-        let last = names.len().checked_sub(1);
-        let crumb = |id: usize, label: String, current: bool, command: String| {
-            let panes = panes.clone();
-            div()
-                .id(("terminal-crumb", id))
-                .flex_none()
-                .px(px(6.))
-                .py(px(3.))
-                .rounded(px(6.))
-                .cursor_pointer()
-                .text_color(if current {
-                    theme.text
-                } else {
-                    theme.text_muted
-                })
-                .when(current, |this| this.font_weight(gpui::FontWeight::MEDIUM))
-                .hover(move |style| style.bg(hover))
-                .active(move |style| style.bg(press))
-                .tooltip(tooltip(format!("Run: {command}")))
-                .on_click(move |_, window, cx| {
-                    let view = panes.read(cx).active().clone();
-                    view.update(cx, |view, cx| view.run_command(&command, cx));
-                    window.focus(&view.focus_handle(cx));
-                })
-                .child(label)
+    /// Shows the files beside the terminals, or hides them. From the mouse: the view fades in.
+    fn toggle_files(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
         };
-        let separator = || {
-            div()
-                .flex_none()
-                .font_family(crate::theme::mono_font())
-                .text_size(crate::theme::ui_px(13.))
-                .text_color(theme.text_disabled)
-                .child("/")
+        let face = if tab.face.shows_files() {
+            Face::Terminal
+        } else {
+            Face::Files
         };
-        let mut crumbs: Vec<AnyElement> = Vec::new();
-        crumbs.push(separator().into_any_element());
-        if from_home {
-            crumbs.push(
-                crumb(0, "~".to_string(), names.is_empty(), "cd ~".to_string()).into_any_element(),
-            );
+        if self.animated(cx) {
+            let count = self.face_fade.map_or(0, |(_, count)| count + 1);
+            self.face_fade = Some((tab.id, count));
         }
-        let mut reached = Vec::new();
-        for (index, name) in names.iter().enumerate() {
-            reached.push(*name);
-            let quoted = shcp_core::shell_quote(&reached.join("/"));
-            let command = if from_home {
-                format!("cd ~/{quoted}")
-            } else {
-                format!(
-                    "cd {}",
-                    shcp_core::shell_quote(&format!("/{}", reached.join("/")))
-                )
-            };
-            if index > 0 || from_home {
-                crumbs.push(separator().into_any_element());
-            }
-            crumbs.push(
-                crumb(index + 1, (*name).to_string(), Some(index) == last, command)
-                    .into_any_element(),
-            );
-        }
-        Some(
-            div()
-                .id("terminal-crumbs")
-                .occlude()
-                .flex()
-                .min_w_0()
-                .items_center()
-                .gap(px(1.))
-                .overflow_hidden()
-                .children(crumbs)
-                .into_any_element(),
-        )
+        self.set_face(index, face, window, cx);
     }
 
-    /// Keep the panel header's height consistent even without an open tab.
-    fn panel_header(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        let location = self.location_bar(cx);
-        div()
-            .h(row_px(LOCATION_HEIGHT))
-            .flex_none()
-            .flex()
-            .items_center()
-            .pl(px(10.))
-            .gap(px(4.))
-            .border_b_1()
-            .border_color(theme.border)
-            .children(location)
-            .into_any_element()
-    }
-
-    /// Where this tab is, how it shows it, and what acts on that.
-    fn location_bar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let index = self.active?;
+    /// The card of a tab's files: where they are, and what acts on them. What the details used to
+    /// show now floats over the list, or sits in the status bar.
+    fn files_card(
+        &mut self,
+        index: usize,
+        files: Entity<FilesView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme().clone();
         let tab = &self.tabs[index];
-        let face = tab.face;
-        let host = self.state.read(cx).host(&tab.host).cloned();
-        let alias = host
-            .as_ref()
-            .map_or(tab.host.0.clone(), |h| h.alias.clone());
-        let target = host.map_or(String::new(), |h| format!("{}@{}", h.user, h.hostname));
-        let files = tab.files.clone().filter(|_| face.shows_files());
-        let panes = Some(tab.panes.clone());
-        let (nav, crumbs, tools) = match &files {
-            Some(view) => view.update(cx, |view, cx| {
-                (
-                    Some(view.nav_buttons(cx)),
-                    Some(view.crumbs(cx)),
-                    Some(view.tools(cx)),
-                )
-            }),
-            None => {
-                let tab = &self.tabs[index];
-                (None, self.terminal_crumbs(tab, cx), None)
+        let color = theme.host_color(self.state.read(cx).host_color(&tab.host));
+        let follows = tab.linked;
+        files.update(cx, |view, _| view.follows = follows);
+        let hold = files.read(cx).holds_tools(window, cx);
+        let tools_shown = self.files_fade.value(hold);
+        if self.files_fade.moving() {
+            window.request_animation_frame();
+        }
+        let (nav, crumbs, tools) = files.update(cx, |view, cx| {
+            (view.nav_buttons(cx), view.crumbs(cx), view.tools(cx))
+        });
+        let close = Button::new("files-close")
+            .icon(IconName::Close)
+            .tooltip("Hide the files (Ctrl+Shift+E shows them)")
+            .style(ButtonStyle::Ghost)
+            .on_click(cx.listener(move |this, _, window, cx| this.toggle_files(index, window, cx)))
+            .into_any_element();
+        let header = panel::header(
+            tools_shown,
+            vec![
+                tile(Mark::Icon(IconName::Folder), color, None, &theme).into_any_element(),
+                crumbs,
+            ],
+            vec![nav, tools, close],
+        );
+        let frame = match theme.material() {
+            Some(material) => {
+                let active = files.read(cx).contains_focus(window, cx);
+                // Alone, a card has nothing to stand out from.
+                let alone = self.tabs[index].files_alone(cx);
+                crate::terminal_material::frame(material, active, active && !alone)
             }
+            None => panel::frame(&theme, theme.bg),
         };
-        let split_tools = panes.filter(|_| files.is_none()).map(|panes| {
-            let split = |id: &'static str, icon, text: &'static str, axis| {
-                let panes = panes.clone();
-                Button::new(id)
-                    .icon(icon)
-                    .tooltip(text)
-                    .style(ButtonStyle::Ghost)
-                    .on_click(move |_, window, cx| {
-                        panes.update(cx, |panes, cx| panes.split(axis, window, cx));
-                    })
-            };
-            div()
-                .flex()
-                .flex_none()
-                .gap(px(1.))
-                .child(split(
-                    "split-right",
-                    IconName::SplitRight,
-                    "Split right (Ctrl+Shift+D)",
-                    SplitAxis::Row,
-                ))
-                .child(split(
-                    "split-down",
-                    IconName::SplitDown,
-                    "Split down (Ctrl+Shift+S)",
-                    SplitAxis::Column,
-                ))
-                .into_any_element()
-        });
-        let faces = Face::ALL.map(|option| {
-            segment(
-                ("tab-face", option as usize),
-                Some(option.icon()),
-                Some(option.label()),
-                option == face,
-                cx,
-            )
-            .on_click(cx.listener(move |this, _, window, cx| {
-                if option != this.tabs[index].face && this.animated(cx) {
-                    this.face_pill.arm(&this.state.read(cx).settings);
-                    let count = this.face_fade.map_or(0, |(_, count)| count + 1);
-                    this.face_fade = Some((this.tabs[index].id, count));
-                }
-                this.set_face(index, option, window, cx)
+        frame
+            .id("files-card")
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                let animated = this.animated(cx);
+                this.files_fade.hover(*hovered, animated);
+                cx.notify();
             }))
-        });
-        Some(
-            div()
-                .h_full()
-                .min_w_0()
-                .flex_1()
-                .flex()
-                .items_center()
-                .gap(px(4.))
-                .pr(px(8.))
-                .children(nav)
-                .child(
-                    div()
-                        .id("location-host")
-                        .occlude()
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .gap(px(7.))
-                        .px(px(6.))
-                        .py(px(3.))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_size(crate::theme::ui_px(13.))
-                        .text_color(theme.text)
-                        .tooltip(tooltip(target))
-                        .child(alias),
-                )
-                .children(crumbs)
-                .child(div().flex_1().min_w(px(8.)))
-                .child(
-                    div()
-                        .id("location-tools")
-                        .occlude()
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .gap(px(1.))
-                        .children(tools)
-                        .children(split_tools),
-                )
-                .child(
-                    div()
-                        .w(px(1.))
-                        .h(px(18.))
-                        .mx(px(6.))
-                        .flex_none()
-                        .bg(theme.strong_border),
-                )
-                // Last, so they stay in the same place whatever the tab shows.
-                .child(
-                    div().id("location-faces").occlude().flex_none().child(
-                        groove(&theme)
-                            .on_children_prepainted(self.face_pill.measure(Some(face as usize + 1)))
-                            .child(self.face_pill.raised(&theme, 7.))
-                            .children(faces),
-                    ),
-                )
-                .into_any_element(),
-        )
+            .size_full()
+            .overflow_hidden()
+            .child(header)
+            .child(div().flex_1().min_h_0().w_full().child(files))
+            .into_any_element()
     }
 }
 
@@ -2183,7 +2052,7 @@ impl Workspace {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .rounded(px(5.))
+                                .rounded(px(crate::theme::RADIUS_SMALL))
                                 .border_1()
                                 .border_color(theme.border)
                                 .bg(theme.surface)
@@ -2210,7 +2079,7 @@ impl Workspace {
         let hint = if no_hosts {
             "Add your first server, or bring in the Host entries of ~/.ssh/config"
         } else {
-            "Double-click a host to open a terminal, or right-click it for more"
+            "Click a host to open a terminal, or right-click it for more"
         };
         div()
             .size_full()
@@ -2295,13 +2164,14 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// What the panel shows: the terminals, or them and the files with the link between them.
+    /// The cards of the tab: one per terminal and, beside them, one for the files. A connection
+    /// still on its way covers them all.
     fn tab_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let Some(tab) = self.active.and_then(|i| self.tabs.get(i)) else {
+        let Some(index) = self.active.filter(|index| *index < self.tabs.len()) else {
             return self.empty_state(cx);
         };
+        let tab = &self.tabs[index];
         let theme = cx.theme().clone();
-        let linked = tab.linked;
         let ratio = tab.both_ratio;
         let bounds = self.both_bounds.clone();
         let alone = tab.files_alone(cx);
@@ -2357,90 +2227,51 @@ impl Workspace {
                 }),
             )
         });
-        let content = match tab.files.clone().filter(|_| tab.face.shows_files()) {
-            Some(files) if alone => files.into_any_element(),
-            Some(files) => div()
-                .size_full()
-                .relative()
-                .flex()
-                .child(
-                    gpui::canvas(move |area, _, _| bounds.set(Some(area)), |_, _, _, _| {})
-                        .absolute()
-                        .size_full(),
-                )
-                .child(div().flex_none().w(relative(ratio)).h_full().child(panes))
-                .child(
-                    div()
-                        .relative()
-                        .w(px(1.))
-                        .h_full()
-                        .flex_none()
-                        .bg(theme.border)
-                        .child(
-                            // More room than the hairline to grab it by.
-                            div()
-                                // Not occluding: the window must keep hearing the pointer on it.
-                                .id("both-divider")
-                                .absolute()
-                                .top_0()
-                                .bottom_0()
-                                .left(px(-3.))
-                                .w(px(7.))
-                                .cursor(CursorStyle::ResizeLeftRight)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.resizing_both = true;
-                                        cx.stop_propagation();
-                                        cx.notify();
-                                    }),
-                                )
-                                .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
-                                    if event.click_count() >= 2
-                                        && let Some(tab) =
-                                            this.active.and_then(|i| this.tabs.get_mut(i))
-                                    {
-                                        tab.both_ratio = 0.5;
-                                        cx.notify();
-                                    }
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id("link-faces")
-                                .occlude()
-                                .absolute()
-                                .top(relative(0.5))
-                                .left(px(-14.))
-                                .mt(px(-14.))
-                                .size(px(28.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_full()
-                                .bg(theme.bg)
-                                .border_1()
-                                .border_color(if linked {
-                                    theme.lit_line
-                                } else {
-                                    theme.strong_border
-                                })
-                                .cursor_pointer()
-                                .tooltip(tooltip(if linked {
-                                    "The files follow the folder of the terminal"
-                                } else {
-                                    "The files move on their own"
-                                }))
-                                .on_click(cx.listener(|this, _, _, cx| this.toggle_link(cx)))
-                                .child(Icon::new(IconName::Link).size(px(13.)).color(if linked {
-                                    theme.accent
-                                } else {
-                                    theme.text_disabled
-                                })),
-                        ),
-                )
-                .child(div().flex_1().min_w_0().h_full().child(files))
-                .into_any_element(),
+        let files = tab.files.clone().filter(|_| tab.face.shows_files());
+        let content = match files {
+            Some(files) if alone => self.files_card(index, files, window, cx),
+            Some(files) => {
+                let files = self.files_card(index, files, window, cx);
+                div()
+                    .size_full()
+                    .relative()
+                    .flex()
+                    .child(
+                        gpui::canvas(move |area, _, _| bounds.set(Some(area)), |_, _, _, _| {})
+                            .absolute()
+                            .size_full(),
+                    )
+                    .child(div().flex_none().w(relative(ratio)).h_full().child(panes))
+                    .child(
+                        // The gap between the terminals and the files is what to grab.
+                        div()
+                            // Not occluding: the window must keep hearing the pointer on it.
+                            .id("both-divider")
+                            .w(px(panel::CARD_GAP))
+                            .h_full()
+                            .flex_none()
+                            .cursor(CursorStyle::ResizeLeftRight)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.resizing_both = true;
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            )
+                            .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
+                                if event.click_count() >= 2
+                                    && let Some(tab) =
+                                        this.active.and_then(|i| this.tabs.get_mut(i))
+                                {
+                                    tab.both_ratio = 0.5;
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                    .child(div().flex_1().min_w_0().h_full().child(files))
+                    .into_any_element()
+            }
             None => panes.into_any_element(),
         };
         div()
@@ -2478,8 +2309,18 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    .rounded(px(8.))
+                    // A way to go somewhere: a capsule, as the rows of the sidebar.
+                    .rounded_full()
+                    // Its groove, as ever. A card of the field would be the strip it sits on, cut
+                    // out of itself: with a material it gets the crests of a card instead.
                     .bg(theme.track)
+                    .map(|this| match theme.material() {
+                        Some(material) => this.relative().child(crate::terminal_material::crests(
+                            material,
+                            crate::panel::CAPSULE,
+                        )),
+                        None => this.border_1().border_color(theme.border),
+                    })
                     .cursor_pointer()
                     .text_size(crate::theme::ui_px(13.))
                     .text_color(theme.text_muted)
@@ -2491,6 +2332,10 @@ impl Workspace {
                     .child(
                         div()
                             .flex_none()
+                            // The mono font sits higher in its line than the one beside it: both
+                            // lines are centered, and the letters end up a pixel apart.
+                            .relative()
+                            .top(px(1.))
                             .font_family(crate::theme::mono_font())
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_size(crate::theme::ui_px(12.))
@@ -2515,15 +2360,6 @@ impl Workspace {
             && let Some(tab) = self.active.and_then(|index| self.tabs.get_mut(index))
         {
             tab.both_ratio = share.clamp(MIN_BOTH_RATIO, 1. - MIN_BOTH_RATIO);
-            cx.notify();
-        }
-    }
-
-    fn toggle_link(&mut self, cx: &mut Context<Self>) {
-        if let Some(tab) = self.active.and_then(|i| self.tabs.get_mut(i)) {
-            tab.linked = !tab.linked;
-            // Back on: the files catch up with the terminal at the next draw.
-            tab.followed = None;
             cx.notify();
         }
     }
@@ -2584,11 +2420,17 @@ impl Render for Workspace {
                         None => target,
                     },
                     face: tab.face,
+                    split: tab.panes.read(cx).is_split(),
                     active: Some(tab.id) == active_id,
                 }
             })
             .collect();
         self.sidebar.update(cx, |sidebar, _| sidebar.open = open);
+        // For the button of the terminals' cards, which draw right after this too.
+        for tab in &self.tabs {
+            let shown = tab.face.shows_files();
+            tab.panes.update(cx, |panes, _| panes.files_shown = shown);
+        }
         // The active host is known only here. Deferred: an entity cannot change mid-render.
         let host = self.current_host(cx);
         if self.state.read(cx).active_host != host {
@@ -2646,7 +2488,6 @@ impl Render for Workspace {
             .into_any_element(),
             None => content,
         };
-        let location = self.panel_header(cx);
         let status_bar = self.status_bar(cx);
         let has_status_bar = status_bar.is_some();
         div()
@@ -2656,7 +2497,14 @@ impl Render for Workspace {
             .relative()
             .size_full()
             .flex()
-            .bg(theme.window_bg)
+            // A theme with a material shows its field behind everything, the sidebar too.
+            .map(|this| match theme.material() {
+                Some(material) => this.child(crate::terminal_material::backdrop(
+                    material,
+                    theme.window_bg.a,
+                )),
+                None => this.bg(theme.window_bg),
+            })
             .text_color(theme.text)
             .text_size(crate::theme::ui_px(14.))
             .font_family(crate::theme::ui_font())
@@ -2818,71 +2666,79 @@ impl Render for Workspace {
                             .when(!has_status_bar, |this| this.pb(px(8.)))
                             .pl(px(8. * (1. - sidebar_amount)))
                             .child(
-                                panel::frame(&theme, theme.bg)
+                                // The cards, and the notices over them.
+                                div()
+                                    .relative()
                                     .flex_1()
                                     .min_h_0()
-                                    .overflow_hidden()
-                                    .child(location)
-                                    .child(div().flex_1().min_h_0().child(content))
-                                    .when(dock_amount > 0., |this| {
-                                        let measured = self.dock_height.clone();
-                                        let inner = div()
-                                            .relative()
-                                            .flex_none()
-                                            .child(self.transfers.clone())
-                                            .child(
-                                                gpui::canvas(
-                                                    move |area, _, _| {
-                                                        measured.set(f32::from(area.size.height))
-                                                    },
-                                                    |_, _, _, _| {},
-                                                )
-                                                .absolute()
-                                                .size_full(),
-                                            );
-                                        // Full height when settled: its content can grow.
-                                        this.child(
-                                            div()
-                                                .flex_none()
-                                                .overflow_hidden()
-                                                .when(dock_amount < 1., |this| {
-                                                    this.h(px(self.dock_height.get() * dock_amount))
-                                                })
-                                                .child(inner),
-                                        )
-                                    })
+                                    .child(content)
                                     .children(notices::label(self, notice_bottom, cx))
                                     .children(notices::list(self, notice_bottom, cx)),
-                            ),
+                            )
+                            .when(dock_amount > 0., |this| {
+                                let measured = self.dock_height.clone();
+                                // A card of its own under the others.
+                                // In the material of the others: never the lit one, it does
+                                // not take the keyboard as a card.
+                                let frame = match theme.material() {
+                                    Some(material) => {
+                                        crate::terminal_material::frame(material, false, false)
+                                    }
+                                    None => panel::frame(&theme, theme.bg),
+                                };
+                                let inner = frame
+                                    .flex_none()
+                                    .overflow_hidden()
+                                    .child(self.transfers.clone())
+                                    .child(
+                                        gpui::canvas(
+                                            move |area, _, _| {
+                                                measured.set(f32::from(area.size.height))
+                                            },
+                                            |_, _, _, _| {},
+                                        )
+                                        .absolute()
+                                        .size_full(),
+                                    );
+                                // Full height when settled: its content can grow.
+                                this.child(
+                                    div()
+                                        .flex_none()
+                                        .overflow_hidden()
+                                        .mt(px(panel::CARD_GAP * dock_amount))
+                                        .when(dock_amount < 1., |this| {
+                                            this.h(px(self.dock_height.get() * dock_amount))
+                                        })
+                                        .child(inner),
+                                )
+                            }),
                     )
                     .children(status_bar),
             )
-            .child(
-                // Fixed at the original logo's center, outside the animated columns.
-                div()
-                    .id("window-sidebar-toggle")
-                    .absolute()
-                    .top_0()
-                    .left(px(16. + (19. - 28.) / 2.))
-                    .h(px(title_bar::HEIGHT))
-                    .flex()
-                    .items_center()
-                    .occlude()
-                    .child(
-                        Button::new("toggle-sidebar")
-                            .icon(IconName::PanelLeft)
-                            .tooltip(if self.sidebar_visible {
-                                "Hide sidebar (Ctrl+Shift+B)"
-                            } else {
-                                "Show sidebar (Ctrl+Shift+B)"
-                            })
-                            .style(ButtonStyle::Ghost)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.arm_sidebar(cx);
-                                this.toggle_sidebar(window, cx)
-                            })),
-                    ),
-            )
+            // With the sidebar hidden, at the left of the top strip. Open, it has its own.
+            .when(!self.sidebar_visible, |this| {
+                this.child(
+                    div()
+                        .id("window-sidebar-toggle")
+                        .absolute()
+                        .top_0()
+                        .left(px(16. + (19. - 28.) / 2.))
+                        .h(px(title_bar::HEIGHT))
+                        .flex()
+                        .items_center()
+                        .occlude()
+                        .child(
+                            Button::new("toggle-sidebar")
+                                .icon(IconName::PanelLeft)
+                                .tooltip("Show sidebar (Ctrl+Shift+B)")
+                                .style(ButtonStyle::Ghost)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.arm_sidebar(cx);
+                                    this.toggle_sidebar(window, cx)
+                                })),
+                        ),
+                )
+            })
             .children(self.tab_menu.clone().map(|menu| {
                 let this = cx.entity().downgrade();
                 ContextMenu::new(

@@ -13,14 +13,6 @@ pub enum ButtonStyle {
     Danger,
 }
 
-/// How a button takes the room it has.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Width {
-    Own,
-    Share,
-    Whole,
-}
-
 type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
 /// Compact button: optional icon and label.
@@ -34,7 +26,6 @@ pub struct Button {
     active: bool,
     compact: bool,
     keyboard_focus: bool,
-    width: Width,
     tooltip: Option<SharedString>,
     on_click: Option<ClickHandler>,
 }
@@ -50,7 +41,6 @@ impl Button {
             active: false,
             compact: false,
             keyboard_focus: false,
-            width: Width::Own,
             tooltip: None,
             on_click: None,
         }
@@ -84,16 +74,6 @@ impl Button {
     /// Ghost button that shows something currently open.
     pub fn active(mut self, active: bool) -> Self {
         self.active = active;
-        self
-    }
-    /// Shares the row evenly with others that do.
-    pub fn share(mut self) -> Self {
-        self.width = Width::Share;
-        self
-    }
-    /// A row of its own.
-    pub fn whole(mut self) -> Self {
-        self.width = Width::Whole;
         self
     }
     /// Smaller, for tight headers.
@@ -139,15 +119,11 @@ impl RenderOnce for Button {
                 this.px(px(if self.compact { 8. } else { 10. }))
             })
             .flex()
-            .map(|this| match self.width {
-                Width::Own => this.flex_none(),
-                Width::Share => this.flex_1().min_w_0(),
-                Width::Whole => this.w_full(),
-            })
+            .flex_none()
             .items_center()
             .justify_center()
             .gap(px(5.))
-            .rounded(px(7.))
+            .rounded(px(crate::theme::RADIUS_CONTROL))
             .text_size(crate::theme::ui_px(if self.compact { 12. } else { 13. }))
             .font_weight(if square || self.style == ButtonStyle::Ghost {
                 gpui::FontWeight::NORMAL

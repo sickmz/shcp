@@ -116,7 +116,8 @@ fn to_rgb(color: Hsla) -> Rgb {
     Rgb(byte(r), byte(g), byte(b))
 }
 
-fn mix(a: Hsla, b: Hsla, amount: f32) -> Hsla {
+/// `amount` of `a` over the rest of `b`, opaque.
+pub(super) fn mix(a: Hsla, b: Hsla, amount: f32) -> Hsla {
     let (a, b) = (a.to_rgb(), b.to_rgb());
     let blend = |x: f32, y: f32| x * amount + y * (1. - amount);
     Rgba {
@@ -258,11 +259,6 @@ fn build(name: SharedString, kind: Option<&str>, colors: Colors) -> Theme {
         window_bg: surface,
         panel_alpha: 1.,
         track: alpha(text, if is_light { 0.06 } else { 0.05 }),
-        raised: if is_light {
-            hsla(0., 0., 1., 1.)
-        } else {
-            alpha(text, 0.11)
-        },
         terminal_bg,
         terminal_selection: colors
             .get(&["terminal.selectionBackground", "editor.selectionBackground"])

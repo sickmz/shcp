@@ -251,6 +251,8 @@ pub(crate) async fn run(control: Arc<Control>, commands: Receiver<Command>) {
             }
             control.ready.send_replace(Some(Ok(files)));
             ctx.state(SessionState::Connected);
+            // Beside everything else: no terminal waits for it.
+            tasks.spawn(login_shell::learn(ctx.clone(), ssh.clone()));
             if ctx.persist_terminals {
                 tokio::select! { biased;
                     _ = ctx.cancel.cancelled() => {}

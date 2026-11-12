@@ -441,6 +441,14 @@ pub fn render(
             .left_0()
             .right_0()
             .occlude()
+            // Over a terminal under its header, or over all the cards of a tab.
+            .map(|this| {
+                if docked {
+                    this.rounded_b(px(PANEL_INNER_RADIUS))
+                } else {
+                    this.rounded(px(PANEL_INNER_RADIUS))
+                }
+            })
             .bg(theme.scrim)
             .flex()
             .items_center()
@@ -451,31 +459,50 @@ pub fn render(
                 div()
                     .id("reconnect-banner")
                     .occlude()
-                    .w(px(420.))
+                    // As wide as what it says: wider, the text and the button drift apart.
+                    .w(px(360.))
                     .min_w_0()
                     .max_w_full()
                     .flex()
                     .items_center()
                     .gap(px(12.))
-                    .p(px(12.))
-                    .rounded(px(11.))
-                    .bg(theme.elevated)
-                    .border_1()
-                    .border_color(theme.strong_border)
+                    .p(px(10.))
+                    .pr(px(12.))
+                    .rounded(px(crate::theme::RADIUS_CARD))
+                    .map(|this| {
+                        crate::panel::floating(
+                            this,
+                            theme,
+                            crate::theme::RADIUS_CARD,
+                            theme.strong_border,
+                        )
+                    })
                     .shadow(crate::theme::float_shadow())
                     .text_size(ui_px(13.))
                     .text_color(theme.text)
+                    // The one color of the card: a tile for the sign, as a host has for its own.
                     .child(
-                        div().flex_none().child(
-                            Icon::new(if reconnecting {
-                                IconName::Refresh
-                            } else {
-                                IconName::Warning
+                        div()
+                            .size(px(34.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(crate::theme::RADIUS_CONTROL))
+                            .bg(gpui::Hsla {
+                                a: 0.13,
+                                ..theme.warning
                             })
-                            .size(px(18.))
-                            .color(theme.warning)
-                            .when(reconnecting, |icon| icon.spin()),
-                        ),
+                            .child(
+                                Icon::new(if reconnecting {
+                                    IconName::Refresh
+                                } else {
+                                    IconName::Warning
+                                })
+                                .size(px(16.))
+                                .color(theme.warning)
+                                .when(reconnecting, |icon| icon.spin()),
+                            ),
                     )
                     .child(
                         div()
@@ -495,9 +522,11 @@ pub fn render(
                             ),
                     )
                     .child(
+                        // Outlined: a fill in the accent beside the sign would be a second
+                        // color shouting on a card this small.
                         Button::new("retry")
                             .label(if reconnecting { "Try now" } else { "Reconnect" })
-                            .style(ButtonStyle::Primary)
+                            .style(ButtonStyle::Filled)
                             .on_click(on_retry),
                     ),
             )
@@ -564,13 +593,13 @@ pub fn render(
         .left_0()
         .right_0()
         .occlude()
-        .rounded_b(px(PANEL_INNER_RADIUS))
         .bg(background)
         .font_family(ui_font())
         .text_size(ui_px(12.))
         .on_mouse_down(MouseButton::Left, move |_, window, _| window.focus(&focus));
     if docked {
         return root
+            .rounded_b(px(PANEL_INNER_RADIUS))
             .border_t_1()
             .border_color(theme.border)
             .px(px(12.))
@@ -580,10 +609,10 @@ pub fn render(
     }
     let card = div()
         .p(px(20.))
-        .rounded(px(11.))
-        .bg(theme.elevated)
-        .border_1()
-        .border_color(theme.strong_border)
+        .rounded(px(crate::theme::RADIUS_CARD))
+        .map(|this| {
+            crate::panel::floating(this, theme, crate::theme::RADIUS_CARD, theme.strong_border)
+        })
         .w(px(CARD_WIDTH))
         .max_w_full()
         .flex()
@@ -613,7 +642,9 @@ pub fn render(
                 )
         }))
         .child(content);
+    // All of the card it covers, or all the cards of a tab: round at the top too.
     root.top_0()
+        .rounded(px(PANEL_INNER_RADIUS))
         .p(px(8.))
         .flex()
         .items_center()

@@ -123,6 +123,49 @@ impl Reveal {
     }
 }
 
+/// How long the tools of a card take to come and go with the pointer.
+const FADE: Duration = Duration::from_millis(140);
+
+/// What shows while the pointer is over something, like the tools of a card: it fades in and out,
+/// and a pointer going back halfway turns it around from where it is.
+pub struct HoverFade {
+    hovered: bool,
+    reveal: Reveal,
+}
+
+impl Default for HoverFade {
+    fn default() -> Self {
+        Self {
+            hovered: false,
+            reveal: Reveal {
+                duration: FADE,
+                ..Reveal::new(false)
+            },
+        }
+    }
+}
+
+impl HoverFade {
+    /// The pointer came or went. It fades if the setting allows it, otherwise it changes at once.
+    pub fn hover(&mut self, hovered: bool, animated: bool) {
+        if hovered != self.hovered && animated {
+            self.reveal.arm();
+        }
+        self.hovered = hovered;
+    }
+
+    /// How much of it shows now, from 0 to 1. `hold` keeps it in sight without the pointer. Once
+    /// per frame; while `moving`, ask for another.
+    pub fn value(&mut self, hold: bool) -> f32 {
+        self.reveal.set(self.hovered || hold);
+        self.reveal.value()
+    }
+
+    pub fn moving(&self) -> bool {
+        self.reveal.moving()
+    }
+}
+
 /// A panel is on its way: terminals keep their size meanwhile, and take the new one once at the end.
 /// Otherwise each frame would reflow them and send the server one more resize.
 static LAYOUT_MOVING: AtomicBool = AtomicBool::new(false);

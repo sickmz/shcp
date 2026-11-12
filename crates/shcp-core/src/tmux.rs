@@ -195,7 +195,7 @@ pub(crate) async fn survey(ctx: &Context, ssh: &Ssh) {
     });
 }
 
-async fn read_all(ssh: &Ssh, command: String) -> Vec<u8> {
+pub(crate) async fn read_all(ssh: &Ssh, command: String) -> Vec<u8> {
     let mut output = Vec::new();
     let Ok(mut channel) = ssh.channel_open_session().await else {
         return output;

@@ -340,7 +340,7 @@ mod tests {
         )
         .unwrap();
         store.load_settings().unwrap();
-        assert_eq!(store.settings.theme, "Porcelain");
+        assert_eq!(store.settings.theme, "Nocturne");
         assert_eq!(store.settings.dark_theme, "Nocturne");
         assert_eq!(store.settings.light_theme, "Solarized");
     }

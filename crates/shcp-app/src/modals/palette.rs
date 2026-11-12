@@ -177,7 +177,7 @@ impl Render for CommandPalette {
             let selected = row == self.selected;
             let icon_color = match item.tint {
                 Some(color) => theme.host_color(color),
-                None if selected => theme.accent,
+                None if selected => theme.text,
                 None => theme.text_disabled,
             };
             rows.push(
@@ -189,7 +189,7 @@ impl Render for CommandPalette {
                     .flex()
                     .items_center()
                     .gap(px(10.))
-                    .rounded(px(8.))
+                    .rounded(px(crate::theme::RADIUS_CONTROL))
                     .cursor_pointer()
                     .when(selected, |this| this.bg(theme.active))
                     .on_mouse_move(cx.listener(move |this, _, _, cx| {
@@ -275,10 +275,15 @@ impl Render for CommandPalette {
                     .max_h(px(560.))
                     .flex()
                     .flex_col()
-                    .rounded(px(15.))
-                    .border_1()
-                    .border_color(theme.strong_border)
-                    .bg(theme.elevated)
+                    .rounded(px(crate::theme::RADIUS_CARD))
+                    .map(|this| {
+                        crate::panel::floating(
+                            this,
+                            &theme,
+                            crate::theme::RADIUS_CARD,
+                            theme.strong_border,
+                        )
+                    })
                     .shadow(crate::theme::float_shadow())
                     .overflow_hidden()
                     .text_size(ui_px(13.))

@@ -8,7 +8,9 @@ use crate::widgets::text_input::{TextInput, TextInputEvent};
 use crate::widgets::tooltip::tooltip;
 use gpui::prelude::*;
 use gpui::{AnyElement, Context, Entity, Hsla, SharedString, Subscription, Window, div, px};
-use shcp_core::{ForwardKind, ForwardState, HostId, HostSource, SessionId, SessionState};
+use shcp_core::{
+    ForwardKind, ForwardSpec, ForwardState, HostId, HostSource, SessionId, SessionState,
+};
 
 const PORT_W: f32 = 96.;
 const ACTIONS_W: f32 = 64.;
@@ -66,23 +68,30 @@ pub struct PortsPanel {
     fields: Entity<ForwardFields>,
     adding: bool,
     error: Option<String>,
-    _subscriptions: [Subscription; 3],
+    /// Where the name of a port is typed, and the port it is being typed for.
+    name_input: Entity<TextInput>,
+    naming: Option<(HostId, ForwardSpec)>,
+    _subscriptions: [Subscription; 4],
 }
 
 impl PortsPanel {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let fields = cx.new(|cx| ForwardFields::new(None, cx));
         let [bind, target] = fields.read(cx).inputs().map(Entity::clone);
+        let name_input = cx.new(|cx| TextInput::new("What is this port for?", false, cx));
         let subscriptions = [
             cx.observe(&state, |_, _, cx| cx.notify()),
             cx.subscribe_in(&bind, window, Self::on_input),
             cx.subscribe_in(&target, window, Self::on_input),
+            cx.subscribe_in(&name_input, window, Self::on_name_input),
         ];
         Self {
             state,
             fields,
             adding: false,
             error: None,
+            name_input,
+            naming: None,
             _subscriptions: subscriptions,
         }
     }
@@ -104,6 +113,54 @@ impl PortsPanel {
         self.fields.update(cx, |fields, cx| fields.clear(cx));
         self.fields.read(cx).focus(window, cx);
         cx.notify();
+    }
+
+    /// The name of this port, to type or to change: Enter keeps it, Esc leaves it as it was.
+    fn start_naming(
+        &mut self,
+        host: HostId,
+        spec: ForwardSpec,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = self
+            .state
+            .read(cx)
+            .settings
+            .port_name(&host, &spec)
+            .unwrap_or_default()
+            .to_string();
+        self.name_input.update(cx, |input, cx| {
+            input.set_text(&name, cx);
+            input.select_all(cx);
+        });
+        self.name_input.read(cx).focus(window);
+        self.naming = Some((host, spec));
+        cx.notify();
+    }
+
+    fn on_name_input(
+        &mut self,
+        input: &Entity<TextInput>,
+        event: &TextInputEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            TextInputEvent::Submit => {
+                if let Some((host, spec)) = self.naming.take() {
+                    let name = input.read(cx).text().to_string();
+                    self.state
+                        .update(cx, |s, cx| s.name_port(&host, &spec, &name, cx));
+                }
+                cx.notify();
+            }
+            TextInputEvent::Cancel => {
+                self.naming = None;
+                cx.notify();
+            }
+            TextInputEvent::Changed => {}
+        }
     }
 
     fn on_input(
@@ -160,6 +217,41 @@ impl PortsPanel {
             ForwardState::Listening | ForwardState::ServerDown
         );
         let (color, text, detail) = describe(forward, theme);
+        let name = state.settings.port_name(host, &spec).map(str::to_string);
+        let naming = self
+            .naming
+            .as_ref()
+            .is_some_and(|(of, port)| of == host && port.name_key() == spec.name_key());
+        let name_cell = if naming {
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(self.name_input.clone())
+                .into_any_element()
+        } else {
+            let (of, port) = (host.clone(), spec.clone());
+            div()
+                .id(("port-name", index))
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .cursor_pointer()
+                .text_color(if name.is_some() {
+                    theme.text
+                } else {
+                    theme.text_disabled
+                })
+                .tooltip(tooltip(if name.is_some() {
+                    "Change the name"
+                } else {
+                    "Name this port, to remember what it is for"
+                }))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.start_naming(of.clone(), port.clone(), window, cx)
+                }))
+                .child(name.unwrap_or_else(|| "Add a name".to_string()))
+                .into_any_element()
+        };
         let text = if remembered {
             format!("{text} · added")
         } else {
@@ -247,6 +339,7 @@ impl PortsPanel {
                     .child(div().size(px(8.)).flex_none().rounded_full().bg(color))
                     .child(spec.bind_port.to_string()),
             )
+            .child(name_cell)
             .child(
                 div()
                     .id(("port-address", index))
@@ -363,6 +456,7 @@ impl Render for PortsPanel {
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text_disabled)
                     .child(div().w(px(PORT_W)).flex_none().child("Port"))
+                    .child(heading("Name"))
                     .child(heading("Listens on"))
                     .child(heading("Goes to"))
                     .child(heading("State"))

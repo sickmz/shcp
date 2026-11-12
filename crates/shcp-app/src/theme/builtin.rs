@@ -1,17 +1,18 @@
-//! The app's own themes, Nocturne and Porcelain, computed in OKLCH: near-neutral grays with a touch
-//! of a blue, and an accent the user picks, a soft blue unless told otherwise.
+//! Built-in themes: cool Nocturne and warm Prune, both in smoked glass unless the user turns
+//! the effects off.
+//! All keep the user's configurable accent.
 use super::Theme;
 use gpui::{Hsla, Rgba};
 use shcp_core::Accent;
 use shcp_core::term::{Palette, Rgb};
 
 /// The hue of the grays, and of the blue accent.
-const HUE: f32 = 268.;
+pub const HUE: f32 = 268.;
 /// How much of that hue the grays take.
 const TINT: f32 = 0.18;
 
 pub const NOCTURNE: &str = "Nocturne";
-pub const PORCELAIN: &str = "Porcelain";
+pub const PRUNE: &str = "Prune";
 
 /// Lightness and chroma of the accent, and lightness of what is written on it.
 const DARK_LIT: (f32, f32, f32) = (0.80, 0.135, 0.17);
@@ -99,11 +100,51 @@ pub fn accent_color(accent: Accent, is_light: bool) -> Hsla {
 }
 
 pub fn build(name: &str, accent: Accent) -> Theme {
-    if name == PORCELAIN {
-        porcelain(accent)
-    } else {
-        nocturne(accent)
+    match name {
+        PRUNE => prune(accent),
+        _ => nocturne(accent),
     }
+}
+
+/// The smoked-glass reference as theme tokens: plum charcoal, brown shadows and a restrained
+/// copper selection. Its cards and its window take the material too: see `Theme::material`.
+fn prune(accent: Accent) -> Theme {
+    let mut theme = nocturne(accent);
+    let color = |hex| -> Hsla { gpui::rgb(hex).into() };
+    let ink = color(0xece3df);
+    theme.name = PRUNE.into();
+    // One plum, at three depths: a modal's side column, on `surface`, and its content, on
+    // `elevated`, must read as two shades of one color and not as a gray beside a purple.
+    theme.bg = color(0x2e272b);
+    theme.surface = color(0x2b2428);
+    theme.elevated = color(0x362c32);
+    theme.input_bg = color(0x211d1f);
+    theme.border = Hsla { a: 0.095, ..ink };
+    theme.strong_border = Hsla { a: 0.17, ..ink };
+    theme.text = ink;
+    theme.text_muted = color(0xc2b2ac);
+    theme.text_disabled = color(0xa59690);
+    theme.hover = Hsla { a: 0.055, ..ink };
+    theme.active = color(0x402e2b);
+    theme.scrim = Hsla {
+        a: 0.46,
+        ..color(0x211d1f)
+    };
+    theme.window_bg = color(0x211d1f);
+    theme.track = color(0x362c32);
+    // The reference's surface where no tint of the material reaches: see `Theme::material`.
+    theme.terminal_bg = color(0x22201e);
+    // Keep the engine's default background exactly aligned with the UI: default
+    // cells must remain transparent to the shared panel material.
+    theme.palette.bg = to_rgb(theme.terminal_bg);
+    theme.palette.fg = to_rgb(ink);
+    theme.terminal_cursor = ink;
+    theme.palette.cursor = to_rgb(ink);
+    theme.palette.ansi[0] = to_rgb(color(0x514443));
+    theme.palette.ansi[7] = to_rgb(color(0xc2b2ac));
+    theme.palette.ansi[8] = to_rgb(color(0x9a8279));
+    theme.palette.ansi[15] = to_rgb(ink);
+    theme
 }
 
 fn nocturne(accent: Accent) -> Theme {
@@ -156,10 +197,10 @@ fn nocturne(accent: Accent) -> Theme {
         window_bg: window,
         panel_alpha: 1.,
         track: raise,
-        raised: oklch(lit_l, lit_c, accent, 0.15),
         terminal_bg: stage,
         terminal_selection: oklch(lit_l, lit_c, accent, 0.3),
-        terminal_cursor: lit,
+        // White in any accent: the accent colors the app, not what is typed.
+        terminal_cursor: ink,
         lit_l: DARK_LIT.0,
         lit_c,
         palette: Palette {
@@ -183,89 +224,7 @@ fn nocturne(accent: Accent) -> Theme {
             ],
             fg: to_rgb(foreground),
             bg: to_rgb(stage),
-            cursor: to_rgb(lit),
-        },
-    }
-}
-
-fn porcelain(accent: Accent) -> Theme {
-    let (tint, h) = (TINT, HUE);
-    let n = 0.012 * tint;
-    let Lit {
-        l: lit_l,
-        c: lit_c,
-        h: accent,
-        on_l,
-        on_c,
-    } = lit(accent, true);
-    let window = oklch(0.935, n, h, 1.);
-    let stage = oklch(0.992, 0.003 * tint, h, 1.);
-    let raise = oklch(0.965, n, h, 1.);
-    let ink = oklch(0.17, 0.018 * tint, h, 1.);
-    let green = oklch(0.47, 0.13, 152., 1.);
-    let red = oklch(0.5, 0.18, 25., 1.);
-    let amber = oklch(0.52, 0.12, 75., 1.);
-    let blue = oklch(0.47, 0.14, 255., 1.);
-    let magenta = oklch(0.48, 0.16, 320., 1.);
-    let cyan = oklch(0.48, 0.09, 200., 1.);
-    let lit = oklch(lit_l, lit_c, accent, 1.);
-    Theme {
-        name: PORCELAIN.into(),
-        origin: None,
-        file: None,
-        is_light: true,
-        bg: stage,
-        surface: window,
-        elevated: stage,
-        input_bg: stage,
-        border: oklch(0.3, 0.03, h, 0.12),
-        strong_border: oklch(0.3, 0.03, h, 0.22),
-        text: ink,
-        text_muted: oklch(0.33, 0.018 * tint, h, 1.),
-        text_disabled: oklch(0.42, 0.016 * tint, h, 1.),
-        accent: lit,
-        primary: lit,
-        on_primary: oklch(on_l, on_c, accent, 1.),
-        success: green,
-        warning: amber,
-        error: red,
-        hover: Hsla { a: 0.055, ..ink },
-        // See-through like `hover`: on a see-through window a solid gray would lighten what it marks.
-        active: Hsla { a: 0.11, ..ink },
-        selected: oklch(lit_l, lit_c, accent, 0.15),
-        lit_line: oklch(lit_l, lit_c, accent, 0.42),
-        scrim: oklch(0.4, 0.02, h, 0.22),
-        window_bg: window,
-        panel_alpha: 1.,
-        track: raise,
-        raised: oklch(lit_l, lit_c, accent, 0.15),
-        terminal_bg: stage,
-        terminal_selection: oklch(lit_l, lit_c, accent, 0.22),
-        terminal_cursor: lit,
-        lit_l: LIGHT_LIT.0,
-        lit_c,
-        palette: Palette {
-            ansi: [
-                to_rgb(ink),
-                to_rgb(red),
-                to_rgb(green),
-                to_rgb(amber),
-                to_rgb(blue),
-                to_rgb(magenta),
-                to_rgb(cyan),
-                to_rgb(oklch(0.6, 0.012 * tint, h, 1.)),
-                to_rgb(oklch(0.475, 0.016 * tint, h, 1.)),
-                to_rgb(oklch(0.56, 0.18, 25., 1.)),
-                to_rgb(oklch(0.53, 0.13, 152., 1.)),
-                to_rgb(oklch(0.58, 0.12, 75., 1.)),
-                to_rgb(oklch(0.53, 0.14, 255., 1.)),
-                to_rgb(oklch(0.54, 0.16, 320., 1.)),
-                to_rgb(oklch(0.54, 0.09, 200., 1.)),
-                to_rgb(oklch(0.78, 0.01 * tint, h, 1.)),
-            ],
-            fg: to_rgb(ink),
-            bg: to_rgb(stage),
-            cursor: to_rgb(lit),
+            cursor: to_rgb(ink),
         },
     }
 }
@@ -309,7 +268,7 @@ mod tests {
 
     #[test]
     fn text_stays_readable() {
-        for name in [NOCTURNE, PORCELAIN] {
+        for name in [NOCTURNE, PRUNE] {
             for accent in Accent::ALL {
                 let theme = build(name, accent);
                 assert!(contrast(theme.text, theme.bg) >= 7., "{name}");

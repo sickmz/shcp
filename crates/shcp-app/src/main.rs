@@ -18,6 +18,7 @@ mod tabs;
 mod terminal_element;
 mod terminal_input;
 mod terminal_layout;
+mod terminal_material;
 mod terminal_panes;
 mod terminal_view;
 mod theme;
