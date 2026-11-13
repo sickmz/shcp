@@ -1128,24 +1128,27 @@ fn icon_samples(ui: &Theme, item: Option<&IconTheme>) -> impl IntoElement + use<
     div().flex().flex_none().gap(px(4.)).children(samples)
 }
 
-/// A theme's main colors, as overlapping dots.
-fn theme_dots(ui: &Theme, item: &Theme) -> impl IntoElement + use<> {
-    let border = ui.border;
-    let colors = [item.bg, item.surface, item.accent, item.success];
-    let dots = colors
-        .into_iter()
-        .enumerate()
-        .map(move |(position, color)| {
-            div()
-                .size(px(12.))
-                .when(position > 0, |dot| dot.ml(px(-3.)))
-                .rounded_full()
-                .border_1()
-                // Keeps a dot that matches the dialog's own background visible.
-                .border_color(border)
-                .bg(color)
-        });
-    div().flex().flex_none().children(dots)
+/// A theme as its terminals show it: a tile in their background with the six colors of their
+/// output, red to cyan. What tells two terminal themes apart is what they print in.
+fn theme_preview(item: &Theme) -> impl IntoElement + use<> {
+    let colors = item.palette.ansi[1..=6].iter().map(|&color| {
+        div()
+            .w(px(5.))
+            .h(px(10.))
+            .rounded(px(1.5))
+            .bg(gpui::rgb(crate::theme::rgb_hex(color)))
+    });
+    div()
+        .flex_none()
+        .flex()
+        .gap(px(2.))
+        .px(px(5.))
+        .py(px(4.))
+        .rounded(px(5.))
+        .border_1()
+        .border_color(item.border)
+        .bg(item.terminal_bg)
+        .children(colors)
 }
 
 impl SettingsModal {
@@ -1620,7 +1623,7 @@ impl SettingsModal {
             .map(|item| crate::theme::with_accent(item.clone(), &settings))
             .collect();
         let themes_dir = self.themes_dir(cx);
-        let current = dropdown_value(theme_dots(&theme, &theme), theme.name.clone());
+        let current = dropdown_value(theme_preview(&theme), theme.name.clone());
         let picker = self.dropdown(
             Dropdown::Theme,
             "theme",
@@ -1648,7 +1651,7 @@ impl SettingsModal {
                                     cx,
                                 );
                             }))
-                            .child(theme_dots(&ui, item))
+                            .child(theme_preview(item))
                             .child(div().min_w_0().truncate().child(item.name.clone()))
                             .into_any_element()
                     })
