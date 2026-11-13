@@ -851,12 +851,17 @@ impl TerminalPanes {
                     .overflow_hidden()
                     // Before the terminal, which may keep the click for the program in it.
                     .capture_any_mouse_down(cx.listener(
-                        move |this, event: &MouseDownEvent, _, cx| {
+                        move |this, event: &MouseDownEvent, window, cx| {
                             // The selection stays where it is: the menu offers to swap with it.
                             if event.button == MouseButton::Right && event.modifiers.control {
                                 this.open_menu(target.clone(), event.position, cx);
                                 cx.stop_propagation();
                             } else {
+                                // The keyboard comes along, on the header too: the card with it
+                                // is the active one at the next frame, whichever was clicked.
+                                if !target.read(cx).contains_focus(window, cx) {
+                                    window.focus(&target.focus_handle(cx));
+                                }
                                 this.set_active(target.clone(), cx);
                             }
                         },
