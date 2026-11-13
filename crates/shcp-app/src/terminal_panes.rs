@@ -824,7 +824,10 @@ impl TerminalPanes {
                 let shown = tools.get(&entity).copied().unwrap_or(0.);
                 let header = self.card_header(view, shown, several, cx);
                 let theme = cx.theme().clone();
-                let active = view.read(cx).contains_focus(window, cx);
+                // What a terminal contains is known from the frame before, where a new one was not
+                // yet: it would show unlit first. Its own focus is known at once.
+                let active = view.focus_handle(cx).is_focused(window)
+                    || view.read(cx).contains_focus(window, cx);
                 let frame = match theme.material() {
                     // Alone, a card has nothing to stand out from.
                     Some(material) => crate::terminal_material::frame(

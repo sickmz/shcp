@@ -775,7 +775,9 @@ impl Render for TerminalView {
             font,
             font_size,
             focused,
-            cursor_visible: self.cursor_visible,
+            // The card waiting for the shell lets the terminal through, which has nothing yet.
+            cursor_visible: self.cursor_visible
+                && !matches!(overlay, Some(Overlay::StartingShell { .. })),
             cursor_shape,
             metrics: self.metrics.clone(),
             theme: theme.clone(),
@@ -835,7 +837,13 @@ impl Render for TerminalView {
                     heading,
                     reconnecting: false,
                     docked: self.had_session,
-                    background: theme.terminal_bg,
+                    // Over a card of material nothing: a flat fill would put out its light until
+                    // the shell is there, and the terminal under it is still empty.
+                    background: if theme.material().is_some() {
+                        gpui::transparent_black()
+                    } else {
+                        theme.terminal_bg
+                    },
                     focus: self.focus.clone(),
                     extra_steps: 1,
                     owner: cx.entity_id(),
