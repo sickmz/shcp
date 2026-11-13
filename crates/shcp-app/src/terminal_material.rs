@@ -22,10 +22,13 @@ use std::{
     cell::{Cell, RefCell},
     rc::Rc,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 /// The reference is a screenshot at twice the size: its pixels, in ours.
 const SCALE: f32 = 0.5;
+/// How long the area keeps a size before its picture is computed for it.
+const SETTLE: Duration = Duration::from_millis(120);
 /// No picture larger than this on a side: the cards go flat instead.
 const LARGEST: u32 = 8192;
 
@@ -440,6 +443,9 @@ fn noise(x: u32, y: u32) -> f32 {
 pub struct Ambient {
     area: Cell<Option<Bounds<Pixels>>>,
     baked: RefCell<Option<Baked>>,
+    /// The size in device pixels the area was last seen at without a picture for it, and since
+    /// when.
+    wanted: Cell<Option<((u32, u32), Instant)>>,
 }
 
 struct Baked {
@@ -463,8 +469,22 @@ impl Ambient {
         self.area.set(Some(area));
     }
 
+    /// Whether the area has been `size` for long enough to compute its picture.
+    fn settled(&self, size: (u32, u32)) -> bool {
+        let now = Instant::now();
+        match self.wanted.get() {
+            Some((wanted, since)) if wanted == size => now.duration_since(since) >= SETTLE,
+            _ => {
+                self.wanted.set(Some((size, now)));
+                false
+            }
+        }
+    }
+
     /// The area and its picture in `material`, computed again only when the area changes size
-    /// or the theme its base.
+    /// or the theme its base. While the size keeps changing, as when the window is dragged by an
+    /// edge, the picture of the last size it rested at is stretched over it: a picture per frame
+    /// costs more than the frame has, and tens of megabytes each.
     fn field(
         &self,
         material: &Material,
@@ -488,6 +508,15 @@ impl Ambient {
         ];
         let key = (width, height, colors.map(bytes));
         let mut baked = self.baked.borrow_mut();
+        if let Some(old) = baked.as_ref().filter(|old| old.key != key)
+            && old.key.2 == key.2
+            && !self.settled((width, height))
+        {
+            // Come back for the picture of the size the area stops at.
+            window.request_animation_frame();
+            return Some((area, old.picture.clone()));
+        }
+        self.wanted.set(None);
         if baked.as_ref().is_none_or(|baked| baked.key != key) {
             if let Some(old) = baked.take() {
                 let _ = window.drop_image(old.picture);
