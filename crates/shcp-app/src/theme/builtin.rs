@@ -92,22 +92,29 @@ pub(crate) fn accent_color(accent: Accent, is_light: bool) -> Hsla {
     oklch(lit.l, lit.c, lit.h, 1.)
 }
 
-pub(crate) fn build(name: &str, accent: Accent) -> Theme {
+/// `raised`: the cards are lighter than the window around them; otherwise darker, sunk into it.
+pub(crate) fn build(name: &str, accent: Accent, raised: bool) -> Theme {
     match name {
-        PRUNE => prune(accent),
-        _ => nocturne(accent),
+        PRUNE => prune(accent, raised),
+        _ => nocturne(accent, raised),
     }
 }
 
 /// Warm charcoal, brown shadows and a restrained copper in the muted text.
-fn prune(accent: Accent) -> Theme {
-    let mut theme = nocturne(accent);
+fn prune(accent: Accent, raised: bool) -> Theme {
+    let mut theme = nocturne(accent, raised);
     let color = |hex| -> Hsla { gpui::rgb(hex).into() };
     let ink = color(0xece3df);
     theme.name = PRUNE.into();
     // The terminals' warm charcoal, at three depths: a modal's side column, on `surface`, and
-    // its content, on `elevated`, read as two shades of one color.
-    theme.bg = color(0x2b2927);
+    // its content, on `elevated`, read as two shades of one color. The cards, terminals and
+    // files alike, a step above the window or a step below it.
+    let (window, card) = if raised {
+        (color(0x1f1d1b), color(0x2b2927))
+    } else {
+        (color(0x2b2927), color(0x22201e))
+    };
+    theme.bg = card;
     theme.surface = color(0x282624);
     theme.elevated = color(0x312f2c);
     theme.input_bg = color(0x1f1d1b);
@@ -122,9 +129,9 @@ fn prune(accent: Accent) -> Theme {
         a: 0.46,
         ..color(0x1f1d1b)
     };
-    theme.window_bg = color(0x1f1d1b);
+    theme.window_bg = window;
     theme.track = color(0x312f2c);
-    theme.terminal_bg = color(0x22201e);
+    theme.terminal_bg = card;
     // Keep the engine's default background exactly aligned with the UI: default cells must
     // remain transparent to the card they are on.
     theme.palette.bg = to_rgb(theme.terminal_bg);
@@ -138,7 +145,7 @@ fn prune(accent: Accent) -> Theme {
     theme
 }
 
-fn nocturne(accent: Accent) -> Theme {
+fn nocturne(accent: Accent, raised: bool) -> Theme {
     let (tint, h) = (TINT, HUE);
     let n = 0.015 * tint;
     let Lit {
@@ -148,8 +155,14 @@ fn nocturne(accent: Accent) -> Theme {
         on_l,
         on_c,
     } = lit(accent, false);
-    let window = oklch(0.178, n, h, 1.);
+    // The cards a step above the window or a step below it, and what floats above both. The
+    // fields stay the darkest, sunk into whatever holds them.
     let stage = oklch(0.132, n, h, 1.);
+    let (window, card) = if raised {
+        (oklch(0.150, n, h, 1.), oklch(0.200, n, h, 1.))
+    } else {
+        (oklch(0.178, n, h, 1.), stage)
+    };
     let raise = oklch(0.232, n, h, 1.);
     let ink = oklch(0.97, 0.006 * tint, h, 1.);
     let green = oklch(0.82, 0.13, 152., 1.);
@@ -165,7 +178,7 @@ fn nocturne(accent: Accent) -> Theme {
         origin: None,
         file: None,
         is_light: false,
-        bg: stage,
+        bg: card,
         surface: window,
         elevated: raise,
         input_bg: stage,
@@ -187,7 +200,7 @@ fn nocturne(accent: Accent) -> Theme {
         scrim: oklch(0.1, 0.01, h, 0.46),
         window_bg: window,
         track: raise,
-        terminal_bg: stage,
+        terminal_bg: card,
         terminal_selection: oklch(lit_l, lit_c, accent, 0.3),
         // White in any accent: the accent colors the app, not what is typed.
         terminal_cursor: ink,
@@ -213,7 +226,7 @@ fn nocturne(accent: Accent) -> Theme {
                 to_rgb(ink),
             ],
             fg: to_rgb(foreground),
-            bg: to_rgb(stage),
+            bg: to_rgb(card),
             cursor: to_rgb(ink),
         },
     }
@@ -259,8 +272,11 @@ mod tests {
     #[test]
     fn text_stays_readable() {
         for name in [NOCTURNE, PRUNE] {
-            for accent in Accent::ALL {
-                let theme = build(name, accent);
+            for (accent, raised) in Accent::ALL
+                .into_iter()
+                .flat_map(|accent| [(accent, true), (accent, false)])
+            {
+                let theme = build(name, accent, raised);
                 assert!(contrast(theme.text, theme.bg) >= 7., "{name}");
                 assert!(contrast(theme.text_muted, theme.surface) >= 4.5, "{name}");
                 assert!(contrast(theme.text_disabled, theme.bg) >= 4.5, "{name}");

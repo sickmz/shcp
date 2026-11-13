@@ -148,7 +148,7 @@ impl ThemeCatalog {
     pub(crate) fn load(dir: &Path) -> (Self, Vec<String>) {
         let mut themes: Vec<Theme> = [builtin::NOCTURNE, builtin::PRUNE]
             .into_iter()
-            .map(|name| builtin::build(name, shcp_core::Accent::default()))
+            .map(|name| builtin::build(name, shcp_core::Accent::default(), true))
             .collect();
         let mut errors = Vec::new();
         let mut files: Vec<_> = std::fs::read_dir(dir)
@@ -223,10 +223,11 @@ pub(crate) fn missing_theme(settings: &Settings, cx: &App) -> Option<String> {
     (!themes.iter().any(|t| t.name == name)).then(|| name.to_string())
 }
 
-/// The app's own themes take the accent asked for; a theme from a file keeps the one it has.
+/// The app's own themes take the accent and the cards asked for; a theme from a file keeps what
+/// it has.
 pub(crate) fn with_accent(theme: Theme, settings: &Settings) -> Theme {
     if theme.file.is_none() {
-        builtin::build(&theme.name, settings.accent)
+        builtin::build(&theme.name, settings.accent, settings.raised_cards)
     } else {
         theme
     }
@@ -250,7 +251,7 @@ pub(crate) fn apply(settings: &Settings, engine: &EngineHandle, cx: &mut App) {
         .or(themes.first())
         .cloned()
         // `ThemeCatalog::load` always holds the bundled themes, so this is never reached.
-        .unwrap_or_else(|| builtin::build(builtin::NOCTURNE, shcp_core::Accent::default()));
+        .unwrap_or_else(|| builtin::build(builtin::NOCTURNE, shcp_core::Accent::default(), true));
     theme = with_accent(theme, settings);
     engine.set_terminal_palette(&theme.palette);
     cx.set_global(theme);

@@ -2040,7 +2040,10 @@ impl Workspace {
             ],
             vec![nav, tools, close],
         );
-        panel::frame(&theme, theme.bg)
+        // Alone, a card has nothing to stand out from.
+        let focused =
+            !self.tabs[index].files_alone(cx) && files.read(cx).contains_focus(window, cx);
+        panel::frame(&theme, theme.bg, focused)
             .id("files-card")
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                 let animated = this.animated(cx);
@@ -2685,7 +2688,7 @@ impl Workspace {
     /// A card of its own under the others.
     fn dock_card(&self, theme: &theme::Theme, dock_amount: f32) -> impl IntoElement + use<> {
         let measured = self.dock_height.clone();
-        let inner = panel::frame(theme, theme.bg)
+        let inner = panel::frame(theme, theme.bg, false)
             .flex_none()
             .overflow_hidden()
             .child(self.dock.clone())

@@ -804,6 +804,7 @@ impl TerminalPanes {
         path: Path,
         several: bool,
         tools: &HashMap<EntityId, f32>,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match node {
@@ -814,7 +815,13 @@ impl TerminalPanes {
                 let shown = tools.get(&entity).copied().unwrap_or(0.);
                 let header = self.card_header(view, shown, several, cx);
                 let theme = cx.theme().clone();
-                crate::panel::frame(&theme, theme.terminal_bg)
+                // What a terminal contains is known from the frame before, where a new one was not
+                // yet: it would show unmarked first. Its own focus is known at once. Alone, a card
+                // has nothing to stand out from.
+                let focused = (several || self.files_shown)
+                    && (view.focus_handle(cx).is_focused(window)
+                        || view.read(cx).contains_focus(window, cx));
+                crate::panel::frame(&theme, theme.terminal_bg, focused)
                     .id(("pane", id))
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                         let animated = this.state.read(cx).settings.animated_selection;
@@ -865,8 +872,8 @@ impl TerminalPanes {
                 let (mut first_path, mut second_path) = (path.clone(), path.clone());
                 first_path.push(false);
                 second_path.push(true);
-                let first = self.render_node(first, first_path, several, tools, cx);
-                let second = self.render_node(second, second_path, several, tools, cx);
+                let first = self.render_node(first, first_path, several, tools, window, cx);
+                let second = self.render_node(second, second_path, several, tools, window, cx);
                 let cell = bounds.clone();
                 let gap = px(crate::panel::CARD_GAP);
                 div()
@@ -1034,7 +1041,7 @@ impl Render for TerminalPanes {
         let root = self.root.take();
         let content = root
             .as_ref()
-            .map(|root| self.render_node(root, Vec::new(), several, &tools, cx));
+            .map(|root| self.render_node(root, Vec::new(), several, &tools, window, cx));
         self.root = root;
         let dragging = self.dragging.is_some();
         div()

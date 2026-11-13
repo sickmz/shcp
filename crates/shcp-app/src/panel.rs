@@ -9,8 +9,9 @@ pub(crate) const CARD_GAP: f32 = 6.;
 const HEADER_HEIGHT: f32 = 38.;
 
 /// A rounded card. Children filling it up to its edge must round their own bottom corners with
-/// `PANEL_INNER_RADIUS`: gpui clips to rectangles only.
-pub(crate) fn frame(theme: &Theme, bg: Hsla) -> Div {
+/// `PANEL_INNER_RADIUS`: gpui clips to rectangles only. `focused`: it has the keyboard among
+/// other cards, and its line is brighter, in the text's own color: never the accent's.
+pub(crate) fn frame(theme: &Theme, bg: Hsla, focused: bool) -> Div {
     div()
         .relative()
         .flex()
@@ -18,9 +19,19 @@ pub(crate) fn frame(theme: &Theme, bg: Hsla) -> Div {
         .min_w_0()
         .rounded(px(RADIUS_CARD))
         .border_1()
-        .border_color(theme.border)
+        .border_color(if focused {
+            Hsla {
+                a: FOCUSED_LINE,
+                ..theme.text
+            }
+        } else {
+            theme.border
+        })
         .bg(bg)
 }
+
+/// How much of the text's color the line of the focused card takes.
+const FOCUSED_LINE: f32 = 0.35;
 
 /// The surface of what floats over the window or stands out of it: a menu, a tooltip, a dialog,
 /// a field. The raised fill and `border`.

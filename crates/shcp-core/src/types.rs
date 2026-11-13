@@ -163,6 +163,9 @@ pub struct Settings {
     /// Name of the file icon theme; empty uses the app's own icons.
     pub icon_theme: String,
     pub density: Density,
+    /// In the app's own themes, the cards are lighter than the window around them; otherwise
+    /// darker, sunk into it.
+    pub raised_cards: bool,
     /// The color of what is on or chosen, in the app's own themes.
     pub accent: Accent,
     /// Which look the rest of these settings were last brought up to. Missing in older files.
@@ -621,6 +624,7 @@ impl Default for Settings {
             light_theme: "Nocturne".into(),
             icon_theme: String::new(),
             density: Density::Default,
+            raised_cards: true,
             accent: Accent::Blue,
             style_version: STYLE_VERSION,
             animated_selection: true,

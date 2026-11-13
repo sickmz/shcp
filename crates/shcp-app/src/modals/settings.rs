@@ -1251,6 +1251,17 @@ impl SettingsModal {
             ),
         );
         add(
+            "Cards",
+            "Terminals and files lighter or darker than the window, in the app's own themes",
+            segmented(
+                theme,
+                "cards",
+                &[(true, "Raised"), (false, "Sunken")],
+                settings.raised_cards,
+                self.setter(|s, v| s.raised_cards = v, cx),
+            ),
+        );
+        add(
             "Animations",
             "Panels, views and the highlight glide when you use the mouse, instead of jumping",
             switch(
