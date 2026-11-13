@@ -76,6 +76,8 @@ pub(crate) struct TerminalView {
     /// It has shown a shell, so it has output worth keeping in sight while disconnected.
     had_session: bool,
     pub(crate) shared_startup: bool,
+    /// Where its shell is, as the server last said.
+    folder: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -145,7 +147,14 @@ impl TerminalView {
             .read(cx)
             .keeps_terminals(&host)
             .then(|| key.unwrap_or_else(shcp_core::new_terminal_key));
-        let persist = key.clone().map(|key| Persistence { key, known });
+        let folder = key
+            .as_ref()
+            .and_then(|key| state.read(cx).terminal_folder(key));
+        let persist = key.clone().map(|key| Persistence {
+            key,
+            known,
+            folder: folder.clone(),
+        });
         let terminal = state
             .read(cx)
             .engine
@@ -202,6 +211,10 @@ impl TerminalView {
                     }
                     Event::Session { id, .. } => *id == this.session,
                     Event::TerminalTitle { id, .. } => *id == this.terminal.id(),
+                    Event::TerminalFolder { id, folder } if *id == this.terminal.id() => {
+                        this.folder = Some(folder.clone());
+                        true
+                    }
                     _ => false,
                 };
                 if relevant {
@@ -250,6 +263,7 @@ impl TerminalView {
             link_armed: false,
             had_session: false,
             shared_startup: true,
+            folder,
             _subscriptions: subscriptions,
         }
     }
@@ -261,6 +275,11 @@ impl TerminalView {
 
     pub(crate) fn terminal_id(&self) -> TerminalId {
         self.terminal.id()
+    }
+
+    /// Where its shell is, as the server last said: a new one starts there after a restart.
+    pub(crate) fn folder(&self) -> Option<&str> {
+        self.folder.as_deref()
     }
 
     pub(crate) fn is_alive(&self) -> bool {
@@ -305,7 +324,11 @@ impl TerminalView {
     fn attach(&mut self, session: SessionId, known: bool, cx: &mut Context<Self>) {
         self.session = session;
         let engine = self.state.read(cx).engine.clone();
-        let persist = self.key.clone().map(|key| Persistence { key, known });
+        let persist = self.key.clone().map(|key| Persistence {
+            key,
+            known,
+            folder: self.folder.clone(),
+        });
         engine.reopen_terminal(session, &self.terminal, "reconnected", persist);
         self.composing.clear();
         self.reported_button = None;
@@ -964,11 +987,38 @@ impl Render for TerminalView {
             .child(terminal)
             .when(show_bar, |this| this.child(bar))
             .children(overlay)
+            .when(self.terminal.history_pending(), |this| {
+                this.child(history_hint(&theme))
+            })
             .when_some(link_url, |this, url| this.child(link_hint(&theme, &url)))
             .when(self.search_open, |this| {
                 this.child(self.search_bar(&theme, cx))
             })
     }
+}
+
+/// The screen is there, the lines above it are still on their way.
+fn history_hint(theme: &Theme) -> impl IntoElement + use<> {
+    div()
+        .absolute()
+        .top(px(8.))
+        .right(px(16.))
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .px(px(8.))
+        .py(px(3.))
+        .rounded(px(crate::theme::RADIUS_SMALL))
+        .map(|this| crate::panel::floating(this, theme, theme.border))
+        .text_size(crate::theme::ui_px(12.))
+        .text_color(theme.text_muted)
+        .child(
+            crate::widgets::icon::Icon::new(IconName::Spinner)
+                .size(px(11.))
+                .color(theme.text_disabled)
+                .spin(),
+        )
+        .child("Loading history")
 }
 
 /// Shows where a link really goes: its text can say anything. The outer box gives the text a

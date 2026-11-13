@@ -63,8 +63,6 @@ const TYPE_AHEAD: Duration = Duration::from_millis(800);
 pub(crate) enum FilesEvent {
     OpenTerminalHere(String),
     GoHereInTerminal(String),
-    /// The files follow the folder of the terminal, or stop following it.
-    ToggleFollow,
 }
 
 /// Where a key moves the cursor on a list of `len` rows.
@@ -225,8 +223,6 @@ pub(crate) struct FilesView {
     /// The toolbar menu open when the mouse went down: that press closes it, and the click that
     /// follows on its button must not open it again.
     closing_menu: Option<ToolbarMenu>,
-    /// The files follow the folder of the terminal. Set by the workspace, for the menu.
-    pub follows: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -398,7 +394,6 @@ impl FilesView {
             more_anchor: MenuAnchor::default(),
             menu_button: None,
             closing_menu: None,
-            follows: true,
             _subscriptions: subscriptions,
         };
         if this.session_connected(cx) {
@@ -1126,25 +1121,10 @@ impl FilesView {
         let this = cx.entity().downgrade();
         let connected = self.session_connected(cx);
         let ready = !self.path.is_empty() && connected;
-        // A check says what is on; what is off shows nothing there.
-        let checked = |entry: MenuEntry, on: bool| {
-            if on {
-                entry.icon(IconName::Check)
-            } else {
-                entry
-            }
-        };
         let mut entries = self.add_entries(cx);
         entries.extend(self.upload_entries(cx));
         entries.extend([
             MenuEntry::Separator,
-            checked(
-                MenuEntry::item(
-                    "Follow terminal",
-                    handler(this.clone(), |_, _, cx| cx.emit(FilesEvent::ToggleFollow)),
-                ),
-                self.follows,
-            ),
             {
                 let here = self.path.clone();
                 MenuEntry::item(

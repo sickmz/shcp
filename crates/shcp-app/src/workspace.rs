@@ -259,6 +259,10 @@ impl Workspace {
             (state.engine.load_tabs(), state.settings.restore_tabs)
         };
         self.saved_tabs = saved.clone();
+        // Before any terminal starts: a new shell after a restart of the server goes there.
+        let folders = saved.folders.clone().into_iter().collect();
+        self.state
+            .update(cx, |state, _| state.terminal_folders = folders);
         if !enabled {
             return;
         }
@@ -283,7 +287,11 @@ impl Workspace {
                     name,
                 } if known(host, self, cx) => {
                     self.open_terminal_with(HostId(host.clone()), layout, true, window, cx);
-                    if *both && let Some(index) = self.active {
+                    // Saved split, from before the files kept to one terminal: no files.
+                    if *both
+                        && let Some(index) = self.active
+                        && !self.tabs[index].panes.read(cx).is_split()
+                    {
                         self.set_face(index, Face::Files, window, cx);
                         if let Some(ratio) = ratio.and_then(both_ratio) {
                             self.tabs[index].both_ratio = ratio;
@@ -325,6 +333,11 @@ impl Workspace {
                     ratio: tab.face.shows_files().then_some(tab.both_ratio),
                     name: tab.name.clone(),
                 })
+                .collect(),
+            folders: self
+                .tabs
+                .iter()
+                .flat_map(|tab| tab.panes.read(cx).folders(cx))
                 .collect(),
         }
     }
@@ -572,7 +585,9 @@ impl Workspace {
         } else {
             Face::Terminal
         };
-        if self.tabs[index].face != face {
+        // A split tab keeps its terminals alone, whatever another PC shows.
+        let split = self.tabs[index].panes.read(cx).is_split();
+        if self.tabs[index].face != face && !(face.shows_files() && split) {
             self.set_face(index, face, window, cx);
         }
         if let Some(ratio) = remote.files_ratio.and_then(both_ratio) {
@@ -994,7 +1009,9 @@ impl Workspace {
                     }
                 }
             }
-            Event::TerminalTitle { .. } | Event::TerminalExited { .. } => cx.notify(),
+            Event::TerminalTitle { .. }
+            | Event::TerminalExited { .. }
+            | Event::TerminalFolder { .. } => cx.notify(),
             Event::TerminalClosed { id } => self.on_terminal_closed(*id, window, cx),
             Event::SharedServer { host, live, tabs } => {
                 self.on_shared_server(host, live, tabs.as_ref(), window, cx);
@@ -1110,6 +1127,15 @@ impl Workspace {
         let Some(tab) = self.tabs.get(index) else {
             return;
         };
+        // The files sit beside one terminal: a split tab keeps its terminals alone.
+        if face.shows_files() && tab.panes.read(cx).is_split() {
+            let message = "The files go beside one terminal: close the other terminals of this \
+                           tab first";
+            self.state.update(cx, |state, cx| {
+                state.push_notice(NoticeLevel::Info, message.to_string(), cx)
+            });
+            return;
+        }
         let host = tab.host.clone();
         let previous = tab.face;
         if face.shows_files() && self.tabs[index].files.is_none() {
@@ -1248,6 +1274,12 @@ impl Workspace {
                 self.toggle_files(index, window, cx);
             }
             PanesEvent::CloseTab => self.close_tab(index, window, cx),
+            PanesEvent::ShellClosed => {
+                if self.active == Some(index) {
+                    self.focus_active(window, cx);
+                }
+                cx.notify();
+            }
         }
     }
 
@@ -1276,18 +1308,16 @@ impl Workspace {
                 cd(&terminal, folder, cx);
                 window.focus(&terminal.focus_handle(cx));
             }
-            FilesEvent::ToggleFollow => {
-                if let Some(tab) = self
-                    .tabs
-                    .iter_mut()
-                    .find(|tab| tab.files.as_ref() == Some(view))
-                {
-                    tab.linked = !tab.linked;
-                    // Back on: the files catch up with the terminal at the next draw.
-                    tab.followed = None;
-                    cx.notify();
-                }
-            }
+        }
+    }
+
+    /// The files follow the folder of the terminal, or stop following it.
+    fn toggle_link(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(index) {
+            tab.linked = !tab.linked;
+            // Back on: the files catch up with the terminal at the next draw.
+            tab.followed = None;
+            cx.notify();
         }
     }
 
@@ -1426,12 +1456,16 @@ impl Workspace {
         let Some(active) = self.active else {
             return;
         };
-        let closed = self
-            .active_panes()
-            .is_some_and(|panes| panes.update(cx, |panes, cx| panes.close_active(window, cx)));
-        if !closed {
+        let Some(panes) = self.active_panes() else {
             self.close_tab(active, window, cx);
-        }
+            return;
+        };
+        // The last terminal: with the files beside it they stay, as the button of its card does.
+        panes.update(cx, |panes, cx| {
+            if !panes.close_active(window, cx) {
+                panes.close_last(cx);
+            }
+        });
     }
 
     pub(crate) fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1678,7 +1712,9 @@ impl Workspace {
                 alt: None,
             });
         };
-        if let Some(panes) = self.active_panes() {
+        // The files sit beside one terminal: no splitting while they show.
+        let files_shown = self.active_tab().is_some_and(|tab| tab.face.shows_files());
+        if let Some(panes) = self.active_panes().filter(|_| !files_shown) {
             for (title, icon, shortcut, axis) in tabs::SPLITS {
                 let panes = panes.clone();
                 command(
@@ -1992,6 +2028,11 @@ impl Workspace {
         let Some(tab) = self.tabs.get(index) else {
             return;
         };
+        // The files are all that is left: hiding them leaves nothing, so the tab goes.
+        if tab.files_alone(cx) {
+            self.close_tab(index, window, cx);
+            return;
+        }
         let face = if tab.face.shows_files() {
             Face::Terminal
         } else {
@@ -2016,8 +2057,6 @@ impl Workspace {
         let theme = cx.theme().clone();
         let tab = &self.tabs[index];
         let color = theme.host_color(self.state.read(cx).host_color(&tab.host));
-        let follows = tab.linked;
-        files.update(cx, |view, _| view.follows = follows);
         let hold = files.read(cx).holds_tools(window, cx);
         let tools_shown = self.files_fade.value(hold);
         if self.files_fade.moving() {
@@ -2026,9 +2065,14 @@ impl Workspace {
         let (nav, crumbs, tools) = files.update(cx, |view, cx| {
             (view.nav_buttons(cx), view.crumbs(cx), view.tools(cx))
         });
+        let alone = self.tabs.get(index).is_some_and(|tab| tab.files_alone(cx));
         let close = Button::new("files-close")
             .icon(IconName::Close)
-            .tooltip("Hide the files (Ctrl+Shift+E shows them)")
+            .tooltip(if alone {
+                "Close tab (Ctrl+Shift+W)"
+            } else {
+                "Hide the files (Ctrl+Shift+E shows them)"
+            })
             .style(ButtonStyle::Ghost)
             .on_click(cx.listener(move |this, _, window, cx| this.toggle_files(index, window, cx)))
             .into_any_element();
@@ -2200,6 +2244,7 @@ impl Workspace {
         let tab = &self.tabs[index];
         let theme = cx.theme().clone();
         let ratio = tab.both_ratio;
+        let linked = tab.linked;
         let bounds = self.both_bounds.clone();
         let alone = tab.files_alone(cx);
         let panes = tab.panes.clone();
@@ -2297,6 +2342,13 @@ impl Workspace {
                             })),
                     )
                     .child(div().flex_1().min_w_0().h_full().child(files))
+                    // Last, so it sits over both cards and not under the files.
+                    .child(link_bridge(
+                        &theme,
+                        linked,
+                        ratio,
+                        cx.listener(move |this, _, _, cx| this.toggle_link(index, cx)),
+                    ))
                     .into_any_element()
             }
             None => panes.into_any_element(),
@@ -2310,11 +2362,12 @@ impl Workspace {
     }
 
     /// In the middle of the top of the window: leads to the palette, where typing happens. Around
-    /// it the strip still moves the window.
+    /// it the strip still moves the window. Only words at rest, so the top stays quiet; the
+    /// capsule shows under the pointer.
     fn search_field(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
-        let keys = crate::actions::with_current_keys("Ctrl+Shift+K", cx).replace('+', " ");
-        let pressed = theme.active;
+        let keys = short_keys(&crate::actions::with_current_keys("Ctrl+Shift+K", cx));
+        let (hover, pressed, edge) = (theme.hover, theme.active, theme.border);
         div()
             .absolute()
             .top_0()
@@ -2328,38 +2381,42 @@ impl Workspace {
                 div()
                     .id("window-search")
                     .occlude()
-                    .w(px(300.))
                     .max_w(relative(0.4))
-                    .h(px(28.))
-                    .pl(px(10.))
-                    .pr(px(8.))
+                    .h(px(26.))
+                    .px(px(10.))
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    // A way to go somewhere: a capsule, as the rows of the sidebar.
+                    // A way to go somewhere: a capsule, as the rows of the sidebar, once the
+                    // pointer is on it. The edge is there all along, unseen, so nothing moves.
                     .rounded_full()
-                    // Its groove, as ever.
-                    .bg(theme.track)
                     .border_1()
-                    .border_color(theme.border)
+                    .border_color(gpui::transparent_black())
                     .cursor_pointer()
-                    .text_size(crate::theme::ui_px(13.))
+                    .text_size(crate::theme::ui_px(12.5))
                     .text_color(theme.text_muted)
-                    .hover(move |style| style.bg(pressed))
-                    .active(move |style| style.bg(pressed))
+                    .hover(move |style| style.bg(hover).border_color(edge))
+                    .active(move |style| style.bg(pressed).border_color(edge))
                     .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx)))
-                    .child(Icon::new(IconName::Search).color(theme.text_muted))
-                    .child(div().flex_1().min_w_0().truncate().child("Go to anything"))
+                    .child(
+                        Icon::new(IconName::Search)
+                            .size(px(13.))
+                            .color(theme.text_muted),
+                    )
+                    .child(div().min_w_0().truncate().child("Go to anything"))
                     .child(
                         div()
                             .flex_none()
-                            // The mono font sits higher in its line than the one beside it: both
-                            // lines are centered, and the letters end up a pixel apart.
-                            .relative()
-                            .top(px(1.))
+                            .ml(px(4.))
+                            .h(px(17.))
+                            .px(px(5.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(theme.border)
                             .font_family(crate::theme::mono_font())
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_size(crate::theme::ui_px(12.))
+                            .text_size(crate::theme::ui_px(11.))
                             .text_color(theme.text_disabled)
                             .child(keys),
                     ),
@@ -2384,6 +2441,94 @@ impl Workspace {
             cx.notify();
         }
     }
+}
+
+/// Across the gap between the terminal and its files, halfway down: whether the files follow the
+/// folder of the terminal, and a click to change it. A capsule that bridges the two cards while
+/// they go together; broken, and plain, when they do not.
+fn link_bridge(
+    theme: &crate::theme::Theme,
+    linked: bool,
+    // The share of the terminals, where the gap starts.
+    ratio: f32,
+    toggle: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    const WIDTH: f32 = 34.;
+    const HEIGHT: f32 = 20.;
+    let (fill, edge, icon, tip) = if linked {
+        (
+            gpui::Hsla {
+                a: 0.16,
+                ..theme.accent
+            },
+            gpui::Hsla {
+                a: 0.45,
+                ..theme.accent
+            },
+            theme.accent,
+            "The files follow the folder of the terminal",
+        )
+    } else {
+        (
+            theme.bg,
+            theme.strong_border,
+            theme.text_disabled,
+            "The files stay where you take them",
+        )
+    };
+    let hover = theme.hover;
+    div()
+        .id("link-faces")
+        .occlude()
+        .absolute()
+        .top(relative(0.5))
+        .mt(px(-HEIGHT / 2.))
+        .left(relative(ratio))
+        .ml(px((panel::CARD_GAP - WIDTH) / 2.))
+        .w(px(WIDTH))
+        .h(px(HEIGHT))
+        .rounded_full()
+        // The ground of the window under the tint: what is behind it, like the edge of a card,
+        // does not show through.
+        .bg(theme.bg)
+        .border_1()
+        .border_color(edge)
+        .cursor_pointer()
+        .tooltip(tooltip(tip))
+        // Its own press: not the start of a resize of the gap under it.
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(toggle)
+        .child(
+            div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(fill)
+                .when(!linked, move |this| {
+                    this.hover(move |style| style.bg(hover))
+                })
+                .child(
+                    Icon::new(if linked {
+                        IconName::Chain
+                    } else {
+                        IconName::Unlink
+                    })
+                    .size(px(12.))
+                    .color(icon),
+                ),
+        )
+        .into_any_element()
+}
+
+/// Keys as the search field shows them, short: `Ctrl+Shift+K` is `Ctrl ⇧ K`, Shift taking its
+/// symbol, every key apart.
+fn short_keys(keys: &str) -> String {
+    keys.split('+')
+        .map(|key| if key == "Shift" { "⇧" } else { key })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The place of the window now, in the form the settings keep.
@@ -2792,5 +2937,17 @@ impl Render for Workspace {
             .child(self.search_field(cx))
             .child(self.modals.clone())
             .child(WindowControls)
+    }
+}
+
+#[cfg(test)]
+mod short_keys_tests {
+    use super::short_keys;
+
+    #[test]
+    fn shift_takes_its_symbol() {
+        assert_eq!(short_keys("Ctrl+Shift+K"), "Ctrl ⇧ K");
+        assert_eq!(short_keys("Ctrl+Alt+K"), "Ctrl Alt K");
+        assert_eq!(short_keys("Shift+F1"), "⇧ F1");
     }
 }

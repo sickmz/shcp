@@ -30,6 +30,8 @@ icons! {
     File => "file",
     FilePlus => "file_plus",
     Link => "link",
+    Chain => "chain",
+    Unlink => "unlink",
     Plus => "plus",
     Close => "close",
     ChevronRight => "chevron_right",

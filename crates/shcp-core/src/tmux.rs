@@ -7,6 +7,9 @@
 //! The tabs and splits belong to the app, but how they are arranged is kept in a tmux option, in
 //! hex, which tells every terminal of every PC when it changes. A server without a recent tmux gets
 //! plain shells instead.
+//!
+//! A terminal shows what is on its screen first, and the history above it once that is there too:
+//! over a slow link it can take a while.
 use crate::{
     Event, NoticeLevel, Persistence, SharedTabs, files,
     session::{Context, OpenTerminal, Ssh},
@@ -48,6 +51,8 @@ const TMUX_USABLE: &str = "SHCP_TMUX_USABLE";
 /// The line between the terminals and the tabs in what `survey` reads.
 const SURVEY_TABS: &str = "SHCP_TABS";
 const LAYOUT_SUBSCRIPTION: &str = "shcp-layout";
+/// The folder of the program in front, which a new shell goes back to after a restart.
+const FOLDER_SUBSCRIPTION: &str = "shcp-folder";
 /// Time for tmux to end a closed terminal before its channel goes away.
 const KILL_WAIT: Duration = Duration::from_secs(2);
 const RENAME_WAIT: Duration = Duration::from_millis(300);
@@ -93,6 +98,9 @@ pub(crate) struct HostState {
     live: Mutex<Option<HashSet<String>>>,
     /// The user knows that tmux could not be used on this connection.
     told: AtomicBool,
+    /// The last thing tmux said on its way out when it did not start, like `server exited
+    /// unexpectedly` from a server busy with clients that never left.
+    said: Mutex<Option<String>>,
 }
 
 /// The user just asked for the terminals of this host to last: says whether the server can do it.
@@ -131,10 +139,14 @@ pub(crate) async fn report_keeping(ctx: Arc<Context>, ssh: Arc<Ssh>) {
 /// tmux is there but this terminal could not use it, which may pass. Says so once per connection.
 pub(crate) fn tell_unavailable(ctx: &Context) {
     if !ctx.tmux.told.swap(true, Ordering::Relaxed) {
+        let said = match ctx.tmux.said.lock().as_deref() {
+            Some(said) => format!(". tmux said: {said}"),
+            None => String::new(),
+        };
         ctx.notice(
             NoticeLevel::Important,
             format!(
-                "Terminals on {} end when shcp closes: tmux did not start on the server",
+                "Terminals on {} end when shcp closes: tmux did not start on the server{said}",
                 ctx.host.alias
             ),
         );
@@ -168,18 +180,43 @@ fn decode_tabs(hex: &[u8]) -> Option<SharedTabs> {
     toml::from_str(&text).ok()
 }
 
+/// What the survey prints, with how many, when it closed clients left over.
+const SURVEY_LEFTOVERS: &str = "SHCP_LEFTOVERS";
+
+/// Closes the clients of this app's tmux whose connection is gone: their SSH session ended without
+/// them, so the system adopted them. tmux waits for every client before it exits, and while it
+/// waits it takes no one else, so one left over after a restart of tmux keeps every terminal out.
+/// The clients of live connections still have their SSH session above them. Only where `/proc` is.
+const CLOSE_LEFTOVERS: &str = "N=0; for P in $(pgrep -u \"$(id -u)\" -x \"tmux: client\" \
+     2>/dev/null); do case \"$(tr \"\\0\" \" \" < /proc/$P/cmdline 2>/dev/null)\" in \
+     *\" -L shcp \"*\" -C \"*) ;; *) continue;; esac; \
+     Q=$(ps -o ppid= -p $P 2>/dev/null | tr -d \" \"); \
+     [ \"$Q\" = 1 ] || [ \"$(cat /proc/$Q/comm 2>/dev/null)\" = systemd ] || continue; \
+     kill $P 2>/dev/null && N=$((N+1)); done; \
+     [ $N -gt 0 ] && { echo SHCP_LEFTOVERS $N; sleep 1; };";
+
 /// Reads what runs on the server, before any terminal of this connection attaches: one that
 /// should be there and is not was closed from elsewhere, and one that attached first would have
-/// started tmux and make the server look in use.
+/// started tmux and make the server look in use. Clients left over by lost connections go first.
 pub(crate) async fn survey(ctx: &Context, ssh: &Ssh) {
     let command = format!(
-        "sh -c '{FIND_TMUX} [ -x \"$T\" ] || exit 0; \
+        "sh -c '{FIND_TMUX} [ -x \"$T\" ] || exit 0; {CLOSE_LEFTOVERS} \
          \"$T\" -u -L shcp list-sessions -F \"#{{session_name}}\" 2>/dev/null || exit 0; \
          echo {SURVEY_TABS}; \"$T\" -L shcp show-options -gqv @shcp_layout'"
     );
     let output = timeout(SURVEY_TIMEOUT, files::read_all(ssh, command))
         .await
         .unwrap_or_default();
+    if let Some(count) = leftovers(&output) {
+        ctx.notice(
+            NoticeLevel::Info,
+            format!(
+                "Closed {count} tmux client{} left on {} by lost connections",
+                if count == 1 { "" } else { "s" },
+                ctx.host.alias
+            ),
+        );
+    }
     let (names, tabs) = parse_survey(&output);
     let live = names
         .iter()
@@ -194,6 +231,14 @@ pub(crate) async fn survey(ctx: &Context, ssh: &Ssh) {
         live,
         tabs,
     });
+}
+
+/// How many left over clients the survey closed, if any.
+fn leftovers(output: &[u8]) -> Option<usize> {
+    String::from_utf8_lossy(output).lines().find_map(|line| {
+        let count = line.strip_prefix(SURVEY_LEFTOVERS)?.trim().parse().ok()?;
+        (count > 0).then_some(count)
+    })
 }
 
 /// A shell's startup files may have printed anything, so only what can be ours counts.
@@ -213,10 +258,34 @@ fn parse_survey(output: &[u8]) -> (Vec<String>, Option<SharedTabs>) {
     (names, tabs)
 }
 
+/// A folder as `sh` reads it between double quotes, `~` for the home. `None` for one with what
+/// would mean something there: such a shell starts in the home.
+fn quoted_folder(folder: &str) -> Option<String> {
+    let unsafe_char = |ch: char| ch.is_control() || matches!(ch, '"' | '\\' | '$' | '`' | '\'');
+    if folder.is_empty() || folder.chars().any(unsafe_char) {
+        return None;
+    }
+    if folder == "~" {
+        return Some("\"$HOME\"".to_string());
+    }
+    if let Some(rest) = folder.strip_prefix("~/") {
+        return Some(format!("\"$HOME/{rest}\""));
+    }
+    folder.starts_with('/').then(|| format!("\"{folder}\""))
+}
+
 /// Runs under any login shell: all of it goes through `sh`, on one line and with no `'` inside.
 /// The shell starts without tmux's own variables, so `tmux` in it reaches the user's server, not
-/// this one, and programs behave as on a plain connection.
-fn start_command(name: &str, cols: u16, rows: u16, history: usize, agent: bool) -> String {
+/// this one, and programs behave as on a plain connection. A new one starts in `folder`, if it is
+/// still there.
+fn start_command(
+    name: &str,
+    cols: u16,
+    rows: u16,
+    history: usize,
+    agent: bool,
+    folder: Option<&str>,
+) -> String {
     let (link, agent) = if agent {
         (
             "S=\"$HOME/.ssh/shcp-agent-$(uname -n).sock\"; [ -n \"$SSH_AUTH_SOCK\" ] && \
@@ -227,6 +296,10 @@ fn start_command(name: &str, cols: u16, rows: u16, history: usize, agent: bool) 
         ("", "")
     };
     let history = history.min(MAX_HISTORY);
+    let folder = folder
+        .and_then(quoted_folder)
+        .map(|folder| format!(" -c {folder}"))
+        .unwrap_or_default();
     // With several PCs on a terminal it has the size of the smallest, so no PC has it cut off.
     format!(
         "sh -c '{FIND_TMUX} [ -x \"$T\" ] || {{ echo {NO_TMUX}; exit 0; }}; \
@@ -234,7 +307,7 @@ fn start_command(name: &str, cols: u16, rows: u16, history: usize, agent: bool) 
          echo {NO_TMUX}; exit 0;; esac; {link}exec \"$T\" -u -L shcp -f /dev/null -C \
          set -g status off \\; set -g automatic-rename off \\; set -g window-size smallest \\; \
          set -g history-limit {history} \\; set -g update-environment \"{ENVIRONMENT}\" \\; \
-         new-session -A -s {name} -x {cols} -y {rows}{agent} \
+         new-session -A -s {name} -x {cols} -y {rows}{folder}{agent} \
          env -u TMUX -u TMUX_PANE -u TERM_PROGRAM -u TERM_PROGRAM_VERSION TERM=xterm-256color \
          \"${{SHELL:-/bin/sh}}\" -l'"
     )
@@ -257,6 +330,8 @@ enum Message {
     Resized(u16, u16),
     /// The value of the option with the tabs, in hex.
     Tabs(Vec<u8>),
+    /// The folder of the program in the foreground.
+    Folder(Vec<u8>),
     /// A session has a new name. It could be another terminal's: every client hears of them all.
     Renamed(Vec<u8>),
 }
@@ -341,11 +416,16 @@ impl Parser {
         } else if let Some(rest) = line.strip_prefix(b"%session-renamed ") {
             out.push(Message::Renamed(after_id(rest).to_vec()));
         } else if let Some(rest) = line.strip_prefix(b"%subscription-changed ") {
-            // `name $1 - - - : value`
-            if rest.starts_with(LAYOUT_SUBSCRIPTION.as_bytes())
-                && let Some(at) = rest.windows(3).position(|part| part == b" : ")
-            {
-                out.push(Message::Tabs(rest[at + 3..].to_vec()));
+            // `name $1 - - - : value`, or `name $1 @1 1 %1 : value` for a pane.
+            let name = rest.split(|byte| *byte == b' ').next().unwrap_or_default();
+            if let Some(at) = rest.windows(3).position(|part| part == b" : ") {
+                let value = rest[at + 3..].to_vec();
+                let message = match name {
+                    _ if name == LAYOUT_SUBSCRIPTION.as_bytes() => Message::Tabs(value),
+                    _ if name == FOLDER_SUBSCRIPTION.as_bytes() => Message::Folder(value),
+                    _ => return,
+                };
+                out.push(message);
             }
         } else if !line.starts_with(b"%") {
             out.push(Message::Text(line));
@@ -377,7 +457,8 @@ fn decode_output(data: &[u8]) -> Vec<u8> {
 }
 
 /// One line of commands, which tmux runs with nothing from the program in between. So what it wrote
-/// before the last answer is in the captures, and what it writes after comes as output.
+/// before the last answer is in the captures, and what it writes after comes as output. The history
+/// is not among them: it comes after, with `history_batch`.
 fn attach_batch(size: Option<(u16, u16)>) -> String {
     let mut commands = Vec::new();
     if let Some((cols, rows)) = size {
@@ -387,9 +468,10 @@ fn attach_batch(size: Option<(u16, u16)>) -> String {
         format!("list-panes -F '{INFO_FORMAT}'"),
         "display-message -p '#{pane_path}'".to_string(),
         "display-message -p '#{pane_title}'".to_string(),
+        "display-message -p '#{pane_current_path}'".to_string(),
         "set-option @shcp_started 1".to_string(),
         format!("refresh-client -B '{LAYOUT_SUBSCRIPTION}::#{{@shcp_layout}}'"),
-        "capture-pane -p -e -J -S - -E -1".to_string(),
+        format!("refresh-client -B '{FOLDER_SUBSCRIPTION}:%*:#{{pane_current_path}}'"),
         "capture-pane -p -e -J -S 0 -E -".to_string(),
         "capture-pane -p -e -J -a -q -S - -E -".to_string(),
         "capture-pane -p -P -C".to_string(),
@@ -400,8 +482,27 @@ fn attach_batch(size: Option<(u16, u16)>) -> String {
 }
 /// How many answers `attach_batch` gets.
 fn attach_replies(size: Option<(u16, u16)>) -> usize {
-    9 + usize::from(size.is_some())
+    10 + usize::from(size.is_some())
 }
+
+/// Everything again, the history too, for a terminal that shows its screen already. Sent before
+/// any other command, so its answers are the first to come back.
+fn history_batch() -> String {
+    let commands = [
+        format!("list-panes -F '{INFO_FORMAT}'"),
+        "display-message -p '#{pane_path}'".to_string(),
+        "display-message -p '#{pane_title}'".to_string(),
+        "capture-pane -p -e -J -S - -E -1".to_string(),
+        "capture-pane -p -e -J -S 0 -E -".to_string(),
+        "capture-pane -p -e -J -a -q -S - -E -".to_string(),
+        "capture-pane -p -P -C".to_string(),
+    ];
+    let mut line = commands.join(" ; ");
+    line.push('\n');
+    line
+}
+/// How many answers `history_batch` gets.
+const HISTORY_REPLIES: usize = 7;
 
 /// The state of a pane as tmux reports it.
 #[derive(Debug, Default, PartialEq)]
@@ -485,7 +586,8 @@ impl PaneInfo {
 struct Captures<'a> {
     path: &'a [u8],
     title: &'a [u8],
-    history: &'a [u8],
+    /// Not asked for yet: only the screen shows.
+    history: Option<&'a [u8]>,
     screen: &'a [u8],
     primary: &'a [u8],
     /// A sequence the program had only started writing: its end comes as output.
@@ -516,8 +618,10 @@ fn restore_stream(info: &PaneInfo, captures: &Captures) -> Vec<u8> {
     if info.existing {
         // Everything starts over, and line drawing in the captures comes as shift out.
         out.extend_from_slice(b"\x1bc\x1b)0");
-        if info.history > 0 {
-            push_lines(&mut out, captures.history);
+        if info.history > 0
+            && let Some(history) = captures.history
+        {
+            push_lines(&mut out, history);
             out.extend_from_slice(b"\r\n");
             out.extend_from_slice(RESET_STYLE);
         }
@@ -652,6 +756,9 @@ struct Live<'a> {
     log: Option<SessionLog>,
     closing: Vec<u8>,
     closed: bool,
+    /// The answers so far to `history_batch`, while it has not all come.
+    history: Option<Vec<(bool, Vec<u8>)>>,
+    folder: Vec<u8>,
 }
 
 impl Live<'_> {
@@ -662,6 +769,11 @@ impl Live<'_> {
             }
             Message::Resized(cols, rows) => self.terminal.fit(cols, rows),
             Message::Tabs(hex) => {
+                // Nothing written yet, as on a tmux that just started: not a PC that closed
+                // every tab.
+                if hex.is_empty() {
+                    return;
+                }
                 if let Some(tabs) = decode_tabs(&hex) {
                     self.ctx.emit(Event::SharedTabsChanged {
                         host: self.ctx.host.id.clone(),
@@ -669,9 +781,55 @@ impl Live<'_> {
                     });
                 }
             }
+            Message::Folder(folder) => {
+                if !folder.is_empty() && folder != self.folder {
+                    self.ctx.emit(Event::TerminalFolder {
+                        id: self.terminal.id(),
+                        folder: String::from_utf8_lossy(&folder).into_owned(),
+                    });
+                    self.folder = folder;
+                }
+            }
             Message::Renamed(name) => self.closed |= name == self.closing,
-            _ => {}
+            Message::Reply { ok, body, .. } => {
+                // Only the history was asked for before anything else.
+                let Some(replies) = &mut self.history else {
+                    return;
+                };
+                replies.push((ok, body));
+                if replies.len() == HISTORY_REPLIES {
+                    let replies = self.history.take().unwrap_or_default();
+                    self.show_history(&replies);
+                }
+            }
+            Message::Text(_) | Message::Exit => {}
         }
+    }
+
+    /// Everything again, with the history the server kept above the screen.
+    fn show_history(&self, replies: &[(bool, Vec<u8>)]) {
+        let [info, path, title, history, screen, primary, pending] = replies else {
+            self.terminal.rebuild(None);
+            return;
+        };
+        let Some(info) = info.0.then(|| PaneInfo::parse(&info.1)).flatten() else {
+            self.terminal.rebuild(None);
+            return;
+        };
+        self.terminal.fit(info.width, info.height);
+        let pending = decode_output(&pending.1);
+        let stream = restore_stream(
+            &info,
+            &Captures {
+                path: &path.1,
+                title: &title.1,
+                history: Some(&history.1),
+                screen: &screen.1,
+                primary: &primary.1,
+                pending: &pending,
+            },
+        );
+        self.terminal.rebuild(Some(&stream));
     }
 }
 
@@ -713,7 +871,14 @@ pub(crate) async fn run(
             // A server that refuses it can still give a session, as with a plain shell.
             writer.agent_forward(false).await?;
         }
-        let start = start_command(&name, cols, rows, command.history, ctx.host.forward_agent);
+        let start = start_command(
+            &name,
+            cols,
+            rows,
+            command.history,
+            ctx.host.forward_agent,
+            persist.folder.as_deref(),
+        );
         if writer.exec(true, start).await.is_err() {
             return Ok(Outcome::Unavailable);
         }
@@ -737,6 +902,13 @@ pub(crate) async fn run(
             match timeout_at(deadline, reader.wait()).await {
                 Ok(Some(ChannelMsg::Data { data })) => parser.feed(&data, &mut messages),
                 Ok(Some(ChannelMsg::Close) | None) | Err(_) => return Ok(Outcome::Unavailable),
+                // What tmux says when it gives up goes to its errors.
+                Ok(Some(ChannelMsg::ExtendedData { data, .. })) => {
+                    let text = String::from_utf8_lossy(&data);
+                    if let Some(line) = text.lines().map(str::trim).rfind(|line| !line.is_empty()) {
+                        *ctx.tmux.said.lock() = Some(line.chars().take(120).collect());
+                    }
+                }
                 Ok(Some(_)) => {}
             }
             let mut drained = std::mem::take(&mut messages).into_iter();
@@ -777,7 +949,8 @@ pub(crate) async fn run(
                 }
             }
         };
-        let [info, path, title, _, _, history, screen, primary, pending] =
+        // The five in between say nothing: setting `@shcp_started` and the subscriptions.
+        let [info, path, title, folder, _, _, _, screen, primary, pending] =
             &replies[usize::from(sized)..]
         else {
             return Ok(Outcome::Unavailable);
@@ -792,9 +965,13 @@ pub(crate) async fn run(
         // What tmux decided, which another PC may have a say in.
         terminal.fit(info.width, info.height);
         if persist.known && !info.existing {
-            terminal.feed(
-                b"\x1b[2m--- The previous shell is gone: the server restarted ---\x1b[0m\r\n",
-            );
+            let folder = String::from_utf8_lossy(&folder.1);
+            let note = if folder.is_empty() {
+                "The previous shell is gone: the server restarted".to_string()
+            } else {
+                format!("The server restarted: a new shell in {folder}")
+            };
+            terminal.feed(format!("\x1b[2m--- {note} ---\x1b[0m\r\n").as_bytes());
         }
         let pending = decode_output(&pending.1);
         terminal.feed(&restore_stream(
@@ -802,7 +979,7 @@ pub(crate) async fn run(
             &Captures {
                 path: &path.1,
                 title: &title.1,
-                history: &history.1,
+                history: None,
                 screen: &screen.1,
                 primary: &primary.1,
                 pending: &pending,
@@ -810,6 +987,12 @@ pub(crate) async fn run(
         ));
         if let Some((cols, rows)) = restored_size {
             terminal.fit(cols, rows);
+        }
+        // The history is asked for before anything else, so its answers come back first.
+        let history = info.existing && info.history > 0;
+        if history {
+            terminal.set_history_pending(true);
+            writer.data_bytes(history_batch().into_bytes()).await?;
         }
         terminal.mark_shell_started();
         terminal.reveal();
@@ -826,7 +1009,10 @@ pub(crate) async fn run(
             log: terminal::open_log(ctx, command.log_dir.clone()),
             closing: closing.clone().into_bytes(),
             closed: false,
+            history: history.then(Vec::new),
+            folder: Vec::new(),
         };
+        let closed_here = AtomicBool::new(false);
         let write_task = async {
             while let Ok(command) = command.input.recv().await {
                 let line = match command {
@@ -840,6 +1026,7 @@ pub(crate) async fn run(
                     }
                     TerminalCommand::Close => {
                         // The user closed this terminal: unlike leaving, that ends what runs in it.
+                        closed_here.store(true, Ordering::Relaxed);
                         let rename = format!("rename-session {closing}\n");
                         writer.data_bytes(rename.into_bytes()).await?;
                         // tmux tells of the new name after the command, and only to clients still on
@@ -880,7 +1067,12 @@ pub(crate) async fn run(
             result = write_task => result?,
             () = read_task => tracing::debug!(session = ctx.id.0, "tmux session channel closed"),
         }
-        Ok(if live.closed {
+        // A history that never came leaves the terminal as it is.
+        if live.history.is_some() {
+            terminal.rebuild(None);
+        }
+        // Closed here, the app already did what closing it means: only the other PCs take it away.
+        Ok(if live.closed && !closed_here.load(Ordering::Relaxed) {
             Outcome::Closed
         } else {
             Outcome::Ended
@@ -1029,6 +1221,17 @@ mod tests {
     }
 
     #[test]
+    fn closing_leftovers_fits_in_the_survey_and_is_counted() {
+        assert!(!CLOSE_LEFTOVERS.contains('\'') && !CLOSE_LEFTOVERS.contains('\n'));
+        assert!(CLOSE_LEFTOVERS.contains(SURVEY_LEFTOVERS));
+        assert_eq!(leftovers(b"Welcome!\nSHCP_LEFTOVERS 2\nshcp-a\n"), Some(2));
+        assert_eq!(leftovers(b"shcp-a\n"), None);
+        // The survey still reads its sessions after it.
+        let (names, _) = parse_survey(b"SHCP_LEFTOVERS 1\nshcp-a\n");
+        assert_eq!(names, ["shcp-a"]);
+    }
+
+    #[test]
     fn keys_go_in_hex_and_nothing_gives_no_line() {
         assert_eq!(send_keys(b"l\x03"), b"send-keys -H 6c 03\n");
         assert!(send_keys(b"").is_empty());
@@ -1058,7 +1261,7 @@ mod tests {
 
     #[test]
     fn the_start_command_has_no_quote_of_its_own() {
-        let command = start_command("shcp-1", 80, 24, 1_000_000, true);
+        let command = start_command("shcp-1", 80, 24, 1_000_000, true, None);
         let inner = command
             .strip_prefix("sh -c '")
             .and_then(|rest| rest.strip_suffix('\''))
@@ -1066,6 +1269,36 @@ mod tests {
         assert!(!inner.contains('\'') && !inner.contains('\n'));
         assert!(inner.contains(&format!("history-limit {MAX_HISTORY} ")));
         assert!(inner.contains("-s shcp-1 -x 80 -y 24 -e "));
+        let command = start_command("shcp-1", 80, 24, 100, false, Some("~/my work"));
+        assert!(command.contains("-y 24 -c \"$HOME/my work\" env -u "));
+    }
+
+    #[test]
+    fn a_folder_with_something_a_shell_would_read_is_left_out() {
+        assert_eq!(quoted_folder("/srv/app").as_deref(), Some("\"/srv/app\""));
+        assert_eq!(quoted_folder("~").as_deref(), Some("\"$HOME\""));
+        assert_eq!(quoted_folder("/tmp/$(reboot)"), None);
+        assert_eq!(quoted_folder("/tmp/it's"), None);
+        assert_eq!(quoted_folder("relative"), None);
+        let command = start_command("shcp-1", 80, 24, 100, false, Some("/a\"b"));
+        assert!(command.contains("-y 24 env -u "));
+    }
+
+    #[test]
+    fn the_attach_batch_asks_as_many_questions_as_are_counted() {
+        for size in [None, Some((80, 24))] {
+            let batch = attach_batch(size);
+            assert_eq!(batch.split(" ; ").count(), attach_replies(size));
+        }
+        assert_eq!(history_batch().split(" ; ").count(), HISTORY_REPLIES);
+    }
+
+    #[test]
+    fn a_terminal_hears_where_its_shell_is() {
+        assert_eq!(
+            parse(&[b"%subscription-changed shcp-folder $1 @1 1 %1 : /srv/my app\n"]),
+            [Message::Folder(b"/srv/my app".to_vec())]
+        );
     }
 
     #[test]
@@ -1108,7 +1341,7 @@ mod tests {
             &Captures {
                 path: b"file://host/tmp",
                 title: b"t",
-                history: b"old",
+                history: Some(b"old"),
                 screen: b"vim\n~",
                 primary: b"$ ls\n$ vim",
                 pending: b"\x1b[",
@@ -1135,7 +1368,7 @@ mod tests {
             &Captures {
                 path: b"",
                 title: b"",
-                history: b"",
+                history: Some(b""),
                 screen: b"$ \n\n",
                 primary: b"",
                 pending: b"",

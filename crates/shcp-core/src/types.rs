@@ -485,6 +485,8 @@ pub struct Persistence {
     pub key: String,
     /// It should be there already: if it is gone, it was closed and comes to an end here too.
     pub known: bool,
+    /// Where its shell last was, for a new one when the old is gone with a restart of the server.
+    pub folder: Option<String>,
 }
 /// A tab as the PCs on a host share it. Which one is active, and the folder its files are at, stay
 /// with each PC.
@@ -536,6 +538,10 @@ pub enum SavedTab {
 pub struct SavedTabs {
     pub active: Option<usize>,
     pub tabs: Vec<SavedTab>,
+    /// Where the shell of each terminal was, by its name on the server: a restart of the server
+    /// starts new shells there.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub folders: BTreeMap<String, String>,
 }
 /// What the user picked for a host: its color. Unset, or one the app does not know, keeps the
 /// default.
@@ -724,6 +730,11 @@ pub enum Event {
     TerminalExited {
         id: TerminalId,
         status: Option<u32>,
+    },
+    /// The folder of the program in a terminal, as the server sees it.
+    TerminalFolder {
+        id: TerminalId,
+        folder: String,
     },
     /// The terminal was closed on another PC, or no longer exists: it goes from here too.
     TerminalClosed {
@@ -1196,6 +1207,7 @@ mod tests {
                     name: Some("database".into()),
                 },
             ],
+            folders: [("k1".to_string(), "/srv/my app".to_string())].into(),
         };
         let text = toml::to_string_pretty(&tabs).unwrap();
         assert_eq!(toml::from_str::<SavedTabs>(&text).unwrap(), tabs);

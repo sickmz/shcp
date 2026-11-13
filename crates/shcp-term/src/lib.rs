@@ -81,6 +81,10 @@ struct State {
     /// How big it can be on screen, once the app has said. A managed terminal is the size the
     /// other side decides, which another PC may keep smaller.
     requested: Option<(u16, u16)>,
+    /// How many lines the grid keeps above the screen.
+    scrollback: usize,
+    /// It shows the screen, and the history above it is on its way.
+    history_pending: bool,
 }
 impl State {
     /// Gives the grid this size. Whether it had another.
@@ -145,6 +149,8 @@ impl TerminalHandle {
                     search: None,
                     managed: false,
                     requested: None,
+                    scrollback,
+                    history_pending: false,
                 }),
                 events: listener,
                 input: Mutex::new(input),
@@ -254,6 +260,42 @@ impl TerminalHandle {
     #[doc(hidden)]
     pub fn publish(&self, text: String) {
         self.send(TerminalCommand::Publish(text));
+    }
+    /// It shows the screen, and the history above it is on its way.
+    pub fn history_pending(&self) -> bool {
+        self.0.state.lock().history_pending
+    }
+    #[doc(hidden)]
+    pub fn set_history_pending(&self, pending: bool) {
+        self.0.state.lock().history_pending = pending;
+        self.changed();
+    }
+    /// Starts over from `stream`, which shows everything: the history above the screen too. Where
+    /// the view was scrolled to, what was selected and searched go with the old grid. `None`: the
+    /// history is not coming, and what shows stays.
+    #[doc(hidden)]
+    pub fn rebuild(&self, stream: Option<&[u8]>) {
+        {
+            let mut state = self.0.state.lock();
+            state.history_pending = false;
+            if stream.is_some() {
+                let size = Size(
+                    state.term.columns() as u16,
+                    state.term.screen_lines() as u16,
+                );
+                let config = Config {
+                    scrolling_history: state.scrollback,
+                    ..Default::default()
+                };
+                state.term = Term::new(config, &size, self.0.events.clone());
+                state.parser = Processor::new();
+                state.search = None;
+            }
+        }
+        match stream {
+            Some(stream) => self.feed(stream),
+            None => self.changed(),
+        }
     }
     fn write(&self, bytes: Vec<u8>) {
         self.scroll_to_bottom();

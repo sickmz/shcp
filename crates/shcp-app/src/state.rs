@@ -108,6 +108,8 @@ pub(crate) struct AppState {
     reconnecting: HashMap<HostId, u32>,
     /// Tunnels that were open when a connection was lost: they open again with the next one.
     lost_forwards: HashMap<HostId, Vec<ForwardSpec>>,
+    /// Where the shells of the last run were, by their name on the server.
+    pub terminal_folders: HashMap<String, String>,
 }
 
 impl EventEmitter<Event> for AppState {}
@@ -152,10 +154,16 @@ impl AppState {
             login_prompts: HashMap::new(),
             reconnecting: HashMap::new(),
             lost_forwards: HashMap::new(),
+            terminal_folders: HashMap::new(),
         }
     }
 
     // ---- queries ----
+
+    /// Where the shell of a terminal of the last run was, by its name on the server.
+    pub(crate) fn terminal_folder(&self, key: &str) -> Option<String> {
+        self.terminal_folders.get(key).cloned()
+    }
 
     pub(crate) fn reconnect_attempt(&self, host: &HostId) -> Option<u32> {
         self.reconnecting.get(host).copied()
@@ -1001,6 +1009,7 @@ impl AppState {
                 Event::TerminalChanged(_)
                 | Event::TerminalTitle { .. }
                 | Event::TerminalExited { .. }
+                | Event::TerminalFolder { .. }
                 | Event::TerminalClosed { .. }
                 | Event::SharedServer { .. }
                 | Event::SharedTabsChanged { .. }

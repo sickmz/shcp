@@ -177,6 +177,8 @@ pub(crate) fn tab_menu(
         .icon(IconName::Folder)
         .shortcut("Ctrl+Shift+E"),
     ];
+    // The files sit beside one terminal.
+    let files_shown = workspace.tabs[index].face.shows_files();
     for (label, icon, shortcut, axis) in SPLITS {
         let panes = panes.clone();
         entries.push(
@@ -187,7 +189,8 @@ pub(crate) fn tab_menu(
                 }),
             )
             .icon(icon)
-            .shortcut(shortcut),
+            .shortcut(shortcut)
+            .disabled(files_shown),
         );
     }
     entries.push(MenuEntry::Separator);

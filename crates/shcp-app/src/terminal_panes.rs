@@ -163,6 +163,8 @@ pub(crate) enum PanesEvent {
     ToggleFiles,
     /// The last terminal was closed from its card: the tab goes.
     CloseTab,
+    /// The last terminal was closed beside the files, which stay: the keyboard goes to them.
+    ShellClosed,
 }
 
 impl EventEmitter<PanesEvent> for TerminalPanes {}
@@ -360,6 +362,17 @@ impl TerminalPanes {
             .collect()
     }
 
+    /// Where each shell is, by its name on the server.
+    pub(crate) fn folders(&self, cx: &App) -> Vec<(String, String)> {
+        self.leaves()
+            .iter()
+            .filter_map(|view| {
+                let view = view.read(cx);
+                Some((view.key()?, view.folder()?.to_string()))
+            })
+            .collect()
+    }
+
     pub(crate) fn has_terminal(&self, id: TerminalId, cx: &App) -> bool {
         self.leaves()
             .iter()
@@ -458,6 +471,10 @@ impl TerminalPanes {
     }
 
     pub(crate) fn split(&mut self, axis: SplitAxis, window: &mut Window, cx: &mut Context<Self>) {
+        // The files sit beside one terminal.
+        if self.files_shown {
+            return;
+        }
         let new = Self::terminal(&self.state, &self.host, None, false, window, cx);
         let target = self.active.entity_id();
         self.root = self
@@ -472,6 +489,18 @@ impl TerminalPanes {
     /// Closes the active terminal. `false`: it was the last one, the tab has to close instead.
     pub(crate) fn close_active(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         self.take_pane(&self.active.clone(), true, window, cx)
+    }
+
+    /// The last terminal goes. Beside the files it ends its shell and leaves them the tab, as
+    /// `exit` does; alone, the tab goes with it.
+    pub(crate) fn close_last(&mut self, cx: &mut Context<Self>) {
+        if self.files_shown && !self.shells_gone(cx) {
+            self.active.read(cx).close(cx);
+            cx.emit(PanesEvent::ShellClosed);
+            cx.notify();
+        } else {
+            cx.emit(PanesEvent::CloseTab);
+        }
     }
 
     /// Takes a terminal out of the tree, ending what runs in it if `kill`.
@@ -735,33 +764,43 @@ impl TerminalPanes {
         };
         let closing = view.clone();
         let files_shown = self.files_shown;
-        let tools = vec![
-            Button::new(("pane-split-right", id))
-                .icon(IconName::SplitRight)
-                .tooltip("Split right (Ctrl+Shift+D)")
-                .style(ButtonStyle::Ghost)
-                .on_click(split(SplitAxis::Row))
-                .into_any_element(),
-            Button::new(("pane-split-down", id))
-                .icon(IconName::SplitDown)
-                .tooltip("Split down (Ctrl+Shift+S)")
-                .style(ButtonStyle::Ghost)
-                .on_click(split(SplitAxis::Column))
-                .into_any_element(),
+        // The files sit beside one terminal: with them there is no splitting, and a split tab
+        // gets no files until it is one terminal again.
+        let mut tools = Vec::new();
+        if !files_shown {
+            tools.extend([
+                Button::new(("pane-split-right", id))
+                    .icon(IconName::SplitRight)
+                    .tooltip("Split right (Ctrl+Shift+D)")
+                    .style(ButtonStyle::Ghost)
+                    .on_click(split(SplitAxis::Row))
+                    .into_any_element(),
+                Button::new(("pane-split-down", id))
+                    .icon(IconName::SplitDown)
+                    .tooltip("Split down (Ctrl+Shift+S)")
+                    .style(ButtonStyle::Ghost)
+                    .on_click(split(SplitAxis::Column))
+                    .into_any_element(),
+            ]);
+        }
+        tools.extend([
             Button::new(("pane-files", id))
                 .icon(IconName::Folder)
                 .tooltip(if files_shown {
                     "Hide the files"
+                } else if several {
+                    "The files go beside one terminal: close the others first"
                 } else {
                     "Files beside the terminal (Ctrl+Shift+E)"
                 })
                 .style(ButtonStyle::Ghost)
                 .active(files_shown)
+                .disabled(several && !files_shown)
                 .on_click(cx.listener(|_, _, _, cx| cx.emit(PanesEvent::ToggleFiles)))
                 .into_any_element(),
             Button::new(("pane-close", id))
                 .icon(IconName::Close)
-                .tooltip(if several {
+                .tooltip(if several || files_shown {
                     "Close terminal (Ctrl+Shift+W)"
                 } else {
                     "Close tab (Ctrl+Shift+W)"
@@ -769,11 +808,11 @@ impl TerminalPanes {
                 .style(ButtonStyle::Ghost)
                 .on_click(cx.listener(move |this, _, window, cx| {
                     if !this.take_pane(&closing, true, window, cx) {
-                        cx.emit(PanesEvent::CloseTab);
+                        this.close_last(cx);
                     }
                 }))
                 .into_any_element(),
-        ];
+        ]);
         let lead = vec![
             shell_tile(
                 ("pane-tile", id),
