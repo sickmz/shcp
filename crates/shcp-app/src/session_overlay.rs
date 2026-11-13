@@ -639,9 +639,7 @@ fn connect_card(
     div()
         .p(px(20.))
         .rounded(px(crate::theme::RADIUS_CARD))
-        .map(|this| {
-            crate::panel::floating(this, theme, crate::theme::RADIUS_CARD, theme.strong_border)
-        })
+        .map(|this| crate::panel::floating(this, theme, theme.strong_border))
         .w(px(CARD_WIDTH))
         .max_w_full()
         .flex()

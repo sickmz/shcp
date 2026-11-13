@@ -416,16 +416,6 @@ impl FilesView {
         &self.path
     }
 
-    /// The keyboard is in the list or in the header's filter, which is outside the list's focus
-    /// subtree: the card is the lit one.
-    pub(crate) fn contains_focus(&self, window: &Window, cx: &App) -> bool {
-        self.focus.contains_focused(window, cx)
-            || self
-                .filter_input
-                .focus_handle(cx)
-                .contains_focused(window, cx)
-    }
-
     /// Its card keeps the tools in sight without the pointer, so nothing goes from under the
     /// user's hands: the filter has the keyboard or some text, or the menu of the tools is open.
     pub(crate) fn holds_tools(&self, window: &Window, cx: &App) -> bool {

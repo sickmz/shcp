@@ -99,8 +99,6 @@ pub(crate) struct Workspace {
     /// No tab was open yet: the empty state makes its entrance. Closing the last tab, later,
     /// brings it back at once.
     first_empty_state: bool,
-    /// What the window was last told to do with its backdrop.
-    translucent: bool,
     /// The notice is expanded to the full text of all of them.
     pub(crate) notices_open: bool,
     /// The pointer is on the notice, not expanded.
@@ -170,7 +168,6 @@ impl Workspace {
                 crate::theme::apply(&settings, &engine, cx);
             }),
         ];
-        let translucent = state.read(cx).settings.translucent_window;
         let workspace = Self {
             state,
             sidebar,
@@ -187,7 +184,6 @@ impl Workspace {
             reconnect_timers: HashMap::new(),
             saved_tabs: SavedTabs::default(),
             first_empty_state: true,
-            translucent,
             notices_open: false,
             notice_hovered: false,
             notices_reveal: motion::Reveal::new(false),
@@ -2044,16 +2040,7 @@ impl Workspace {
             ],
             vec![nav, tools, close],
         );
-        let frame = match theme.material() {
-            Some(material) => {
-                let active = files.read(cx).contains_focus(window, cx);
-                // Alone, a card has nothing to stand out from.
-                let alone = self.tabs[index].files_alone(cx);
-                crate::terminal_material::frame(material, active, active && !alone)
-            }
-            None => panel::frame(&theme, theme.bg),
-        };
-        frame
+        panel::frame(&theme, theme.bg)
             .id("files-card")
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                 let animated = this.animated(cx);
@@ -2348,16 +2335,10 @@ impl Workspace {
                     .gap(px(8.))
                     // A way to go somewhere: a capsule, as the rows of the sidebar.
                     .rounded_full()
-                    // Its groove, as ever. A card of the field would be the strip it sits on, cut
-                    // out of itself: with a material it gets the crests of a card instead.
+                    // Its groove, as ever.
                     .bg(theme.track)
-                    .map(|this| match theme.material() {
-                        Some(material) => this.relative().child(crate::terminal_material::crests(
-                            material,
-                            crate::panel::CAPSULE,
-                        )),
-                        None => this.border_1().border_color(theme.border),
-                    })
+                    .border_1()
+                    .border_color(theme.border)
                     .cursor_pointer()
                     .text_size(crate::theme::ui_px(13.))
                     .text_color(theme.text_muted)
@@ -2704,13 +2685,7 @@ impl Workspace {
     /// A card of its own under the others.
     fn dock_card(&self, theme: &theme::Theme, dock_amount: f32) -> impl IntoElement + use<> {
         let measured = self.dock_height.clone();
-        // In the material of the others: never the lit one, it does
-        // not take the keyboard as a card.
-        let frame = match theme.material() {
-            Some(material) => crate::terminal_material::frame(material, false, false),
-            None => panel::frame(theme, theme.bg),
-        };
-        let inner = frame
+        let inner = panel::frame(theme, theme.bg)
             .flex_none()
             .overflow_hidden()
             .child(self.dock.clone())
@@ -2758,13 +2733,6 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let translucent = self.state.read(cx).settings.translucent_window;
-        if self.translucent != translucent {
-            self.translucent = translucent;
-            window.set_background_appearance(crate::theme::window_background(
-                &self.state.read(cx).settings,
-            ));
-        }
         self.follow_terminal(cx);
         self.sync_open_tabs(cx);
         self.sync_shared(window, cx);
@@ -2790,14 +2758,7 @@ impl Render for Workspace {
             .relative()
             .size_full()
             .flex()
-            // A theme with a material shows its field behind everything, the sidebar too.
-            .map(|this| match theme.material() {
-                Some(material) => this.child(crate::terminal_material::backdrop(
-                    material,
-                    theme.window_bg.a,
-                )),
-                None => this.bg(theme.window_bg),
-            })
+            .bg(theme.window_bg)
             .text_color(theme.text)
             .text_size(crate::theme::ui_px(14.))
             .font_family(crate::theme::ui_font())

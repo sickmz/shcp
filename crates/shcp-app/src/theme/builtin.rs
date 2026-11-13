@@ -1,5 +1,4 @@
-//! Built-in themes: cool Nocturne and warm Prune, both in smoked glass unless the user turns
-//! the effects off.
+//! Built-in themes: cool Nocturne and warm Prune.
 //! All keep the user's configurable accent.
 use super::{Theme, to_rgb};
 use gpui::{Hsla, Rgba};
@@ -7,7 +6,7 @@ use shcp_core::Accent;
 use shcp_core::term::Palette;
 
 /// The hue of the grays, and of the blue accent.
-pub(crate) const HUE: f32 = 268.;
+const HUE: f32 = 268.;
 /// How much of that hue the grays take.
 const TINT: f32 = 0.18;
 
@@ -100,36 +99,34 @@ pub(crate) fn build(name: &str, accent: Accent) -> Theme {
     }
 }
 
-/// The smoked-glass reference as theme tokens: plum charcoal, brown shadows and a restrained
-/// copper selection. Its cards and its window take the material too: see `Theme::material`.
+/// Warm charcoal, brown shadows and a restrained copper in the muted text.
 fn prune(accent: Accent) -> Theme {
     let mut theme = nocturne(accent);
     let color = |hex| -> Hsla { gpui::rgb(hex).into() };
     let ink = color(0xece3df);
     theme.name = PRUNE.into();
-    // One plum, at three depths: a modal's side column, on `surface`, and its content, on
-    // `elevated`, must read as two shades of one color and not as a gray beside a purple.
-    theme.bg = color(0x2e272b);
-    theme.surface = color(0x2b2428);
-    theme.elevated = color(0x362c32);
-    theme.input_bg = color(0x211d1f);
+    // The terminals' warm charcoal, at three depths: a modal's side column, on `surface`, and
+    // its content, on `elevated`, read as two shades of one color.
+    theme.bg = color(0x2b2927);
+    theme.surface = color(0x282624);
+    theme.elevated = color(0x312f2c);
+    theme.input_bg = color(0x1f1d1b);
     theme.border = Hsla { a: 0.095, ..ink };
     theme.strong_border = Hsla { a: 0.17, ..ink };
     theme.text = ink;
     theme.text_muted = color(0xc2b2ac);
     theme.text_disabled = color(0xa59690);
     theme.hover = Hsla { a: 0.055, ..ink };
-    theme.active = color(0x402e2b);
+    theme.active = color(0x38322e);
     theme.scrim = Hsla {
         a: 0.46,
-        ..color(0x211d1f)
+        ..color(0x1f1d1b)
     };
-    theme.window_bg = color(0x211d1f);
-    theme.track = color(0x362c32);
-    // The reference's surface where no tint of the material reaches: see `Theme::material`.
+    theme.window_bg = color(0x1f1d1b);
+    theme.track = color(0x312f2c);
     theme.terminal_bg = color(0x22201e);
-    // Keep the engine's default background exactly aligned with the UI: default
-    // cells must remain transparent to the shared panel material.
+    // Keep the engine's default background exactly aligned with the UI: default cells must
+    // remain transparent to the card they are on.
     theme.palette.bg = to_rgb(theme.terminal_bg);
     theme.palette.fg = to_rgb(ink);
     theme.terminal_cursor = ink;
@@ -189,7 +186,6 @@ fn nocturne(accent: Accent) -> Theme {
         lit_line: oklch(lit_l, lit_c, accent, 0.42),
         scrim: oklch(0.1, 0.01, h, 0.46),
         window_bg: window,
-        panel_alpha: 1.,
         track: raise,
         terminal_bg: stage,
         terminal_selection: oklch(lit_l, lit_c, accent, 0.3),

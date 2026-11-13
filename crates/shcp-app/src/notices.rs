@@ -143,9 +143,7 @@ pub(crate) fn label(workspace: &Workspace, cx: &mut Context<Workspace>) -> Optio
         .pl(px(10.))
         .pr(px(6.))
         .rounded(px(crate::theme::RADIUS_CONTROL))
-        .map(|this| {
-            crate::panel::floating(this, &theme, crate::theme::RADIUS_CONTROL, theme.border)
-        })
+        .map(|this| crate::panel::floating(this, &theme, theme.border))
         .cursor_pointer()
         .text_size(ui_px(12.))
         .text_color(text_color)
@@ -293,7 +291,7 @@ pub(crate) fn list(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option
         .flex()
         .flex_col()
         .rounded(px(crate::theme::RADIUS_CARD))
-        .map(|this| crate::panel::floating(this, &theme, crate::theme::RADIUS_CARD, theme.border))
+        .map(|this| crate::panel::floating(this, &theme, theme.border))
         .cursor_pointer()
         .text_size(ui_px(12.))
         .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {

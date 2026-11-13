@@ -409,21 +409,14 @@ pub(crate) fn card(theme: &Theme, width: f32) -> Div {
         .gap(px(12.))
 }
 
-/// What every dialog looks like, whatever its layout. `border` is drawn when the theme has no
-/// material.
+/// What every dialog looks like, whatever its layout.
 pub(crate) fn card_frame(theme: &Theme, border: Hsla) -> Div {
     div()
         .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .rounded(px(crate::theme::RADIUS_CARD))
-        // In a theme with a material a dialog is a card of it, lit.
-        .map(|this| match theme.material() {
-            Some(material) => this.relative().child(crate::terminal_material::layers(
-                material.opaque(),
-                true,
-                true,
-            )),
-            None => this.border_1().border_color(border).bg(theme.elevated),
-        })
+        .border_1()
+        .border_color(border)
+        .bg(theme.elevated)
         .shadow(crate::theme::float_shadow())
         .text_size(crate::theme::ui_px(13.))
         .text_color(theme.text)

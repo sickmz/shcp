@@ -84,7 +84,7 @@ fn drag_chip(theme: &Theme, border: Hsla, ui_font: bool, text: String) -> Div {
     div()
         .px(px(10.))
         .rounded_full()
-        .map(|this| crate::panel::floating(this, theme, crate::panel::CAPSULE, border))
+        .map(|this| crate::panel::floating(this, theme, border))
         .shadow(crate::theme::float_shadow())
         .when(ui_font, |this| this.font_family(crate::theme::ui_font()))
         .text_size(crate::theme::ui_px(13.))

@@ -247,7 +247,6 @@ fn build(name: SharedString, kind: Option<&str>, colors: &Colors) -> Theme {
         lit_line: alpha(accent, 0.42),
         scrim: hsla(0., 0., 0., if is_light { 0.28 } else { 0.5 }),
         window_bg: surface,
-        panel_alpha: 1.,
         track: alpha(text, if is_light { 0.06 } else { 0.05 }),
         terminal_bg,
         terminal_selection: colors

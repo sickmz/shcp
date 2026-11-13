@@ -50,7 +50,7 @@ impl Render for Tooltip {
             .items_center()
             .gap(px(8.))
             .rounded(px(crate::theme::RADIUS_CONTROL))
-            .map(|this| crate::panel::floating(this, theme, crate::theme::RADIUS_CONTROL, border))
+            .map(|this| crate::panel::floating(this, theme, border))
             .shadow(crate::theme::float_shadow())
             .text_size(crate::theme::ui_px(12.))
             .text_color(theme.text)

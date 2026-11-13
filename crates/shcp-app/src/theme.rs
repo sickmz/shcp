@@ -6,12 +6,8 @@ pub(crate) mod icon_theme;
 pub(crate) mod open_vsx;
 mod vscode;
 
-use crate::terminal_material::Material;
 use crate::widgets::host_color::HostColor;
-use gpui::{
-    App, BoxShadow, Global, Hsla, Pixels, SharedString, WindowAppearance,
-    WindowBackgroundAppearance, hsla, point, px,
-};
+use gpui::{App, BoxShadow, Global, Hsla, Pixels, SharedString, WindowAppearance, hsla, point, px};
 use shcp_core::{
     Density, EngineHandle, Settings,
     term::{Palette, Rgb},
@@ -61,10 +57,8 @@ pub(crate) struct Theme {
     /// The accent as a line: outlines of idle host tiles and of what is on.
     pub lit_line: Hsla,
     pub scrim: Hsla,
-    /// What the window shows between its panels: `surface`, see-through if asked for.
+    /// What the window shows between its panels.
     pub window_bg: Hsla,
-    /// How much of the window's backdrop a panel lets through: 1 for none.
-    pub panel_alpha: f32,
     /// The groove the tabs sit in.
     pub track: Hsla,
     pub terminal_bg: Hsla,
@@ -90,69 +84,6 @@ impl Theme {
             self.lit_c
         };
         builtin::oklch(self.lit_l, chroma, color.hue(), 1.)
-    }
-
-    /// The smoked glass of the cards and of the window. Prune has the reference's own warm
-    /// colors. Nocturne has the same effects in its own cool hue, and a window lighter than its
-    /// cards, as it always was. A theme from a file has them in its accent, thinned into its own
-    /// background, over a window that keeps most of its own color. With the effects off in
-    /// Settings no theme has it. The strengths are in `Material::smoked`.
-    pub(crate) fn material(&self) -> Option<Material> {
-        if !EFFECTS.load(Ordering::Relaxed) {
-            return None;
-        }
-        let material = Material {
-            alpha: self.panel_alpha,
-            radius: RADIUS_CARD,
-            ..Material::smoked(self.terminal_bg)
-        };
-        if self.file.is_some() {
-            let accent = Hsla {
-                a: 1.,
-                ..self.accent
-            };
-            let (near, far) = (
-                vscode::mix(accent, self.terminal_bg, 0.5),
-                vscode::mix(accent, self.terminal_bg, 0.3),
-            );
-            let window = Hsla {
-                a: 0.6,
-                ..self.window_bg
-            };
-            // On a light surface the crests are white and the line around a card is faint.
-            let (glass, line) = if self.is_light {
-                (gpui::white(), 0.10)
-            } else {
-                (self.text, 0.4)
-            };
-            return Some(Material {
-                separation: Hsla {
-                    a: line,
-                    ..gpui::black()
-                },
-                ..material.recolored([near, far, near, far], glass, window)
-            });
-        }
-        if self.name == builtin::PRUNE {
-            Some(material)
-        } else if self.name == builtin::NOCTURNE {
-            let hue = builtin::HUE;
-            Some(material.recolored(
-                [
-                    builtin::oklch(0.50, 0.07, hue, 1.),
-                    builtin::oklch(0.36, 0.07, hue - 18., 1.),
-                    builtin::oklch(0.46, 0.07, hue + 17., 1.),
-                    builtin::oklch(0.42, 0.06, hue - 18., 1.),
-                ],
-                builtin::oklch(0.93, 0.015, hue, 1.),
-                Hsla {
-                    a: 0.04,
-                    ..gpui::white()
-                },
-            ))
-        } else {
-            None
-        }
     }
 
     /// The tile a session shows its host's color on, and the deck of a split one.
@@ -303,7 +234,6 @@ pub(crate) fn with_accent(theme: Theme, settings: &Settings) -> Theme {
 
 /// Makes `settings` take effect: theme, terminal colors, font and row scale.
 pub(crate) fn apply(settings: &Settings, engine: &EngineHandle, cx: &mut App) {
-    EFFECTS.store(settings.glass_effects, Ordering::Relaxed);
     let appearance = cx.window_appearance();
     let name = active_name(settings, appearance);
     let themes = &cx.global::<ThemeCatalog>().themes;
@@ -322,10 +252,6 @@ pub(crate) fn apply(settings: &Settings, engine: &EngineHandle, cx: &mut App) {
         // `ThemeCatalog::load` always holds the bundled themes, so this is never reached.
         .unwrap_or_else(|| builtin::build(builtin::NOCTURNE, shcp_core::Accent::default()));
     theme = with_accent(theme, settings);
-    if settings.translucent_window {
-        theme.window_bg.a = if theme.is_light { 0.88 } else { 0.84 };
-        theme.panel_alpha = if theme.is_light { 0.93 } else { 0.86 };
-    }
     engine.set_terminal_palette(&theme.palette);
     cx.set_global(theme);
     // A theme that is gone leaves the app's own icons.
@@ -371,15 +297,6 @@ pub(crate) const RADIUS_SMALL: f32 = 6.;
 /// Radius for what fills a card up to its edge, so it stays inside the card's border.
 pub(crate) const PANEL_INNER_RADIUS: f32 = RADIUS_CARD - 1.;
 
-/// What the window asks of the system behind it.
-pub(crate) fn window_background(settings: &Settings) -> WindowBackgroundAppearance {
-    if settings.translucent_window {
-        WindowBackgroundAppearance::Blurred
-    } else {
-        WindowBackgroundAppearance::Opaque
-    }
-}
-
 /// The soft shadow of what floats over everything else: menus, modals, tooltips.
 pub(crate) fn float_shadow() -> Vec<BoxShadow> {
     let shadow = |alpha, y: f32, blur: f32| BoxShadow {
@@ -414,8 +331,6 @@ pub(crate) fn load_fonts(cx: &App) {
 const UI_FAMILY: &str = "Instrument Sans";
 pub(crate) const MONO_FAMILY: &str = "Geist Mono";
 
-/// The user wants the materials of the themes: see `Theme::material`.
-static EFFECTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static UI_SCALE: AtomicU32 = AtomicU32::new(1f32.to_bits());
 static ROW_SCALE: AtomicU32 = AtomicU32::new(1f32.to_bits());
 

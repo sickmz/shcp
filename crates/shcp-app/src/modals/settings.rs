@@ -1128,19 +1128,10 @@ fn icon_samples(ui: &Theme, item: Option<&IconTheme>) -> impl IntoElement + use<
     div().flex().flex_none().gap(px(4.)).children(samples)
 }
 
-/// A theme's main colors, as overlapping dots. One of the app's own with a material shows the
-/// tints of it instead: its other colors are close from one to the other and would tell nothing.
+/// A theme's main colors, as overlapping dots.
 fn theme_dots(ui: &Theme, item: &Theme) -> impl IntoElement + use<> {
     let border = ui.border;
-    let colors = match item.material().filter(|_| item.file.is_none()) {
-        Some(material) => [
-            item.terminal_bg,
-            material.top[0].color,
-            material.left[0].color,
-            material.bottom.color,
-        ],
-        None => [item.bg, item.surface, item.accent, item.success],
-    };
+    let colors = [item.bg, item.surface, item.accent, item.success];
     let dots = colors
         .into_iter()
         .enumerate()
@@ -1257,26 +1248,6 @@ impl SettingsModal {
                 ],
                 settings.density,
                 self.setter(|s, v| s.density = v, cx),
-            ),
-        );
-        add(
-            "Translucent window",
-            "Lets the desktop show through, blurred",
-            switch(
-                theme,
-                "translucent-window",
-                settings.translucent_window,
-                self.setter(|s, v| s.translucent_window = v, cx),
-            ),
-        );
-        add(
-            "Glass effects",
-            "Shaded surfaces and light along the edges, in the themes that have them",
-            switch(
-                theme,
-                "glass-effects",
-                settings.glass_effects,
-                self.setter(|s, v| s.glass_effects = v, cx),
             ),
         );
         add(
@@ -2144,12 +2115,7 @@ impl SettingsModal {
             .gap(px(1.))
             .p(px(8.))
             .rounded_l(px(crate::theme::PANEL_INNER_RADIUS))
-            // Over a material, a shade of it and not a color of its own.
-            .bg(if theme.material().is_some() {
-                gpui::black().opacity(0.14)
-            } else {
-                theme.surface
-            })
+            .bg(theme.surface)
             .border_r_1()
             .border_color(theme.border)
             .child(

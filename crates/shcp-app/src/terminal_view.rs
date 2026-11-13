@@ -777,13 +777,7 @@ impl TerminalView {
                 heading,
                 reconnecting: false,
                 docked: self.had_session,
-                // Over a card of material nothing: a flat fill would put out its light until
-                // the shell is there, and the terminal under it is still empty.
-                background: if theme.material().is_some() {
-                    gpui::transparent_black()
-                } else {
-                    theme.terminal_bg
-                },
+                background: theme.terminal_bg,
                 focus: self.focus.clone(),
                 shell_step: true,
                 owner: cx.entity_id(),
@@ -837,10 +831,6 @@ impl TerminalView {
                     theme,
                     if missed { theme.error } else { theme.border },
                 )
-            })
-            // The material has no border to turn red.
-            .when(missed && theme.material().is_some(), |this| {
-                this.border_1().border_color(theme.error)
             })
             .text_size(crate::theme::ui_px(12.))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
@@ -997,9 +987,7 @@ fn link_hint(theme: &Theme, url: &str) -> impl IntoElement + use<> {
                 .py(px(3.))
                 .truncate()
                 .rounded(px(crate::theme::RADIUS_SMALL))
-                .map(|this| {
-                    crate::panel::floating(this, theme, crate::theme::RADIUS_SMALL, theme.border)
-                })
+                .map(|this| crate::panel::floating(this, theme, theme.border))
                 .text_size(crate::theme::ui_px(12.))
                 .text_color(theme.text_muted)
                 .child(format!("Ctrl+click to open {url}")),

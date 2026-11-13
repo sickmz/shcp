@@ -19,44 +19,19 @@ pub(crate) fn frame(theme: &Theme, bg: Hsla) -> Div {
         .rounded(px(RADIUS_CARD))
         .border_1()
         .border_color(theme.border)
-        // A flat fill: gpui does not dither, and a faint gradient this long shows up as bands.
-        .bg(Hsla {
-            a: theme.panel_alpha,
-            ..bg
-        })
+        .bg(bg)
 }
 
-/// The `radius` of what is `rounded_full`, for `floating`.
-pub(crate) const CAPSULE: f32 = 999.;
-
 /// The surface of what floats over the window or stands out of it: a menu, a tooltip, a dialog,
-/// a field. In a theme with a material it is a lit card of it, opaque, with `radius` for its
-/// corners, the same as `this` is rounded with; otherwise the raised fill and `border`. To call
-/// before `this` gets its children: the material goes under them.
-pub(crate) fn floating<E: Styled + ParentElement>(
-    this: E,
-    theme: &Theme,
-    radius: f32,
-    border: Hsla,
-) -> E {
-    match theme.material() {
-        Some(material) => this.relative().child(crate::terminal_material::layers(
-            crate::terminal_material::Material {
-                radius,
-                ..material.opaque()
-            },
-            true,
-            true,
-        )),
-        None => this.border_1().border_color(border).bg(theme.elevated),
-    }
+/// a field. The raised fill and `border`.
+pub(crate) fn floating<E: Styled>(this: E, theme: &Theme, border: Hsla) -> E {
+    this.border_1().border_color(border).bg(theme.elevated)
 }
 
 /// A card that floats over the rest: rounded as a card, with the surface of [`floating`] and a
-/// shadow. To call before `this` gets its children, as [`floating`].
-pub(crate) fn floating_card<E: Styled + ParentElement>(this: E, theme: &Theme, border: Hsla) -> E {
-    floating(this.rounded(px(RADIUS_CARD)), theme, RADIUS_CARD, border)
-        .shadow(crate::theme::float_shadow())
+/// shadow.
+pub(crate) fn floating_card<E: Styled>(this: E, theme: &Theme, border: Hsla) -> E {
+    floating(this.rounded(px(RADIUS_CARD)), theme, border).shadow(crate::theme::float_shadow())
 }
 
 /// The top of a card: what it shows at the left, what acts on it at the right. The tools show as

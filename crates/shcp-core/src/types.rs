@@ -168,11 +168,6 @@ pub struct Settings {
     /// Which look the rest of these settings were last brought up to. Missing in older files.
     #[serde(default)]
     pub style_version: u32,
-    /// Lets the desktop show through the window, blurred.
-    pub translucent_window: bool,
-    /// The smoked glass of the themes that have one: the shaded surfaces and the light along
-    /// their edges. Off, every theme is flat.
-    pub glass_effects: bool,
     /// The highlight glides to the tab or host picked with the mouse, instead of jumping there.
     pub animated_selection: bool,
     /// Open the `LocalForward` tunnels on connecting; otherwise they wait for a click, so the
@@ -282,7 +277,6 @@ impl Settings {
         if self.sidebar_width == 260. {
             self.sidebar_width = 248.;
         }
-        self.translucent_window = false;
         self.style_version = STYLE_VERSION;
     }
     /// Gives a group another name, keeping its place, its hosts and whether it is closed. Taking a
@@ -629,8 +623,6 @@ impl Default for Settings {
             density: Density::Default,
             accent: Accent::Blue,
             style_version: STYLE_VERSION,
-            translucent_window: false,
-            glass_effects: true,
             animated_selection: true,
             auto_open_forwards: false,
             auto_open_transfers: true,
@@ -1041,6 +1033,7 @@ mod tests {
 
     #[test]
     fn older_settings_take_the_new_look_once_and_keep_what_was_chosen() {
+        // `translucent_window` is a setting that no longer exists: an old file still loads.
         let mut old: Settings = toml::from_str(
             "theme = \"Dark\"\nlight_theme = \"Solarized\"\nui_font_size = 13.0\n\
              terminal_font_family = \"Cascadia Mono\"\nterminal_font_size = 15.0\n\
@@ -1054,13 +1047,10 @@ mod tests {
         assert_eq!(old.ui_font_size, 14.);
         assert_eq!(old.terminal_font_family, "Geist Mono");
         assert_eq!(old.terminal_font_size, 15.);
-        assert!(!old.translucent_window);
         // From now on the choices are the user's, old defaults included.
         old.terminal_font_family = "Cascadia Mono".into();
-        old.translucent_window = true;
         old.migrate_style();
         assert_eq!(old.terminal_font_family, "Cascadia Mono");
-        assert!(old.translucent_window);
     }
 
     #[test]

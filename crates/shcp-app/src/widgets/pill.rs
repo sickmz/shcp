@@ -3,10 +3,7 @@
 use crate::motion::PillMotion;
 use crate::theme::Theme;
 use gpui::prelude::*;
-use gpui::{
-    App, BorderStyle, Bounds, Edges, Hsla, Pixels, Window, canvas, point, px, quad,
-    transparent_black,
-};
+use gpui::{App, BorderStyle, Bounds, Hsla, Pixels, Window, canvas, point, px, quad};
 use shcp_core::Settings;
 use std::{cell::RefCell, rc::Rc, time::Instant};
 
@@ -42,29 +39,19 @@ impl SlidingPill {
         }
     }
 
-    /// Without the accent: the neutral fill of the current item, with a faint edge. In a theme
-    /// with a material it has the crests of a card too: light along the top, less at the bottom.
+    /// Without the accent: the neutral fill of the current item, with a faint edge.
     pub(crate) fn neutral(&self, theme: &Theme, radius: f32) -> impl IntoElement + use<> {
         self.painted(
             theme.active,
-            Some(Hsla {
+            Hsla {
                 a: 0.05,
                 ..theme.text
-            }),
-            theme
-                .material()
-                .map(|material| (material.top_crest, material.bottom_crest)),
+            },
             radius,
         )
     }
 
-    fn painted(
-        &self,
-        fill: Hsla,
-        border: Option<Hsla>,
-        crests: Option<(Hsla, Hsla)>,
-        radius: f32,
-    ) -> impl IntoElement + use<> {
+    fn painted(&self, fill: Hsla, border: Hsla, radius: f32) -> impl IntoElement + use<> {
         let motion = self.0.clone();
         canvas(
             |_, _, _| {},
@@ -81,39 +68,10 @@ impl SlidingPill {
                     pill,
                     px(radius),
                     fill,
-                    px(0.),
-                    transparent_black(),
+                    px(1.),
+                    border,
                     BorderStyle::Solid,
                 ));
-                if let Some(border) = border {
-                    window.paint_quad(quad(
-                        pill,
-                        px(radius),
-                        Hsla { a: 0., ..border },
-                        px(1.),
-                        border,
-                        BorderStyle::Solid,
-                    ));
-                }
-                // A border on one side tapers to nothing around the pill's ends.
-                if let Some((top, bottom)) = crests {
-                    let (none, line) = (px(0.), px(1.));
-                    for (color, top, bottom) in [(top, line, none), (bottom, none, line)] {
-                        window.paint_quad(quad(
-                            pill,
-                            px(radius),
-                            transparent_black(),
-                            Edges {
-                                top,
-                                bottom,
-                                left: none,
-                                right: none,
-                            },
-                            color,
-                            BorderStyle::Solid,
-                        ));
-                    }
-                }
                 if moving {
                     window.request_animation_frame();
                 }
