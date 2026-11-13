@@ -13,7 +13,11 @@ use gpui::{
 };
 use shcp_core::TerminalHandle;
 use shcp_core::term::{CursorInfo, CursorShape, GridPoint, Rgb};
-use std::{cell::Cell, rc::Rc};
+use std::{
+    cell::Cell,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 #[derive(Clone, Copy)]
 pub struct TerminalMetrics {
@@ -23,7 +27,13 @@ pub struct TerminalMetrics {
     pub cols: u16,
     pub rows: u16,
     pub caret: Bounds<Pixels>,
+    /// The size the bounds ask for, when it is not the one above, and since when they have.
+    pub wanted: Option<((u16, u16), Instant)>,
 }
+
+/// How long the bounds must ask for the same size before the terminal takes it. A window being
+/// dragged goes through many sizes, and the program would redraw for each of them.
+const RESIZE_SETTLE: Duration = Duration::from_millis(120);
 
 pub type SharedMetrics = Rc<Cell<Option<TerminalMetrics>>>;
 
@@ -200,12 +210,28 @@ impl Element for TerminalElement {
             window.request_animation_frame();
         }
         // While a panel glides past, the terminal keeps its size, cut off by the panel if need be.
-        let (cols, rows) = match previous.filter(|_| layout_moving) {
-            Some(metrics) => (metrics.cols, metrics.rows),
-            None => (
-                ((bounds.size.width / cell_width).floor() as u16).max(2),
-                ((bounds.size.height / line_height).floor() as u16).max(1),
-            ),
+        let fit = (
+            ((bounds.size.width / cell_width).floor() as u16).max(2),
+            ((bounds.size.height / line_height).floor() as u16).max(1),
+        );
+        let mut wanted = None;
+        let (cols, rows) = match previous {
+            Some(metrics) if layout_moving => (metrics.cols, metrics.rows),
+            // The same goes for a window being dragged: one resize, once it has stopped.
+            Some(metrics) if fit != (metrics.cols, metrics.rows) => {
+                let since = metrics
+                    .wanted
+                    .filter(|(size, _)| *size == fit)
+                    .map_or_else(Instant::now, |(_, since)| since);
+                if since.elapsed() >= RESIZE_SETTLE {
+                    fit
+                } else {
+                    wanted = Some((fit, since));
+                    window.request_animation_frame();
+                    (metrics.cols, metrics.rows)
+                }
+            }
+            _ => fit,
         };
         if previous.is_none_or(|m| m.cols != cols || m.rows != rows) {
             self.terminal.resize(cols, rows);
@@ -228,6 +254,7 @@ impl Element for TerminalElement {
             cols,
             rows,
             caret,
+            wanted,
         }));
         let cell = (cell_width, line_height);
         let origin = bounds.origin;

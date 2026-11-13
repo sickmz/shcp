@@ -275,11 +275,16 @@ impl TerminalHandle {
     }
     /// Reports a mouse event to the application. Returns false when it was not wanted.
     pub fn mouse(&self, input: MouseInput) -> bool {
+        self.mouse_repeated(input, 1)
+    }
+    /// The same event `times` over, as the turns of a wheel are. They go out together, so the
+    /// application has them all before it draws again.
+    pub fn mouse_repeated(&self, input: MouseInput, times: usize) -> bool {
         let mode = *self.0.state.lock().term.mode();
         match mouse::encode(input, mode) {
             Some(bytes) => {
                 if self.is_alive() {
-                    self.send(TerminalCommand::Write(bytes));
+                    self.send(TerminalCommand::Write(bytes.repeat(times)));
                 }
                 true
             }
@@ -345,9 +350,9 @@ impl TerminalHandle {
                 alt: false,
                 shift: false,
             };
-            for _ in 0..delta_lines.unsigned_abs().min(1000) {
-                self.write(keys::encode(key, app));
-            }
+            // In one piece, so the application has them all before it draws again.
+            let times = delta_lines.unsigned_abs().min(1000) as usize;
+            self.write(keys::encode(key, app).repeat(times));
         } else {
             state.term.scroll_display(Scroll::Delta(delta_lines));
             drop(state);

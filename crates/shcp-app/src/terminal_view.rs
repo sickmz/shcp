@@ -27,6 +27,10 @@ use shcp_core::{
 };
 use std::{cell::Cell, collections::HashSet, rc::Rc, time::Duration};
 
+/// The most wheel turns one scroll event reports to an application that asked for the mouse. It
+/// draws again for them, and a fast wheel sends many events anyway.
+const MAX_WHEEL_EVENTS: usize = 5;
+
 /// Inset above the first terminal row, also used to align the sidebar's groups.
 pub(crate) const CONTENT_TOP_PADDING: f32 = 14.;
 
@@ -674,16 +678,17 @@ impl TerminalView {
             } else {
                 term::MouseButton::WheelDown
             };
-            for _ in 0..(lines.abs() as u32).min(50) {
-                self.terminal.mouse(MouseInput {
+            self.terminal.mouse_repeated(
+                MouseInput {
                     action: MouseAction::Press,
                     button: Some(button),
                     point,
                     ctrl: event.modifiers.control,
                     alt: event.modifiers.alt,
                     shift: false,
-                });
-            }
+                },
+                (lines.abs() as usize).min(MAX_WHEEL_EVENTS),
+            );
             return;
         }
         if lines != 0. {
