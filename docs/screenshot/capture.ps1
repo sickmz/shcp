@@ -1,9 +1,9 @@
 # Sizes the shcp window and saves a picture of it, without touching anything inside it.
-#   .\capture.ps1 -Out docs\both.png [-Width 1272] [-Height 795]
+#   .\capture.ps1 -Out docs\shcp.png [-Width 1400] [-Height 875]
 param(
     [Parameter(Mandatory)][string]$Out,
-    [int]$Width = 1272,
-    [int]$Height = 795
+    [int]$Width = 1400,
+    [int]$Height = 875
 )
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing

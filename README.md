@@ -1,23 +1,29 @@
 # shcp
 
-ssh and sftp client for Windows written in Rust with [gpui](https://gpui.rs).
+An SSH and SFTP client for Windows, written in Rust with [gpui](https://gpui.rs).
 
-![A terminal and the files of its folder side by side, with hosts grouped in the sidebar](docs/both.png)
+![A terminal and the files of its folder side by side, with hosts grouped in the sidebar](docs/shcp.png)
 
-- Terminals keep running when you close the app, and you can pick them up from another machine (needs tmux on the server)
-- Terminal, alone or next to its SFTP browser
-- Tabs and split terminals share one SSH connection per host. Tabs reopen when you start the app again
-- Group and reorder hosts in the sidebar
-- Search terminal output, open links with Ctrl+click, and save session logs
-- Automatic reconnection without losing terminal output, and resumable file transfers
-- Preview files, change permissions, and edit remote files in your local editor
-- Drop files or paste screenshots into the terminal to upload them
-- Key, SSH agent, password and keyboard-interactive authentication, including two-factor prompts
-- Reads `~/.ssh/config`, including `Include`, `Match`, `ProxyJump` and `ProxyCommand`
-- Local and remote port forwarding, SOCKS proxies, and optional SSH agent forwarding
-- Saved commands and startup commands per host
-- Custom shortcuts, tab names, and themes from [Open VSX](https://open-vsx.org) or VS Code theme files.
-- Import and export hosts and settings.
+## Why
+
+I built shcp for my day job, i wanted a lightweight SSH client for Windows with
+a file browser that follows the shell I am working in.
+
+As I move around in a terminal the file browser beside it follows my current folder. I can preview
+files, change permissions, open remote files in my local editor and save them back, drop a file
+or paste a screenshot onto the terminal to upload it, with its path typed for me.
+
+With tmux on the server, every tab and split runs in its own tmux session, without me ever touching
+tmux. Closing the app, dropping the connection or switching PC brings back the same tabs, splits
+and output, and the tabs are shared live. If the server restarts, the shells come back in the folders they were in. Lost connections come back by
+themselves, and interrupted transfers resume where they stopped.
+
+It works with the SSH setup I already have. It reads `~/.ssh/config` (`Include`, `Match`,
+`ProxyJump`, `ProxyCommand`), uses my keys or the SSH agent, answers password and two-factor
+prompts, and runs every tab, port forward and SOCKS proxy over one connection per host. Hosts sit in
+groups in the sidebar, a command palette (Ctrl+Shift+K) takes me to any host, tab or command, and
+themes come from [Open VSX](https://open-vsx.org) or VS Code. It is a single native `.exe`, drawn
+on the GPU with gpui, that updates itself.
 
 ## Build
 

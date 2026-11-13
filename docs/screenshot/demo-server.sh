@@ -9,7 +9,9 @@ ROOT=/srv/shop
 RC=/tmp/shcp-demo-rc
 
 green=$'\e[1;32m' blue=$'\e[1;34m' yellow=$'\e[33m' cyan=$'\e[36m' reset=$'\e[0m'
-prompt="${green}deploy@shop-web-1${reset}:${blue}${ROOT}${reset}\$ "
+# The user the app shows in the card, so the prompt says the same.
+who=$(id -un)
+prompt="${green}${who}@shop-web-1${reset}:${blue}${ROOT}${reset}\$ "
 
 if [ "${1:-}" = clean ]; then
     [ -e "$ROOT/.shcp-demo" ] && sudo rm -rf "$ROOT"
@@ -40,7 +42,7 @@ done
 touch -d yesterday current logs releases shared deploy.sh compose.yaml Caddyfile README.md
 
 cat > "$RC" <<EOF
-PS1='\[${green}\]deploy@shop-web-1\[${reset}\]:\[${blue}\]\w\[${reset}\]\\$ '
+PS1='\[${green}\]${who}@shop-web-1\[${reset}\]:\[${blue}\]\w\[${reset}\]\\$ '
 PROMPT_COMMAND='printf "\033]7;file://shop-web-1%s\033\\\\" "\$PWD"'
 EOF
 
