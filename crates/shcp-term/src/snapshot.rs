@@ -67,37 +67,22 @@ impl TerminalHandle {
         let cursor = shape.and_then(|shape| {
             visible(content.cursor.point).map(|point| CursorInfo { point, shape })
         });
+        let screen = Screen {
+            offset: content.display_offset as i32,
+            rows: rows as i32,
+            cols,
+        };
         let selection = content
             .selection
             .filter(|s| {
-                s.end.line.0 + content.display_offset as i32 >= 0
-                    && s.start.line.0 + (content.display_offset as i32) < rows as i32
+                s.end.line.0 + screen.offset >= 0 && s.start.line.0 + screen.offset < screen.rows
             })
-            .map(|s| {
-                let clamp = |p: Point| {
-                    let row = p.line.0 + content.display_offset as i32;
-                    if row < 0 {
-                        GridPoint { row: 0, col: 0 }
-                    } else if row >= rows as i32 {
-                        GridPoint {
-                            row: rows - 1,
-                            col: cols - 1,
-                        }
-                    } else {
-                        GridPoint {
-                            row: row as u16,
-                            col: (p.column.0 as u16).min(cols - 1),
-                        }
-                    }
-                };
-                (clamp(s.start), clamp(s.end))
-            });
+            .map(|s| (screen.point(s.start), screen.point(s.end)));
         TermSnapshot {
             cols,
             rows,
             cells,
             cursor,
-            display_offset: content.display_offset,
             selection,
             search_hits,
             links,

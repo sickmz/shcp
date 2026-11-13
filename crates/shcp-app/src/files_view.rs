@@ -1,24 +1,25 @@
 //! Files tab: SFTP browser for one host (listing, navigation, selection, upload/download,
 //! mkdir/rename/delete). Remote results arrive as core events re-emitted by `AppState`.
-use crate::files_format as format;
+use crate::files_format;
 use crate::modals::{
     ModalLayer, confirm::ConfirmModal, folder_picker::FolderPicker, text_prompt::TextPrompt,
 };
 use crate::state::AppState;
 use crate::theme::icon_theme::file_icon;
-use crate::theme::{ActiveTheme as _, row_px};
+use crate::theme::{ActiveTheme as _, Theme, row_px};
 use crate::widgets::button::{Button, ButtonStyle};
 use crate::widgets::context_menu::{ContextMenu, MenuAnchor, MenuEntry, OpenMenu, handler};
 use crate::widgets::icon::{Icon, IconName};
-use crate::widgets::scrollbar::{ScrollDrag, ScrollMetrics, scrollbar};
+use crate::widgets::scrollbar::{ScrollDrag, list_scrollbar};
 use crate::widgets::text_input::{TextInput, TextInputEvent};
 use crate::widgets::tile::{Mark, tile};
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, Corner, Div, Entity, EventEmitter,
     ExternalPaths, FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent,
-    PathPromptOptions, Pixels, Point, ScrollStrategy, SharedString, Subscription,
-    UniformListScrollHandle, Window, anchored, canvas, deferred, div, img, point, px, uniform_list,
+    PathPromptOptions, Pixels, Point, ScrollStrategy, SharedString, Stateful, Subscription,
+    UniformListScrollHandle, WeakEntity, Window, anchored, canvas, deferred, div, img, point, px,
+    uniform_list,
 };
 use shcp_core::{
     EngineHandle, EntryKind, Event, HostId, NoticeLevel, RemoteEntry, RequestId, SearchScope,
@@ -28,6 +29,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     collections::HashSet,
+    fmt::Write as _,
     ops::Range,
     path::PathBuf,
     rc::Rc,
@@ -58,7 +60,7 @@ const ROW_H: f32 = 30.;
 /// Letters typed closer than this search together.
 const TYPE_AHEAD: Duration = Duration::from_millis(800);
 
-pub enum FilesEvent {
+pub(crate) enum FilesEvent {
     OpenTerminalHere(String),
     GoHereInTerminal(String),
     /// The files follow the folder of the terminal, or stop following it.
@@ -69,10 +71,8 @@ pub enum FilesEvent {
 fn moved_cursor(key: &str, cursor: Option<usize>, len: usize, page: usize) -> Option<usize> {
     let last = len.checked_sub(1)?;
     Some(match (key, cursor) {
-        ("home", _) => 0,
-        ("end", _) => last,
-        ("up", None) | ("pageup", None) => last,
-        (_, None) => 0,
+        ("end", _) | ("up" | "pageup", None) => last,
+        ("home", _) | (_, None) => 0,
         ("up", Some(at)) => at.saturating_sub(1),
         ("down", Some(at)) => (at + 1).min(last),
         ("pageup", Some(at)) => at.saturating_sub(page),
@@ -102,6 +102,26 @@ fn copy_name(name: &str, taken: &HashSet<String>) -> String {
         }
         number += 1;
     }
+}
+
+/// Cut and Copy of the selection, to paste it elsewhere.
+fn cut_copy_entries(this: &WeakEntity<FilesView>, ready: bool) -> [MenuEntry; 2] {
+    [
+        MenuEntry::item(
+            "Cut",
+            handler(this.clone(), |v, _, cx| v.pick_selected(true, cx)),
+        )
+        .icon(IconName::Forward)
+        .shortcut("Ctrl+X")
+        .disabled(!ready),
+        MenuEntry::item(
+            "Copy",
+            handler(this.clone(), |v, _, cx| v.pick_selected(false, cx)),
+        )
+        .icon(IconName::Copy)
+        .shortcut("Ctrl+C")
+        .disabled(!ready),
+    ]
 }
 
 /// The folder and the name of a remote path.
@@ -135,7 +155,7 @@ fn first_starting_with<'a>(names: impl Iterator<Item = &'a str>, typed: &str) ->
         .map(|(index, _)| index)
 }
 
-pub struct FilesView {
+pub(crate) struct FilesView {
     state: Entity<AppState>,
     modals: Entity<ModalLayer>,
     host: HostId,
@@ -214,9 +234,14 @@ pub struct FilesView {
 struct Preview {
     path: String,
     req: RequestId,
-    /// `None` while waiting, or for what is not text: `arrived` tells which.
-    text: Option<String>,
-    arrived: bool,
+    head: Head,
+}
+
+/// What came of reading the start of a file.
+enum Head {
+    Loading,
+    Text(String),
+    NotText,
 }
 
 /// The permissions of an entry, open in their popover.
@@ -267,7 +292,7 @@ impl Focusable for FilesView {
 }
 
 impl FilesView {
-    pub fn new(
+    pub(crate) fn new(
         state: Entity<AppState>,
         modals: Entity<ModalLayer>,
         host: HostId,
@@ -275,11 +300,7 @@ impl FilesView {
         cx: &mut Context<Self>,
     ) -> Self {
         let session = state.update(cx, |s, cx| s.connect_host(&host, cx));
-        let filter_input = cx.new(|cx| {
-            TextInput::new("Filter this folder", false, cx)
-                .quiet()
-                .clearable()
-        });
+        let filter_input = cx.new(|cx| TextInput::new("Filter this folder", cx).toolbar());
         let filter_focus = filter_input.focus_handle(cx);
         let focus = cx.focus_handle();
         let show_hidden = state.read(cx).settings.show_hidden_files;
@@ -386,18 +407,18 @@ impl FilesView {
         this
     }
 
-    pub fn host(&self) -> &HostId {
+    pub(crate) fn host(&self) -> &HostId {
         &self.host
     }
 
     /// The folder on screen; empty until the first listing arrives.
-    pub fn path(&self) -> &str {
+    pub(crate) fn path(&self) -> &str {
         &self.path
     }
 
     /// The keyboard is in the list or in the header's filter, which is outside the list's focus
     /// subtree: the card is the lit one.
-    pub fn contains_focus(&self, window: &Window, cx: &App) -> bool {
+    pub(crate) fn contains_focus(&self, window: &Window, cx: &App) -> bool {
         self.focus.contains_focused(window, cx)
             || self
                 .filter_input
@@ -407,17 +428,19 @@ impl FilesView {
 
     /// Its card keeps the tools in sight without the pointer, so nothing goes from under the
     /// user's hands: the filter has the keyboard or some text, or the menu of the tools is open.
-    pub fn holds_tools(&self, window: &Window, cx: &App) -> bool {
+    pub(crate) fn holds_tools(&self, window: &Window, cx: &App) -> bool {
         self.filter_input.focus_handle(cx).is_focused(window)
             || !self.filter_input.read(cx).text().trim().is_empty()
             || (self.menu.is_some() && self.menu_button == Some(ToolbarMenu::Folder))
     }
 
     fn session_connected(&self, cx: &App) -> bool {
-        self.state
-            .read(cx)
-            .session(self.session)
-            .is_some_and(|s| matches!(s.state, SessionState::Connected))
+        self.state.read(cx).session_connected(self.session)
+    }
+
+    /// A folder is showing and the connection is up: what acts on it can run.
+    fn ready(&self, cx: &App) -> bool {
+        !self.path.is_empty() && self.session_connected(cx)
     }
 
     fn notice(&self, level: NoticeLevel, message: String, cx: &mut Context<Self>) {
@@ -456,7 +479,7 @@ impl FilesView {
     }
 
     /// Shows a folder as a shell names it, now or as soon as the connection is up.
-    pub fn go_to(&mut self, path: String, cx: &mut Context<Self>) {
+    pub(crate) fn go_to(&mut self, path: String, cx: &mut Context<Self>) {
         if self.session_connected(cx) {
             self.home_requested = true;
             self.list_from_shell(path, cx);
@@ -478,7 +501,7 @@ impl FilesView {
         let path = if path.starts_with('/') {
             path
         } else {
-            format::join(
+            files_format::join(
                 if self.path.is_empty() {
                     "/"
                 } else {
@@ -520,7 +543,7 @@ impl FilesView {
     /// the folders the settings leave out.
     fn start_search(&mut self, query: String, everywhere: bool, cx: &mut Context<Self>) {
         self.end_search(cx);
-        if !query.is_empty() && !self.path.is_empty() && self.session_connected(cx) {
+        if !query.is_empty() && self.ready(cx) {
             let root = self.path.clone();
             let state = self.state.read(cx);
             let scope = SearchScope {
@@ -564,22 +587,18 @@ impl FilesView {
         self.apply_filter(cx);
     }
 
-    fn session_is_gone(&self, cx: &App) -> bool {
-        self.state.read(cx).session(self.session).is_none_or(|s| {
-            matches!(
-                s.state,
-                SessionState::Disconnected { .. } | SessionState::Failed { .. }
-            )
-        })
+    /// Forgets the answers awaited from a connection that is gone.
+    fn drop_pending(&mut self) {
+        self.pending_home = None;
+        self.pending_list = None;
+        self.pending_ops.clear();
+        self.uploads.clear();
     }
 
     /// Follows the host to a new connection, staying in the same folder.
     fn resume_on(&mut self, session: SessionId, cx: &mut Context<Self>) {
         self.session = session;
-        self.pending_home = None;
-        self.pending_list = None;
-        self.pending_ops.clear();
-        self.uploads.clear();
+        self.drop_pending();
         self.refresh(cx);
     }
 
@@ -590,7 +609,10 @@ impl FilesView {
                 id,
                 host,
                 state: SessionState::Connected,
-            } if *host == self.host && *id != self.session && self.session_is_gone(cx) => {
+            } if *host == self.host
+                && *id != self.session
+                && self.state.read(cx).session_gone(self.session) =>
+            {
                 self.resume_on(*id, cx);
             }
             Event::Session { id, state, .. } if *id == self.session => {
@@ -600,10 +622,7 @@ impl FilesView {
                     state,
                     SessionState::Disconnected { .. } | SessionState::Failed { .. }
                 ) {
-                    self.pending_home = None;
-                    self.pending_list = None;
-                    self.pending_ops.clear();
-                    self.uploads.clear();
+                    self.drop_pending();
                     self.loading = false;
                 }
                 cx.notify();
@@ -670,8 +689,10 @@ impl FilesView {
             }
             Event::RemoteHead { req, text, .. } => {
                 if let Some(preview) = self.preview.as_mut().filter(|p| p.req == *req) {
-                    preview.text = text.clone().ok().flatten();
-                    preview.arrived = true;
+                    preview.head = match text {
+                        Ok(Some(text)) => Head::Text(text.clone()),
+                        _ => Head::NotText,
+                    };
                     cx.notify();
                 }
             }
@@ -687,7 +708,7 @@ impl FilesView {
                     match result {
                         Ok(end) => {
                             search.limited = end.limited;
-                            search.skipped = end.skipped.clone();
+                            search.skipped.clone_from(&end.skipped);
                         }
                         Err(error) => {
                             let message = format!("Could not search: {error}");
@@ -744,7 +765,6 @@ impl FilesView {
         cx: &mut Context<Self>,
     ) {
         self.sort_entries(&mut entries);
-        self.anchor = None;
         if path != self.path {
             if !self.path.is_empty() && !self.going_back {
                 self.history.push(self.path.clone());
@@ -755,7 +775,6 @@ impl FilesView {
             self.filter_input
                 .update(cx, |input, cx| input.set_text("", cx));
             self.selected.clear();
-            self.anchor = None;
         } else {
             let names: HashSet<_> = entries.iter().map(|e| e.path.clone()).collect();
             self.selected.retain(|p| names.contains(p));
@@ -861,147 +880,12 @@ impl FilesView {
 
     fn open_menu(&mut self, position: Point<Pixels>, row: Option<usize>, cx: &mut Context<Self>) {
         let this = cx.entity().downgrade();
-        let ready = !self.path.is_empty() && self.session_connected(cx);
+        let ready = self.ready(cx);
         let selection = self.selected.len();
         let mut entries = Vec::new();
         if let Some(entry) = row.and_then(|i| self.entries.get(i)) {
-            if entry.kind == EntryKind::Dir && selection == 1 {
-                let path = entry.path.clone();
-                entries.push(
-                    MenuEntry::item(
-                        "Open terminal here",
-                        handler(this.clone(), move |_, _, cx: &mut Context<Self>| {
-                            cx.emit(FilesEvent::OpenTerminalHere(path.clone()))
-                        }),
-                    )
-                    .icon(IconName::Terminal)
-                    .disabled(!ready),
-                );
-                let path = entry.path.clone();
-                entries.push(
-                    MenuEntry::item(
-                        "Go here in terminal",
-                        handler(this.clone(), move |_, _, cx: &mut Context<Self>| {
-                            cx.emit(FilesEvent::GoHereInTerminal(path.clone()))
-                        }),
-                    )
-                    .icon(IconName::Terminal)
-                    .disabled(!ready),
-                );
-            }
-            if matches!(entry.kind, EntryKind::Dir | EntryKind::Symlink) && selection == 1 {
-                entries.push(
-                    MenuEntry::item(
-                        "Open",
-                        handler(this.clone(), move |v, _, cx| {
-                            if let Some(i) = row {
-                                v.open(i, cx)
-                            }
-                        }),
-                    )
-                    .icon(IconName::Folder)
-                    .shortcut("Enter"),
-                );
-            }
-            if entry.kind == EntryKind::File && selection == 1 {
-                entries.push(
-                    MenuEntry::item(
-                        "Edit",
-                        handler(this.clone(), move |v, _, cx| {
-                            if let Some(i) = row {
-                                v.open(i, cx)
-                            }
-                        }),
-                    )
-                    .icon(IconName::File)
-                    .shortcut("Enter")
-                    .disabled(!ready),
-                );
-                entries.push(
-                    MenuEntry::item(
-                        "Preview",
-                        handler(this.clone(), |v, _, cx| v.open_look(true, cx)),
-                    )
-                    .icon(IconName::Eye)
-                    .shortcut("Space"),
-                );
-            }
-            entries.push(
-                MenuEntry::item(
-                    if selection > 1 {
-                        format!("Download {selection} items")
-                    } else {
-                        "Download".to_string()
-                    },
-                    handler(this.clone(), |v, _, cx| v.download(cx)),
-                )
-                .icon(IconName::Download)
-                .disabled(!ready),
-            );
-            entries.push(
-                MenuEntry::item("Rename", handler(this.clone(), |v, w, cx| v.rename(w, cx)))
-                    .icon(IconName::Pencil)
-                    .shortcut("F2")
-                    .disabled(!ready || selection != 1),
-            );
-            entries.push(
-                MenuEntry::item(
-                    "Move to",
-                    handler(this.clone(), |v, w, cx| v.move_selected(w, cx)),
-                )
-                .icon(IconName::FolderUp)
-                .disabled(!ready),
-            );
-            entries.push(
-                MenuEntry::item(
-                    "Cut",
-                    handler(this.clone(), |v, _, cx| v.pick_selected(true, cx)),
-                )
-                .icon(IconName::Forward)
-                .shortcut("Ctrl+X")
-                .disabled(!ready),
-            );
-            entries.push(
-                MenuEntry::item(
-                    "Copy",
-                    handler(this.clone(), |v, _, cx| v.pick_selected(false, cx)),
-                )
-                .icon(IconName::Copy)
-                .shortcut("Ctrl+C")
-                .disabled(!ready),
-            );
-            entries.extend(self.archive_entries(cx));
-            // One entry the server gave permissions for: its grid of toggles, under its cell.
-            if selection == 1 && entry.permissions.is_some() {
-                let path = entry.path.clone();
-                entries.push(
-                    MenuEntry::item(
-                        "Permissions…",
-                        handler(this.clone(), move |v, _, cx| {
-                            v.open_perms(path.clone(), position, cx)
-                        }),
-                    )
-                    .icon(IconName::Lock)
-                    .disabled(!ready),
-                );
-            }
-            // Typed in octal: also for several entries, and for the special bits.
-            entries.push(
-                MenuEntry::item(
-                    "Permissions in octal…",
-                    handler(this.clone(), |v, w, cx| v.change_permissions(w, cx)),
-                )
-                .icon(IconName::Settings)
-                .disabled(!ready),
-            );
-            entries.push(
-                MenuEntry::item(
-                    "Copy path",
-                    handler(this.clone(), |v, _, cx| v.copy_paths(cx)),
-                )
-                .icon(IconName::Copy),
-            );
-            entries.push(MenuEntry::Separator);
+            entries.extend(Self::open_entries(entry, row, selection, ready, &this));
+            entries.extend(self.row_entries(entry, selection, ready, position, &this, cx));
         }
         entries.push(
             MenuEntry::item(
@@ -1019,20 +903,7 @@ impl FilesView {
         }
         entries.extend([
             MenuEntry::Separator,
-            MenuEntry::item(
-                if self.show_hidden {
-                    "Hide hidden files"
-                } else {
-                    "Show hidden files"
-                },
-                handler(this.clone(), |v, _, cx| v.toggle_hidden(cx)),
-            )
-            .icon(if self.show_hidden {
-                IconName::EyeOff
-            } else {
-                IconName::Eye
-            })
-            .shortcut("Ctrl+H"),
+            self.hidden_files_entry(this.clone()),
             MenuEntry::item("Refresh", handler(this.clone(), |v, _, cx| v.refresh(cx)))
                 .icon(IconName::Refresh)
                 .shortcut("F5"),
@@ -1061,7 +932,7 @@ impl FilesView {
         } else {
             entries.push(MenuEntry::Separator);
             entries.push(
-                MenuEntry::item("Delete", handler(this, |v, w, cx| v.delete(w, cx)))
+                MenuEntry::item("Delete", handler(this, FilesView::delete))
                     .icon(IconName::Trash)
                     .shortcut("Del")
                     .danger()
@@ -1073,18 +944,158 @@ impl FilesView {
         cx.notify();
     }
 
+    /// What opens the entry under the pointer, when it is the only one selected.
+    fn open_entries(
+        entry: &RemoteEntry,
+        row: Option<usize>,
+        selection: usize,
+        ready: bool,
+        this: &WeakEntity<Self>,
+    ) -> Vec<MenuEntry> {
+        let mut entries = Vec::new();
+        if entry.kind == EntryKind::Dir && selection == 1 {
+            let path = entry.path.clone();
+            entries.push(
+                MenuEntry::item(
+                    "Open terminal here",
+                    handler(this.clone(), move |_, _, cx: &mut Context<Self>| {
+                        cx.emit(FilesEvent::OpenTerminalHere(path.clone()))
+                    }),
+                )
+                .icon(IconName::Terminal)
+                .disabled(!ready),
+            );
+            let path = entry.path.clone();
+            entries.push(
+                MenuEntry::item(
+                    "Go here in terminal",
+                    handler(this.clone(), move |_, _, cx: &mut Context<Self>| {
+                        cx.emit(FilesEvent::GoHereInTerminal(path.clone()))
+                    }),
+                )
+                .icon(IconName::Terminal)
+                .disabled(!ready),
+            );
+        }
+        if matches!(entry.kind, EntryKind::Dir | EntryKind::Symlink) && selection == 1 {
+            entries.push(
+                MenuEntry::item(
+                    "Open",
+                    handler(this.clone(), move |v, _, cx| {
+                        if let Some(i) = row {
+                            v.open(i, cx)
+                        }
+                    }),
+                )
+                .icon(IconName::Folder)
+                .shortcut("Enter"),
+            );
+        }
+        if entry.kind == EntryKind::File && selection == 1 {
+            entries.push(
+                MenuEntry::item(
+                    "Edit",
+                    handler(this.clone(), move |v, _, cx| {
+                        if let Some(i) = row {
+                            v.open(i, cx)
+                        }
+                    }),
+                )
+                .icon(IconName::File)
+                .shortcut("Enter")
+                .disabled(!ready),
+            );
+            entries.push(
+                MenuEntry::item(
+                    "Preview",
+                    handler(this.clone(), |v, _, cx| v.open_look(true, cx)),
+                )
+                .icon(IconName::Eye)
+                .shortcut("Space"),
+            );
+        }
+        entries
+    }
+
+    /// What acts on the selected entries.
+    fn row_entries(
+        &self,
+        entry: &RemoteEntry,
+        selection: usize,
+        ready: bool,
+        position: Point<Pixels>,
+        this: &WeakEntity<Self>,
+        cx: &mut Context<Self>,
+    ) -> Vec<MenuEntry> {
+        let mut entries = Vec::new();
+        entries.push(
+            MenuEntry::item(
+                if selection > 1 {
+                    format!("Download {selection} items")
+                } else {
+                    "Download".to_string()
+                },
+                handler(this.clone(), |v, _, cx| v.download(cx)),
+            )
+            .icon(IconName::Download)
+            .disabled(!ready),
+        );
+        entries.push(
+            MenuEntry::item("Rename", handler(this.clone(), FilesView::rename))
+                .icon(IconName::Pencil)
+                .shortcut("F2")
+                .disabled(!ready || selection != 1),
+        );
+        entries.push(
+            MenuEntry::item("Move to", handler(this.clone(), FilesView::move_selected))
+                .icon(IconName::FolderUp)
+                .disabled(!ready),
+        );
+        entries.extend(cut_copy_entries(this, ready));
+        entries.extend(self.archive_entries(cx));
+        // One entry the server gave permissions for: its grid of toggles, under its cell.
+        if selection == 1 && entry.permissions.is_some() {
+            let path = entry.path.clone();
+            entries.push(
+                MenuEntry::item(
+                    "Permissions…",
+                    handler(this.clone(), move |v, _, cx| {
+                        v.open_perms(path.clone(), position, cx)
+                    }),
+                )
+                .icon(IconName::Lock)
+                .disabled(!ready),
+            );
+        }
+        // Typed in octal: also for several entries, and for the special bits.
+        entries.push(
+            MenuEntry::item(
+                "Permissions in octal…",
+                handler(this.clone(), FilesView::change_permissions),
+            )
+            .icon(IconName::Settings)
+            .disabled(!ready),
+        );
+        entries.push(
+            MenuEntry::item(
+                "Copy path",
+                handler(this.clone(), |v, _, cx| v.copy_paths(cx)),
+            )
+            .icon(IconName::Copy),
+        );
+        entries.push(MenuEntry::Separator);
+        entries
+    }
+
     /// What creates something in this folder.
     fn add_entries(&self, cx: &mut Context<Self>) -> Vec<MenuEntry> {
         let this = cx.entity().downgrade();
-        let ready = !self.path.is_empty() && self.session_connected(cx);
+        let ready = self.ready(cx);
         vec![
-            MenuEntry::item(
-                "New file",
-                handler(this.clone(), |v, w, cx| v.new_file(w, cx)),
-            )
-            .icon(IconName::FilePlus)
-            .disabled(!ready),
-            MenuEntry::item("New folder", handler(this, |v, w, cx| v.new_folder(w, cx)))
+            MenuEntry::item("New file", handler(this.clone(), FilesView::new_file))
+                .icon(IconName::FilePlus)
+                .disabled(!ready),
+            MenuEntry::item("New folder", handler(this, FilesView::new_folder))
                 .icon(IconName::FolderPlus)
                 .disabled(!ready),
         ]
@@ -1093,7 +1104,7 @@ impl FilesView {
     /// What brings something from this PC into this folder.
     fn upload_entries(&self, cx: &mut Context<Self>) -> Vec<MenuEntry> {
         let this = cx.entity().downgrade();
-        let ready = !self.path.is_empty() && self.session_connected(cx);
+        let ready = self.ready(cx);
         vec![
             MenuEntry::item(
                 "Upload files",
@@ -1148,20 +1159,7 @@ impl FilesView {
             MenuEntry::Separator,
         ]);
         entries.extend([
-            MenuEntry::item(
-                if self.show_hidden {
-                    "Hide hidden files"
-                } else {
-                    "Show hidden files"
-                },
-                handler(this.clone(), |v, _, cx| v.toggle_hidden(cx)),
-            )
-            .icon(if self.show_hidden {
-                IconName::EyeOff
-            } else {
-                IconName::Eye
-            })
-            .shortcut("Ctrl+H"),
+            self.hidden_files_entry(this.clone()),
             MenuEntry::item("Refresh", handler(this.clone(), |v, _, cx| v.refresh(cx)))
                 .icon(IconName::Refresh)
                 .shortcut("F5")
@@ -1194,7 +1192,7 @@ impl FilesView {
     /// What acts on the selection, besides the buttons of the selection bar.
     fn selection_entries(&self, cx: &mut Context<Self>) -> Vec<MenuEntry> {
         let this = cx.entity().downgrade();
-        let ready = !self.path.is_empty() && self.session_connected(cx);
+        let ready = self.ready(cx);
         let mut entries = Vec::new();
         let single = (self.selected.len() == 1)
             .then(|| {
@@ -1218,30 +1216,14 @@ impl FilesView {
             }
             entries.push(MenuEntry::Separator);
         }
+        entries.extend(cut_copy_entries(&this, ready));
         entries.extend([
-            MenuEntry::item(
-                "Cut",
-                handler(this.clone(), |v, _, cx| v.pick_selected(true, cx)),
-            )
-            .icon(IconName::Forward)
-            .shortcut("Ctrl+X")
-            .disabled(!ready),
-            MenuEntry::item(
-                "Copy",
-                handler(this.clone(), |v, _, cx| v.pick_selected(false, cx)),
-            )
-            .icon(IconName::Copy)
-            .shortcut("Ctrl+C")
-            .disabled(!ready),
-            MenuEntry::item(
-                "Move to",
-                handler(this.clone(), |v, w, cx| v.move_selected(w, cx)),
-            )
-            .icon(IconName::FolderUp)
-            .disabled(!ready),
+            MenuEntry::item("Move to", handler(this.clone(), FilesView::move_selected))
+                .icon(IconName::FolderUp)
+                .disabled(!ready),
             MenuEntry::item(
                 "Permissions in octal…",
-                handler(this.clone(), |v, w, cx| v.change_permissions(w, cx)),
+                handler(this.clone(), FilesView::change_permissions),
             )
             .icon(IconName::Settings)
             .disabled(!ready),
@@ -1252,17 +1234,32 @@ impl FilesView {
         entries
     }
 
+    /// Shows or hides the dot files.
+    fn hidden_files_entry(&self, this: WeakEntity<Self>) -> MenuEntry {
+        MenuEntry::item(
+            if self.show_hidden {
+                "Hide hidden files"
+            } else {
+                "Show hidden files"
+            },
+            handler(this, |v, _, cx| v.toggle_hidden(cx)),
+        )
+        .icon(if self.show_hidden {
+            IconName::EyeOff
+        } else {
+            IconName::Eye
+        })
+        .shortcut("Ctrl+H")
+    }
+
     /// What makes an archive of the selection, or opens the archive selected.
     fn archive_entries(&self, cx: &mut Context<Self>) -> Vec<MenuEntry> {
         let this = cx.entity().downgrade();
-        let ready = !self.path.is_empty() && self.session_connected(cx);
+        let ready = self.ready(cx);
         let mut entries = vec![
-            MenuEntry::item(
-                "Compress",
-                handler(this.clone(), |v, w, cx| v.compress(w, cx)),
-            )
-            .icon(IconName::FilePlus)
-            .disabled(!ready),
+            MenuEntry::item("Compress", handler(this.clone(), FilesView::compress))
+                .icon(IconName::FilePlus)
+                .disabled(!ready),
         ];
         if let [only] = self.selected_entries().as_slice()
             && only.kind == EntryKind::File
@@ -1278,12 +1275,7 @@ impl FilesView {
     }
 
     fn copy_paths(&mut self, cx: &mut Context<Self>) {
-        let text = self
-            .selected_entries()
-            .into_iter()
-            .map(|e| e.path)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let text = self.selected_paths().join("\n");
         if !text.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
@@ -1296,6 +1288,32 @@ impl FilesView {
             .iter()
             .filter(|e| self.selected.contains(&e.path))
             .cloned()
+            .collect()
+    }
+
+    /// Starts what a modal asked for, unless the view has moved to another connection meanwhile,
+    /// and waits for the answers under `label`.
+    fn run_op<I: IntoIterator<Item = RequestId>>(
+        &mut self,
+        session: SessionId,
+        label: &'static str,
+        cx: &mut Context<Self>,
+        start: impl FnOnce(&mut Self, &EngineHandle, &mut Context<Self>) -> I,
+    ) {
+        if self.session != session {
+            return;
+        }
+        let engine = self.state.read(cx).engine.clone();
+        for req in start(self, &engine, cx) {
+            self.pending_ops.insert(req, label);
+        }
+    }
+
+    fn selected_paths(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|e| self.selected.contains(&e.path))
+            .map(|e| e.path.clone())
             .collect()
     }
 
@@ -1415,18 +1433,8 @@ impl FilesView {
         }
     }
 
-    fn list_metrics(handle: &UniformListScrollHandle) -> Option<ScrollMetrics> {
-        let base = handle.0.borrow().base_handle.clone();
-        let max = f32::from(base.max_offset().height);
-        let height = f32::from(base.bounds().size.height);
-        (max > 0.).then(|| ScrollMetrics {
-            position: -f32::from(base.offset().y) / max,
-            visible: height / (height + max),
-        })
-    }
-
     fn toggle_hidden(&mut self, cx: &mut Context<Self>) {
-        self.state.update(cx, |s, cx| s.toggle_hidden_files(cx));
+        self.state.update(cx, AppState::toggle_hidden_files);
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1535,7 +1543,7 @@ impl FilesView {
 
     fn go_up(&mut self, cx: &mut Context<Self>) {
         if self.path != "/" && !self.path.is_empty() {
-            self.navigate(format::parent(&self.path), cx);
+            self.navigate(files_format::parent(&self.path), cx);
         }
     }
 
@@ -1544,10 +1552,6 @@ impl FilesView {
             self.going_back = true;
             self.navigate(path, cx);
         }
-    }
-
-    fn upload_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        self.upload_paths_to(paths, self.path.clone(), cx);
     }
 
     fn upload_paths_to(&mut self, paths: Vec<PathBuf>, dir: String, cx: &mut Context<Self>) {
@@ -1573,12 +1577,8 @@ impl FilesView {
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(paths))) = picked.await {
                 this.update(cx, |this, cx| {
-                    if this.session == session && this.session_connected(cx) {
-                        let engine = &this.state.read(cx).engine;
-                        for path in paths {
-                            let id = engine.upload(session, path, dir.clone());
-                            this.uploads.insert(id, dir.clone());
-                        }
+                    if this.session == session {
+                        this.upload_paths_to(paths, dir, cx);
                     }
                 })
                 .ok();
@@ -1589,11 +1589,7 @@ impl FilesView {
 
     /// Keeps the selection to paste it elsewhere, moving it if `cut`.
     fn pick_selected(&mut self, cut: bool, cx: &mut Context<Self>) {
-        let paths: Vec<String> = self
-            .selected_entries()
-            .into_iter()
-            .map(|entry| entry.path)
-            .collect();
+        let paths = self.selected_paths();
         if !paths.is_empty() {
             self.picked = Some((paths, cut));
             cx.notify();
@@ -1634,7 +1630,7 @@ impl FilesView {
                 continue;
             }
             let target = copy_name(&name, &taken);
-            let to = format::join(&self.path, &target);
+            let to = files_format::join(&self.path, &target);
             taken.insert(target);
             let (req, label) = if cut {
                 (engine.rename(self.session, from, to), "Move")
@@ -1653,11 +1649,7 @@ impl FilesView {
     /// Asks for a folder and moves the selection there. Nothing gets replaced: a server refuses to
     /// rename onto a name in use, and that is the error the user reads.
     fn move_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let paths: Vec<String> = self
-            .selected_entries()
-            .into_iter()
-            .map(|entry| entry.path)
-            .collect();
+        let paths = self.selected_paths();
         if paths.is_empty() {
             return;
         }
@@ -1687,18 +1679,19 @@ impl FilesView {
                 refusal,
                 move |folder, _, cx| {
                     this.update(cx, |this, cx| {
-                        if this.session != session {
-                            return;
-                        }
-                        let engine = this.state.read(cx).engine.clone();
-                        for from in paths {
-                            let (origin, name) = split_path(&from);
-                            if origin != folder {
-                                let to = format::join(&folder, name);
-                                let req = engine.rename(session, from, to);
-                                this.pending_ops.insert(req, "Move");
-                            }
-                        }
+                        this.run_op(session, "Move", cx, |_, engine, _| {
+                            paths
+                                .into_iter()
+                                .filter_map(|from| {
+                                    let (origin, name) = split_path(&from);
+                                    if origin == folder {
+                                        return None;
+                                    }
+                                    let to = files_format::join(&folder, name);
+                                    Some(engine.rename(session, from, to))
+                                })
+                                .collect::<Vec<_>>()
+                        });
                     });
                 },
                 window,
@@ -1741,22 +1734,16 @@ impl FilesView {
                 &format!("{suggested}.tar.gz"),
                 move |name, _, cx| {
                     this.update(cx, |this, cx| {
-                        if this.session != session {
-                            return;
-                        }
-                        let name = if archive_stem(&name).is_some() {
-                            name
-                        } else {
-                            format!("{name}.tar.gz")
-                        };
-                        let archive = format::join(&folder, &name);
-                        this.notice(NoticeLevel::Info, format!("Compressing to {name}…"), cx);
-                        let req = this
-                            .state
-                            .read(cx)
-                            .engine
-                            .compress(session, folder, names, archive);
-                        this.pending_ops.insert(req, "Compress");
+                        this.run_op(session, "Compress", cx, |this, engine, cx| {
+                            let name = if archive_stem(&name).is_some() {
+                                name
+                            } else {
+                                format!("{name}.tar.gz")
+                            };
+                            let archive = files_format::join(&folder, &name);
+                            this.notice(NoticeLevel::Info, format!("Compressing to {name}…"), cx);
+                            Some(engine.compress(session, folder, names, archive))
+                        });
                     });
                 },
                 window,
@@ -1776,7 +1763,7 @@ impl FilesView {
         };
         let taken: HashSet<String> = self.all_entries.iter().map(|e| e.name.clone()).collect();
         let name = copy_name(stem, &taken);
-        let folder = format::join(&format::parent(&only.path), &name);
+        let folder = files_format::join(&files_format::parent(&only.path), &name);
         self.notice(NoticeLevel::Info, format!("Extracting to {name}…"), cx);
         let req = self
             .state
@@ -1796,13 +1783,13 @@ impl FilesView {
             [only] => format!("Permissions of {}, in octal", only.name),
             many => format!("Permissions of {} items, in octal", many.len()),
         };
-        let paths: Vec<String> = selected.iter().map(|entry| entry.path.clone()).collect();
+        let paths = self.selected_paths();
         let (this, session) = (cx.entity(), self.session);
         let prompt = cx.new(|cx| {
             TextPrompt::new(
                 &title,
                 "Apply",
-                &std::format!("{current:o}"),
+                &format!("{current:o}"),
                 move |text, _, cx| {
                     this.update(cx, |this, cx| {
                         let Some(mode) = parse_mode(&text) else {
@@ -1815,11 +1802,9 @@ impl FilesView {
                             );
                             return;
                         };
-                        if this.session != session {
-                            return;
-                        }
-                        let req = this.state.read(cx).engine.chmod(session, paths, mode);
-                        this.pending_ops.insert(req, "Change permissions");
+                        this.run_op(session, "Change permissions", cx, |_, engine, _| {
+                            Some(engine.chmod(session, paths, mode))
+                        });
                     });
                 },
                 window,
@@ -1907,15 +1892,9 @@ impl FilesView {
                 "",
                 move |name, _, cx| {
                     this.update(cx, |this, cx| {
-                        if this.session != session {
-                            return;
-                        }
-                        let req = create(
-                            &this.state.read(cx).engine,
-                            session,
-                            format::join(&dir, &name),
-                        );
-                        this.pending_ops.insert(req, operation);
+                        this.run_op(session, operation, cx, |_, engine, _| {
+                            Some(create(engine, session, files_format::join(&dir, &name)))
+                        });
                     });
                 },
                 window,
@@ -1931,7 +1910,7 @@ impl FilesView {
         let [entry] = selected.as_slice() else { return };
         let this = cx.entity();
         // Its own folder: among search results that is not the one on screen.
-        let (from, dir) = (entry.path.clone(), format::parent(&entry.path));
+        let (from, dir) = (entry.path.clone(), files_format::parent(&entry.path));
         let session = self.session;
         let prompt = cx.new(|cx| {
             TextPrompt::new(
@@ -1940,15 +1919,9 @@ impl FilesView {
                 &entry.name,
                 move |name, _, cx| {
                     this.update(cx, |this, cx| {
-                        if this.session != session {
-                            return;
-                        }
-                        let req = this.state.read(cx).engine.rename(
-                            session,
-                            from,
-                            format::join(&dir, &name),
-                        );
-                        this.pending_ops.insert(req, "Rename");
+                        this.run_op(session, "Rename", cx, |_, engine, _| {
+                            Some(engine.rename(session, from, files_format::join(&dir, &name)))
+                        });
                     });
                 },
                 window,
@@ -1964,19 +1937,17 @@ impl FilesView {
         if selected.is_empty() {
             return;
         }
-        let paths: Vec<String> = selected.iter().map(|e| e.path.clone()).collect();
+        let paths = self.selected_paths();
         let this = cx.entity();
         let session = self.session;
         let run = move |cx: &mut App| {
             this.update(cx, |this, cx| {
-                if this.session != session {
-                    return;
-                }
-                let engine = this.state.read(cx).engine.clone();
-                for path in paths {
-                    let req = engine.remove(session, path, true);
-                    this.pending_ops.insert(req, "Delete");
-                }
+                this.run_op(session, "Delete", cx, |_, engine, _| {
+                    paths
+                        .into_iter()
+                        .map(|path| engine.remove(session, path, true))
+                        .collect::<Vec<_>>()
+                });
             });
         };
         if !self.state.read(cx).settings.confirm_on_delete {
@@ -2034,7 +2005,7 @@ impl FilesView {
     }
 
     /// Back and up, at the start of the header of its card.
-    pub fn nav_buttons(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn nav_buttons(&self, cx: &mut Context<Self>) -> AnyElement {
         let connected = self.session_connected(cx);
         let ready = !self.path.is_empty() && connected;
         div()
@@ -2063,7 +2034,7 @@ impl FilesView {
     }
 
     /// What acts on the folder, at the end of the header of its card.
-    pub fn tools(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn tools(&self, cx: &mut Context<Self>) -> AnyElement {
         div()
             .flex()
             .flex_none()
@@ -2178,7 +2149,7 @@ impl FilesView {
     fn selection_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let count = self.selected.len();
-        let ready = !self.path.is_empty() && self.session_connected(cx);
+        let ready = self.ready(cx);
         div()
             .flex()
             .flex_none()
@@ -2253,7 +2224,7 @@ impl FilesView {
     }
 
     /// The current path as clickable folders.
-    pub fn crumbs(&self, cx: &Context<Self>) -> AnyElement {
+    pub(crate) fn crumbs(&self, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let hover = theme.track;
         let mut folders: Vec<(String, String)> = Vec::new();
@@ -2349,53 +2320,7 @@ impl FilesView {
             EntryKind::Dir => file_icon(&entry.name, true, cx),
             _ => file_icon(&entry.name, false, cx),
         };
-        let executable = entry.kind == EntryKind::File
-            && entry.permissions.is_some_and(|mode| mode & 0o100 != 0);
-        let (accent, muted, lit_fill) = (theme.accent, theme.text_muted, theme.selected);
-        let mark = match (themed, entry.kind) {
-            (Some(path), kind) => {
-                let fallback = match kind {
-                    EntryKind::Dir => (IconName::Folder, accent),
-                    _ => (IconName::File, muted),
-                };
-                img(path)
-                    .size(px(16.))
-                    .with_fallback(move || {
-                        Icon::new(fallback.0).color(fallback.1).into_any_element()
-                    })
-                    .into_any_element()
-            }
-            (None, EntryKind::Dir) => Icon::new(IconName::Folder)
-                .size(px(16.))
-                .color(accent)
-                .into_any_element(),
-            (None, EntryKind::Symlink) => Icon::new(IconName::Link)
-                .size(px(14.))
-                .color(muted)
-                .into_any_element(),
-            (None, _) => div()
-                .w(px(32.))
-                .h(px(18.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(crate::theme::RADIUS_SMALL))
-                .font_family(crate::theme::mono_font())
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_size(px(9.5))
-                .text_color(if executable { accent } else { muted })
-                .bg(if executable {
-                    lit_fill
-                } else {
-                    gpui::Hsla {
-                        a: 0.075,
-                        ..theme.text
-                    }
-                })
-                .child(format::badge(&entry.name))
-                .into_any_element(),
-        };
-        let (number, unit) = format::size_parts(entry);
+        let mark = entry_mark(entry, themed, &theme);
         // The rows of the list fill it, and each keeps a little room from its sides.
         div()
             .w_full()
@@ -2441,119 +2366,174 @@ impl FilesView {
                             this.on_row_right_click(index, event, window, cx)
                         }),
                     )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .items_center()
-                            .gap(px(9.))
-                            // As wide as a label, so names line up whatever marks them.
-                            .child(
-                                div()
-                                    .w(px(32.))
-                                    .flex()
-                                    .flex_none()
-                                    .justify_center()
-                                    .child(mark),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .when(entry.kind == EntryKind::Dir, |this| {
-                                        this.font_weight(gpui::FontWeight::MEDIUM)
-                                    })
-                                    .child(shown_name),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .w(px(SIZE_W))
-                            .flex()
-                            .flex_none()
-                            .justify_end()
-                            .gap(px(4.))
-                            .font_family(crate::theme::mono_font())
-                            .text_size(crate::theme::ui_px(13.))
-                            .text_color(theme.text_muted)
-                            .child(number)
-                            .child(div().text_color(theme.text_disabled).child(unit)),
-                    )
+                    .child(name_cell(entry, mark, shown_name))
+                    .child(size_cell(entry, &theme))
                     .when(width >= MODIFIED_FROM, |this| {
-                        this.child(
-                            div()
-                                .id(("file-modified", index))
-                                .w(px(MODIFIED_W))
-                                .flex_none()
-                                .text_size(crate::theme::ui_px(13.))
-                                .text_color(theme.text_muted)
-                                .tooltip(crate::widgets::tooltip::tooltip(format!(
-                                    "{}\n{}",
-                                    format::modified(entry.modified),
-                                    format::modified_utc(entry.modified),
-                                )))
-                                .child(format::relative(entry.modified, SystemTime::now())),
-                        )
+                        this.child(modified_cell(entry, index, &theme))
                     })
                     .when(width >= PERMS_FROM, |this| {
-                        // What to click to change them: a small control, with the popover under it.
-                        let cells = self.perm_cells.clone();
-                        let key = entry.path.clone();
-                        let path = entry.path.clone();
-                        let open = self.perms.as_ref().is_some_and(|open| open.path == path);
-                        let known = entry.permissions.is_some();
-                        let (hover, raised) = (theme.hover, theme.active);
-                        this.child(
-                            div().w(px(PERMS_W)).flex().flex_none().child(
-                                div()
-                                    .flex_none()
-                                    .on_children_prepainted(move |children, _, _| {
-                                        if let Some(cell) = children.first() {
-                                            cells.borrow_mut().insert(key.clone(), *cell);
-                                        }
-                                    })
-                                    .child(
-                                        div()
-                                            .id(("file-perms", index))
-                                            .h(px(22.))
-                                            .ml(px(-6.))
-                                            .px(px(6.))
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(5.))
-                                            .rounded(px(crate::theme::RADIUS_SMALL))
-                                            .font_family(crate::theme::mono_font())
-                                            .text_size(crate::theme::ui_px(13.))
-                                            .when(open, |this| this.bg(raised))
-                                            .when(known, |this| {
-                                                this.cursor_pointer()
-                                                    .hover(move |style| style.bg(hover))
-                                                    .tooltip(crate::widgets::tooltip::tooltip(
-                                                        "Change permissions",
-                                                    ))
-                                                    .on_click(cx.listener(
-                                                        move |this, event: &ClickEvent, _, cx| {
-                                                            cx.stop_propagation();
-                                                            this.selected =
-                                                                HashSet::from([path.clone()]);
-                                                            this.anchor = Some(index);
-                                                            this.open_perms(
-                                                                path.clone(),
-                                                                event.position(),
-                                                                cx,
-                                                            );
-                                                        },
-                                                    ))
-                                            })
-                                            .children(permission_triples(entry, &theme)),
-                                    ),
-                            ),
-                        )
+                        this.child(self.perm_cell(entry, index, &theme, cx))
                     }),
             )
             .into_any_element()
     }
+
+    /// What to click to change the permissions: a small control, with the popover under it.
+    fn perm_cell(
+        &self,
+        entry: &RemoteEntry,
+        index: usize,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let cells = self.perm_cells.clone();
+        let key = entry.path.clone();
+        let path = entry.path.clone();
+        let open = self.perms.as_ref().is_some_and(|open| open.path == path);
+        let known = entry.permissions.is_some();
+        let (hover, raised) = (theme.hover, theme.active);
+        div().w(px(PERMS_W)).flex().flex_none().child(
+            div()
+                .flex_none()
+                .on_children_prepainted(move |children, _, _| {
+                    if let Some(cell) = children.first() {
+                        cells.borrow_mut().insert(key.clone(), *cell);
+                    }
+                })
+                .child(
+                    div()
+                        .id(("file-perms", index))
+                        .h(px(22.))
+                        .ml(px(-6.))
+                        .px(px(6.))
+                        .flex()
+                        .items_center()
+                        .gap(px(5.))
+                        .rounded(px(crate::theme::RADIUS_SMALL))
+                        .font_family(crate::theme::mono_font())
+                        .text_size(crate::theme::ui_px(13.))
+                        .when(open, |this| this.bg(raised))
+                        .when(known, |this| {
+                            this.cursor_pointer()
+                                .hover(move |style| style.bg(hover))
+                                .tooltip(crate::widgets::tooltip::tooltip("Change permissions"))
+                                .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.selected = HashSet::from([path.clone()]);
+                                    this.anchor = Some(index);
+                                    this.open_perms(path.clone(), event.position(), cx);
+                                }))
+                        })
+                        .children(permission_triples(entry, theme)),
+                ),
+        )
+    }
+}
+
+/// The icon of an entry, or for a file without one a label of its type.
+fn entry_mark(entry: &RemoteEntry, themed: Option<PathBuf>, theme: &Theme) -> AnyElement {
+    let executable =
+        entry.kind == EntryKind::File && entry.permissions.is_some_and(|mode| mode & 0o100 != 0);
+    let (accent, muted, lit_fill) = (theme.accent, theme.text_muted, theme.selected);
+    match (themed, entry.kind) {
+        (Some(path), kind) => {
+            let fallback = match kind {
+                EntryKind::Dir => (IconName::Folder, accent),
+                _ => (IconName::File, muted),
+            };
+            img(path)
+                .size(px(16.))
+                .with_fallback(move || Icon::new(fallback.0).color(fallback.1).into_any_element())
+                .into_any_element()
+        }
+        (None, EntryKind::Dir) => Icon::new(IconName::Folder)
+            .size(px(16.))
+            .color(accent)
+            .into_any_element(),
+        (None, EntryKind::Symlink) => Icon::new(IconName::Link)
+            .size(px(14.))
+            .color(muted)
+            .into_any_element(),
+        (None, _) => div()
+            .w(px(32.))
+            .h(px(18.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(crate::theme::RADIUS_SMALL))
+            .font_family(crate::theme::mono_font())
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_size(px(9.5))
+            .text_color(if executable { accent } else { muted })
+            .bg(if executable {
+                lit_fill
+            } else {
+                gpui::Hsla {
+                    a: 0.075,
+                    ..theme.text
+                }
+            })
+            .child(files_format::badge(&entry.name))
+            .into_any_element(),
+    }
+}
+
+/// The mark and the name of an entry.
+fn name_cell(entry: &RemoteEntry, mark: AnyElement, shown_name: String) -> Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .items_center()
+        .gap(px(9.))
+        // As wide as a label, so names line up whatever marks them.
+        .child(
+            div()
+                .w(px(32.))
+                .flex()
+                .flex_none()
+                .justify_center()
+                .child(mark),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .when(entry.kind == EntryKind::Dir, |this| {
+                    this.font_weight(gpui::FontWeight::MEDIUM)
+                })
+                .child(shown_name),
+        )
+}
+
+fn size_cell(entry: &RemoteEntry, theme: &Theme) -> Div {
+    let (number, unit) = files_format::size_parts(entry);
+    div()
+        .w(px(SIZE_W))
+        .flex()
+        .flex_none()
+        .justify_end()
+        .gap(px(4.))
+        .font_family(crate::theme::mono_font())
+        .text_size(crate::theme::ui_px(13.))
+        .text_color(theme.text_muted)
+        .child(number)
+        .child(div().text_color(theme.text_disabled).child(unit))
+}
+
+fn modified_cell(entry: &RemoteEntry, index: usize, theme: &Theme) -> Stateful<Div> {
+    div()
+        .id(("file-modified", index))
+        .w(px(MODIFIED_W))
+        .flex_none()
+        .text_size(crate::theme::ui_px(13.))
+        .text_color(theme.text_muted)
+        .tooltip(crate::widgets::tooltip::tooltip(format!(
+            "{}\n{}",
+            files_format::modified(entry.modified),
+            files_format::modified_utc(entry.modified),
+        )))
+        .child(files_format::relative(entry.modified, SystemTime::now()))
 }
 
 impl FilesView {
@@ -2620,19 +2600,23 @@ impl FilesView {
     }
 
     /// What the status bar says after the summary, dimmer: how to preview the file selected.
-    pub fn summary_hint(&self) -> Option<&'static str> {
+    pub(crate) fn summary_hint(&self) -> Option<&'static str> {
         (!self.path.is_empty() && self.previewable().is_some()).then_some("Space to preview")
     }
 
     /// For the status bar: the selection or what the folder holds, and the room left on the server.
     /// Nothing until the folder has loaded.
-    pub fn summary(&self) -> Option<String> {
+    pub(crate) fn summary(&self) -> Option<String> {
         if self.path.is_empty() {
             return None;
         }
         // One file: what it is, for the hint after it to open its preview.
         if let Some(file) = self.previewable() {
-            return Some(format!("{} · {}", file.name, format::bytes(file.size)));
+            return Some(format!(
+                "{} · {}",
+                file.name,
+                files_format::bytes(file.size)
+            ));
         }
         let mut text = if self.selected.is_empty() {
             self.contents_summary()
@@ -2644,7 +2628,7 @@ impl FilesView {
             }
         };
         if let Some(free) = self.free_space {
-            text.push_str(&format!(", {} free", format::bytes(free)));
+            let _ = write!(text, ", {} free", files_format::bytes(free));
         }
         Some(text)
     }
@@ -2667,14 +2651,14 @@ impl FilesView {
                 .filter(|e| e.name.starts_with('.'))
                 .count();
             if hidden > 0 {
-                text.push_str(&format!(", {hidden} hidden"));
+                let _ = write!(text, ", {hidden} hidden");
             }
         }
         text
     }
 
     /// The name of the folder on screen, once there is one.
-    pub fn folder_name(&self) -> Option<&str> {
+    fn folder_name(&self) -> Option<&str> {
         match self.path.as_str() {
             "" => None,
             "/" => Some("/"),
@@ -2690,14 +2674,14 @@ impl FilesView {
             .filter(|e| e.kind != EntryKind::Dir)
             .map(|e| e.size)
             .sum();
-        (bytes > 0).then(|| format::bytes(bytes))
+        (bytes > 0).then(|| files_format::bytes(bytes))
     }
 }
 
 /// The three groups of a permission string, each letter on its own: dashes step back, and the right
 /// to run a file stands out.
 fn permission_triples(entry: &RemoteEntry, theme: &crate::theme::Theme) -> Vec<Div> {
-    let text = format::permissions(entry);
+    let text = files_format::permissions(entry);
     let letters: Vec<char> = text.chars().skip(1).collect();
     let is_dir = entry.kind == EntryKind::Dir;
     letters
@@ -2722,8 +2706,7 @@ fn permission_triples(entry: &RemoteEntry, theme: &crate::theme::Theme) -> Vec<D
 /// A line of a file, its key and its comments told apart at a glance.
 fn preview_line(line: &str, theme: &crate::theme::Theme) -> Div {
     let line = line.trim_end();
-    let row = div().flex().flex_none().h(px(0.)).min_h(px(0.));
-    let _ = row;
+
     let trimmed = line.trim_start();
     let indent = &line[..line.len() - trimmed.len()];
     let comment = trimmed.starts_with('#') || trimmed.starts_with("//");
@@ -2798,8 +2781,7 @@ impl FilesView {
         self.preview = Some(Preview {
             path,
             req,
-            text: None,
-            arrived: false,
+            head: Head::Loading,
         });
     }
 
@@ -2840,15 +2822,15 @@ impl FilesView {
         let mark = if is_dir {
             Mark::Icon(IconName::Folder)
         } else {
-            Mark::Label(format::badge(&entry.name).into())
+            Mark::Label(files_format::badge(&entry.name).into())
         };
         let meta = if is_dir {
-            format!("Folder · {}", format::modified(entry.modified))
+            format!("Folder · {}", files_format::modified(entry.modified))
         } else {
             format!(
                 "{} · {}",
-                format::bytes(entry.size),
-                format::modified(entry.modified)
+                files_format::bytes(entry.size),
+                files_format::modified(entry.modified)
             )
         };
         let preview = self.preview.as_ref().filter(|p| p.path == entry.path);
@@ -2863,18 +2845,16 @@ impl FilesView {
                 .text_color(theme.text_disabled)
                 .child(text)
         };
-        let body = match preview {
+        let body = match preview.map(|p| &p.head) {
             _ if is_dir => empty("Folders have no preview"),
             _ if entry.size == 0 => empty("This file is empty"),
-            Some(Preview {
-                text: Some(text), ..
-            }) => div().flex().flex_col().children(
+            Some(Head::Text(text)) => div().flex().flex_col().children(
                 text.lines()
                     .take(PREVIEW_LINES)
                     .map(|line| preview_line(line, &theme)),
             ),
-            Some(Preview { arrived: true, .. }) => empty("No preview: this file is not text"),
-            _ => empty("Loading…"),
+            Some(Head::NotText) => empty("No preview: this file is not text"),
+            Some(Head::Loading) | None => empty("Loading…"),
         };
         let header = div()
             .h(px(42.))
@@ -2932,11 +2912,7 @@ impl FilesView {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .rounded(px(crate::theme::RADIUS_CARD))
-            .map(|this| {
-                crate::panel::floating(this, &theme, crate::theme::RADIUS_CARD, theme.strong_border)
-            })
-            .shadow(crate::theme::float_shadow())
+            .map(|this| crate::panel::floating_card(this, &theme, theme.strong_border))
             // A press inside belongs to the preview: the list under it keeps its selection.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
@@ -3020,11 +2996,7 @@ impl FilesView {
             .flex()
             .flex_col()
             .gap(px(8.))
-            .rounded(px(crate::theme::RADIUS_CARD))
-            .map(|this| {
-                crate::panel::floating(this, &theme, crate::theme::RADIUS_CARD, theme.strong_border)
-            })
-            .shadow(crate::theme::float_shadow())
+            .map(|this| crate::panel::floating_card(this, &theme, theme.strong_border))
             .text_size(crate::theme::ui_px(13.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.perms = None;
@@ -3057,7 +3029,7 @@ impl FilesView {
     }
 
     /// Flips one permission of an entry.
-    fn toggle_permission(&mut self, path: String, bit: u32, cx: &mut Context<Self>) {
+    fn toggle_permission(&mut self, path: &str, bit: u32, cx: &mut Context<Self>) {
         let Some(mode) = self
             .all_entries
             .iter()
@@ -3071,7 +3043,7 @@ impl FilesView {
             .state
             .read(cx)
             .engine
-            .chmod(self.session, vec![path.clone()], mode);
+            .chmod(self.session, vec![path.to_string()], mode);
         self.pending_ops.insert(req, "Change permissions");
         // The listing that follows says the same, a moment later.
         for entry in self
@@ -3089,7 +3061,7 @@ impl FilesView {
     /// the server at once. `None` when the server did not say.
     fn permissions_grid(&self, entry: &RemoteEntry, cx: &mut Context<Self>) -> Option<Div> {
         let theme = cx.theme().clone();
-        let ready = !self.path.is_empty() && self.session_connected(cx);
+        let ready = self.ready(cx);
         entry.permissions.map(|mode| {
             let path = entry.path.clone();
             let octal = format!("{:o}", mode & 0o777);
@@ -3123,7 +3095,7 @@ impl FilesView {
                         this.cursor_pointer()
                             .hover(move |style| style.border_color(line))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.toggle_permission(path.clone(), mask, cx)
+                                this.toggle_permission(&path, mask, cx)
                             }))
                     })
                     .when(on, |this| {
@@ -3201,21 +3173,12 @@ impl Render for FilesView {
         let measured = self.width.clone();
         let list_width = self.width.get();
         let drop_highlight = theme.selected;
-        let bar = {
-            let (metrics, moved) = (self.list_scroll.clone(), self.list_scroll.clone());
-            let this = cx.entity().downgrade();
-            scrollbar(
-                self.scroll_drag.clone(),
-                theme.text_muted,
-                move |_| Self::list_metrics(&metrics),
-                move |position, _, cx| {
-                    let base = moved.0.borrow().base_handle.clone();
-                    let max = f32::from(base.max_offset().height);
-                    base.set_offset(point(px(0.), px(-position * max)));
-                    this.update(cx, |_, cx| cx.notify()).ok();
-                },
-            )
-        };
+        let bar = list_scrollbar(
+            &self.list_scroll,
+            self.scroll_drag.clone(),
+            theme.text_muted,
+            cx.entity().downgrade(),
+        );
         let empty_message = if let Some(search) = &self.search {
             (self.entries.is_empty() && !search.running).then_some(if search.found.is_empty() {
                 "Nothing found in this folder or under it"
@@ -3240,7 +3203,7 @@ impl Render for FilesView {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                this.upload_paths(paths.paths().to_vec(), cx)
+                this.upload_paths_to(paths.paths().to_vec(), this.path.clone(), cx)
             }))
             .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_highlight))
             .relative()
@@ -3332,13 +3295,7 @@ impl Render for FilesView {
                 ContextMenu::new(
                     "files-menu",
                     menu,
-                    std::rc::Rc::new(move |_, cx| {
-                        this.update(cx, |this, cx| {
-                            this.menu = None;
-                            cx.notify();
-                        })
-                        .ok();
-                    }),
+                    crate::widgets::context_menu::dismiss(this, |view| &mut view.menu),
                 )
             }));
         let look = self.render_look(cx);

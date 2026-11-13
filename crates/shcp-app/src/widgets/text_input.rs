@@ -17,13 +17,32 @@ use std::time::Duration;
 
 const CARET_BLINK: Duration = Duration::from_millis(500);
 
-pub enum TextInputEvent {
+/// How long typing has to stop before what it changes is acted on.
+pub(crate) const TYPING_PAUSE: Duration = Duration::from_millis(500);
+
+/// Runs `then` on the view once typing has paused, unless the task is dropped before.
+pub(crate) fn after_typing<V: 'static>(
+    cx: &mut Context<V>,
+    then: impl FnOnce(&mut V, &mut Context<V>) + 'static,
+) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        cx.background_executor().timer(TYPING_PAUSE).await;
+        this.update(cx, then).ok();
+    })
+}
+
+/// What of `text` a single line takes: no control characters.
+fn printable(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
+}
+
+pub(crate) enum TextInputEvent {
     Changed,
     Submit,
     Cancel,
 }
 
-pub struct TextInput {
+pub(crate) struct TextInput {
     focus: FocusHandle,
     text: String,
     /// Byte offset of the caret.
@@ -38,10 +57,9 @@ pub struct TextInput {
     /// Where the caret was when it last started blinking: moving it keeps it lit.
     caret_blink_from: (usize, usize),
     masked: bool,
-    /// No box around it until it has the focus: for a field that sits in a toolbar.
-    quiet: bool,
-    /// A button at the end takes the text away, while there is some.
-    clearable: bool,
+    /// For a field that sits in a toolbar: no box around it until it has the focus, and a button
+    /// at the end that takes the text away, while there is some.
+    toolbar: bool,
     /// No box at all: it sits in something that is already one.
     bare: bool,
     /// A word before the text that says what it takes, for the field a dialog is about.
@@ -62,7 +80,7 @@ impl Focusable for TextInput {
 }
 
 impl TextInput {
-    pub fn new(placeholder: &str, masked: bool, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(placeholder: &str, cx: &mut Context<Self>) -> Self {
         Self {
             focus: cx.focus_handle().tab_stop(true),
             text: String::new(),
@@ -72,9 +90,8 @@ impl TextInput {
             caret_visible: true,
             caret_blink: None,
             caret_blink_from: (0, 0),
-            masked,
-            quiet: false,
-            clearable: false,
+            masked: false,
+            toolbar: false,
             bare: false,
             prompt: None,
             marked: None,
@@ -85,51 +102,62 @@ impl TextInput {
         }
     }
 
-    pub fn bare(mut self) -> Self {
+    pub(crate) fn bare(mut self) -> Self {
         self.bare = true;
         self
     }
 
-    pub fn quiet(mut self) -> Self {
-        self.quiet = true;
+    /// Shows dots in place of the text, and keeps it from the clipboard and the platform.
+    pub(crate) fn masked(mut self) -> Self {
+        self.masked = true;
         self
     }
 
-    pub fn clearable(mut self) -> Self {
-        self.clearable = true;
+    pub(crate) fn toolbar(mut self) -> Self {
+        self.toolbar = true;
+        self
+    }
+
+    /// Starts with `text`, the caret at its end.
+    pub(crate) fn with_text(mut self, text: &str) -> Self {
+        self.put_text(text);
         self
     }
 
     /// Taller and in the terminal's font, after `prompt`.
-    pub fn command(mut self, prompt: &'static str) -> Self {
+    pub(crate) fn command(mut self, prompt: &'static str) -> Self {
         self.prompt = Some(prompt);
         self
     }
 
-    pub fn text(&self) -> &str {
+    pub(crate) fn text(&self) -> &str {
         &self.text
     }
 
-    pub fn set_placeholder(&mut self, placeholder: &str, cx: &mut Context<Self>) {
+    pub(crate) fn set_placeholder(&mut self, placeholder: &str, cx: &mut Context<Self>) {
         if self.placeholder != placeholder {
             self.placeholder = SharedString::from(placeholder.to_string());
             cx.notify();
         }
     }
 
-    pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
+    pub(crate) fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.put_text(text);
+        cx.notify();
+    }
+
+    fn put_text(&mut self, text: &str) {
         self.text = text.to_string();
         self.cursor = self.text.len();
         self.anchor = None;
         self.marked = None;
-        cx.notify();
     }
 
-    pub fn focus(&self, window: &mut Window) {
+    pub(crate) fn focus(&self, window: &mut Window) {
         window.focus(&self.focus);
     }
 
-    pub fn select_all(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn select_all(&mut self, cx: &mut Context<Self>) {
         self.anchor = Some(0);
         self.cursor = self.text.len();
         cx.notify();
@@ -153,7 +181,7 @@ impl TextInput {
     }
 
     fn insert(&mut self, s: &str, cx: &mut Context<Self>) {
-        let s: String = s.chars().filter(|c| !c.is_control()).collect();
+        let s = printable(s);
         if s.is_empty() {
             return;
         }
@@ -277,7 +305,6 @@ impl TextInput {
                     }
                 }
             }
-            _ if command || key.modifiers.alt && !alt_gr => return,
             // Let the platform deliver text, spaces, dead keys and IME commits.
             _ => return,
         }
@@ -408,7 +435,7 @@ impl Render for TextInput {
             } else {
                 theme.border
             })
-            .when(!self.quiet && !self.bare, |this| this.bg(theme.input_bg))
+            .when(!self.toolbar && !self.bare, |this| this.bg(theme.input_bg))
             .when(self.bare, |this| {
                 this.h(px(30.))
                     .px(px(0.))
@@ -416,7 +443,7 @@ impl Render for TextInput {
             })
             .text_size(crate::theme::ui_px(13.))
             .text_color(theme.text)
-            .when(self.quiet, |this| {
+            .when(self.toolbar, |this| {
                 this.gap(px(6.))
                     .child(Icon::new(IconName::Search).size(px(13.)).color(if focused {
                         theme.text_muted
@@ -438,7 +465,7 @@ impl Render for TextInput {
                     )
             })
             .child(TextElement { input: cx.entity() })
-            .when(self.clearable && !self.text.is_empty(), |this| {
+            .when(self.toolbar && !self.text.is_empty(), |this| {
                 this.child(
                     div()
                         .flex_none()

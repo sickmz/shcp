@@ -9,14 +9,14 @@ use std::time::{Duration, Instant};
 
 /// When an element moves, for how long and how far.
 #[derive(Clone, Copy)]
-pub struct Beat {
+pub(crate) struct Beat {
     delay_ms: u64,
     duration_ms: u64,
     rise: f32,
 }
 
 impl Beat {
-    pub const fn new(duration_ms: u64, rise: f32) -> Self {
+    pub(crate) const fn new(duration_ms: u64, rise: f32) -> Self {
         Self {
             delay_ms: 0,
             duration_ms,
@@ -24,16 +24,16 @@ impl Beat {
         }
     }
 
-    pub const fn after(mut self, delay_ms: u64) -> Self {
+    pub(crate) const fn after(mut self, delay_ms: u64) -> Self {
         self.delay_ms = delay_ms;
         self
     }
 
-    pub const fn total(self) -> Duration {
+    pub(crate) const fn total(self) -> Duration {
         Duration::from_millis(self.delay_ms + self.duration_ms)
     }
 
-    pub fn animation(self) -> Animation {
+    pub(crate) fn animation(self) -> Animation {
         let delay = self.delay_ms as f32;
         let duration = self.duration_ms as f32;
         let total = delay + duration;
@@ -42,12 +42,12 @@ impl Beat {
     }
 }
 
-pub const MENU: Beat = Beat::new(110, 0.);
-pub const MODAL: Beat = Beat::new(200, 6.);
-pub const NOTICE_IN: Beat = Beat::new(180, 6.);
-pub const NOTICE_OUT: Beat = Beat::new(120, 4.);
+pub(crate) const MENU: Beat = Beat::new(110, 0.);
+pub(crate) const MODAL: Beat = Beat::new(200, 6.);
+pub(crate) const NOTICE_IN: Beat = Beat::new(180, 6.);
+pub(crate) const NOTICE_OUT: Beat = Beat::new(120, 4.);
 /// The content of a tab when it shows another way.
-pub const FACE: Beat = Beat::new(170, 0.);
+pub(crate) const FACE: Beat = Beat::new(170, 0.);
 
 /// How long a panel takes to open or close.
 const REVEAL: Duration = Duration::from_millis(210);
@@ -57,7 +57,7 @@ const FOLD: Duration = Duration::from_millis(260);
 
 /// A panel opening and closing: how much of it shows, from 0 to 1. Asked per frame, and can change
 /// its mind halfway, going back from where it is.
-pub struct Reveal {
+pub(crate) struct Reveal {
     open: bool,
     from: f32,
     started: Option<Instant>,
@@ -67,7 +67,7 @@ pub struct Reveal {
 }
 
 impl Reveal {
-    pub fn new(open: bool) -> Self {
+    pub(crate) fn new(open: bool) -> Self {
         Self {
             open,
             from: if open { 1. } else { 0. },
@@ -79,7 +79,7 @@ impl Reveal {
     }
 
     /// For rows of a list folding under what holds them.
-    pub fn rows(open: bool) -> Self {
+    pub(crate) fn rows(open: bool) -> Self {
         Self {
             duration: FOLD,
             ease: ease_out_soft,
@@ -88,12 +88,12 @@ impl Reveal {
     }
 
     /// The next change came from the mouse, so it may glide.
-    pub fn arm(&mut self) {
+    pub(crate) fn arm(&mut self) {
         self.armed = true;
     }
 
     /// Says what it should be now. Once per frame.
-    pub fn set(&mut self, open: bool) {
+    pub(crate) fn set(&mut self, open: bool) {
         let armed = std::mem::take(&mut self.armed);
         if open == self.open {
             return;
@@ -104,11 +104,11 @@ impl Reveal {
         self.started = (armed && !animations_off()).then_some(now);
     }
 
-    pub fn value(&self) -> f32 {
+    pub(crate) fn value(&self) -> f32 {
         self.value_at(Instant::now())
     }
 
-    pub fn moving(&self) -> bool {
+    pub(crate) fn moving(&self) -> bool {
         self.started
             .is_some_and(|started| started.elapsed() < self.duration)
     }
@@ -128,7 +128,7 @@ const FADE: Duration = Duration::from_millis(140);
 
 /// What shows while the pointer is over something, like the tools of a card: it fades in and out,
 /// and a pointer going back halfway turns it around from where it is.
-pub struct HoverFade {
+pub(crate) struct HoverFade {
     hovered: bool,
     reveal: Reveal,
 }
@@ -147,7 +147,7 @@ impl Default for HoverFade {
 
 impl HoverFade {
     /// The pointer came or went. It fades if the setting allows it, otherwise it changes at once.
-    pub fn hover(&mut self, hovered: bool, animated: bool) {
+    pub(crate) fn hover(&mut self, hovered: bool, animated: bool) {
         if hovered != self.hovered && animated {
             self.reveal.arm();
         }
@@ -156,12 +156,12 @@ impl HoverFade {
 
     /// How much of it shows now, from 0 to 1. `hold` keeps it in sight without the pointer. Once
     /// per frame; while `moving`, ask for another.
-    pub fn value(&mut self, hold: bool) -> f32 {
+    pub(crate) fn value(&mut self, hold: bool) -> f32 {
         self.reveal.set(self.hovered || hold);
         self.reveal.value()
     }
 
-    pub fn moving(&self) -> bool {
+    pub(crate) fn moving(&self) -> bool {
         self.reveal.moving()
     }
 }
@@ -170,44 +170,56 @@ impl HoverFade {
 /// Otherwise each frame would reflow them and send the server one more resize.
 static LAYOUT_MOVING: AtomicBool = AtomicBool::new(false);
 
-pub fn set_layout_moving(moving: bool) {
+pub(crate) fn set_layout_moving(moving: bool) {
     LAYOUT_MOVING.store(moving, Ordering::Relaxed);
 }
 
-pub fn layout_moving() -> bool {
+pub(crate) fn layout_moving() -> bool {
     LAYOUT_MOVING.load(Ordering::Relaxed)
 }
 
 /// Already at its end: for what shares an element with something animated but must not move.
-pub fn settled() -> Animation {
+pub(crate) fn settled() -> Animation {
     Animation::new(Duration::from_millis(1)).with_easing(|_| 1.)
 }
 
-pub fn enter<E: Styled + IntoElement + 'static>(
+pub(crate) fn enter<E: Styled + IntoElement + 'static>(
     element: E,
     id: impl Into<ElementId>,
     beat: Beat,
 ) -> impl IntoElement {
-    let rise = travel(beat);
-    element.with_animation(id, beat.animation(), move |element, delta| {
-        offset(element.opacity(delta), rise, 1. - delta)
-    })
+    slide(element, id, beat, true)
 }
 
-pub fn exit<E: Styled + IntoElement + 'static>(
+pub(crate) fn exit<E: Styled + IntoElement + 'static>(
     element: E,
     id: impl Into<ElementId>,
     beat: Beat,
 ) -> impl IntoElement {
+    slide(element, id, beat, false)
+}
+
+/// Fades and rises in, or the other way out.
+fn slide<E: Styled + IntoElement + 'static>(
+    element: E,
+    id: impl Into<ElementId>,
+    beat: Beat,
+    entering: bool,
+) -> impl IntoElement {
     let rise = travel(beat);
     element.with_animation(id, beat.animation(), move |element, delta| {
-        offset(element.opacity(1. - delta), rise, delta)
+        let (shown, away) = if entering {
+            (delta, 1. - delta)
+        } else {
+            (1. - delta, delta)
+        };
+        offset(element.opacity(shown), rise, away)
     })
 }
 
 /// A bar running along its parent, for as long as something is under way and nobody can say how
 /// much is left. With animations off it stays put and fills the parent.
-pub fn sweep<E: Styled + IntoElement + 'static>(
+pub(crate) fn sweep<E: Styled + IntoElement + 'static>(
     element: E,
     id: impl Into<ElementId>,
 ) -> impl IntoElement {
@@ -249,7 +261,7 @@ struct Spring {
 /// Where a pill is, and where it is going. Its edges move on their own: left, top, right, bottom.
 /// Going somewhere else halfway keeps its speed, so a move can be interrupted at any time.
 #[derive(Default)]
-pub struct PillMotion {
+pub(crate) struct PillMotion {
     armed: bool,
     target: Option<[f32; 4]>,
     springs: [Spring; 4],
@@ -259,12 +271,12 @@ pub struct PillMotion {
 }
 
 impl PillMotion {
-    pub fn arm(&mut self) {
+    pub(crate) fn arm(&mut self) {
         self.armed = true;
     }
 
     /// Takes in where the current item is. Once per frame: being armed lasts for one.
-    pub fn aim(&mut self, target: Option<[f32; 4]>) {
+    pub(crate) fn aim(&mut self, target: Option<[f32; 4]>) {
         self.aim_with(target, animations_off());
     }
 
@@ -308,7 +320,7 @@ impl PillMotion {
     }
 
     /// Where to paint it now, if anywhere, and whether another frame is needed.
-    pub fn frame(&mut self, now: Instant) -> (Option<[f32; 4]>, bool) {
+    pub(crate) fn frame(&mut self, now: Instant) -> (Option<[f32; 4]>, bool) {
         if self.moving {
             let elapsed = self
                 .last
@@ -408,8 +420,7 @@ fn ease_out_soft(t: f32) -> f32 {
 }
 
 /// "Animation effects" is off in Windows: elements fade, but stay where they are.
-#[cfg(windows)]
-pub fn animations_off() -> bool {
+fn animations_off() -> bool {
     use std::ffi::c_void;
 
     const SPI_GETCLIENTAREAANIMATION: u32 = 0x1042;
@@ -425,11 +436,6 @@ pub fn animations_off() -> bool {
         SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, (&raw mut enabled).cast(), 0)
     };
     read != 0 && enabled == 0
-}
-
-#[cfg(not(windows))]
-pub fn animations_off() -> bool {
-    false
 }
 
 #[cfg(test)]

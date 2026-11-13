@@ -3,7 +3,8 @@
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, Hitbox, HitboxBehavior, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Window, canvas, div, fill, point, px, size,
+    MouseUpEvent, Pixels, UniformListScrollHandle, WeakEntity, Window, canvas, div, fill, point,
+    px, size,
 };
 use std::{cell::Cell, rc::Rc};
 
@@ -14,7 +15,7 @@ const MIN_THUMB: f32 = 24.;
 const INSET: f32 = 6.;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ScrollMetrics {
+pub(crate) struct ScrollMetrics {
     /// From 0 at the top to 1 at the bottom.
     pub position: f32,
     /// The part of the content on screen, from 0 to 1.
@@ -37,14 +38,14 @@ fn position_at(y: f32, grab: f32, track: f32, height: f32) -> f32 {
 }
 
 /// Where the thumb is being held, kept by the view between frames.
-pub type ScrollDrag = Rc<Cell<Option<f32>>>;
+pub(crate) type ScrollDrag = Rc<Cell<Option<f32>>>;
 
 type Metrics = Rc<dyn Fn(&App) -> Option<ScrollMetrics>>;
 type Seek = Rc<dyn Fn(f32, &mut Window, &mut App)>;
 
 /// Goes last among the children of a relatively positioned box. `metrics` runs while painting, so
 /// it sees what was laid out in the same frame; with nothing to scroll, nothing is drawn.
-pub fn scrollbar(
+pub(crate) fn scrollbar(
     drag: ScrollDrag,
     color: Hsla,
     metrics: impl Fn(&App) -> Option<ScrollMetrics> + 'static,
@@ -141,6 +142,38 @@ fn paint(
             window.refresh();
         }
     });
+}
+
+/// Where a `uniform_list` is scrolled to, once it has more than fits.
+fn list_metrics(handle: &UniformListScrollHandle) -> Option<ScrollMetrics> {
+    let base = handle.0.borrow().base_handle.clone();
+    let max = f32::from(base.max_offset().height);
+    let height = f32::from(base.bounds().size.height);
+    (max > 0.).then(|| ScrollMetrics {
+        position: -f32::from(base.offset().y) / max,
+        visible: height / (height + max),
+    })
+}
+
+/// The scrollbar of a `uniform_list`. Moving it redraws `view`, which holds the list.
+pub(crate) fn list_scrollbar<V: 'static>(
+    handle: &UniformListScrollHandle,
+    drag: ScrollDrag,
+    color: Hsla,
+    view: WeakEntity<V>,
+) -> impl IntoElement {
+    let (metrics, moved) = (handle.clone(), handle.clone());
+    scrollbar(
+        drag,
+        color,
+        move |_| list_metrics(&metrics),
+        move |position, _, cx| {
+            let base = moved.0.borrow().base_handle.clone();
+            let max = f32::from(base.max_offset().height);
+            base.set_offset(point(px(0.), px(-position * max)));
+            view.update(cx, |_, cx| cx.notify()).ok();
+        },
+    )
 }
 
 #[cfg(test)]

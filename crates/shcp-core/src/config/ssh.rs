@@ -32,7 +32,7 @@ fn words(line: &str) -> Result<Vec<String>> {
     Ok(result)
 }
 
-pub(crate) fn wildcard(pattern: &str, value: &str) -> bool {
+fn wildcard(pattern: &str, value: &str) -> bool {
     let p = pattern.to_ascii_lowercase().into_bytes();
     let v = value.to_ascii_lowercase().into_bytes();
     let (mut i, mut j, mut star, mut retry) = (0, 0, None, 0);
@@ -76,7 +76,7 @@ const MAX_INCLUDE_DEPTH: usize = 16;
 
 /// One line of the config, with the files it includes already in place.
 enum Line {
-    /// `where` tells the file and line, for warnings.
+    /// `place` tells the file and line, for warnings.
     Option {
         key: String,
         values: Vec<String>,
@@ -106,7 +106,7 @@ pub(crate) fn parse(text: &str, home: &Path) -> (Vec<HostConfig>, Vec<String>) {
         }
     }
     let mut hosts = Vec::new();
-    let local_user = HostConfig::default().user;
+    let local_user = crate::local_user();
     for alias in aliases {
         let mut host = HostConfig {
             id: HostId(alias.clone()),
@@ -166,7 +166,7 @@ pub(crate) fn parse(text: &str, home: &Path) -> (Vec<HostConfig>, Vec<String>) {
             let result: Result<()> = (|| {
                 match key.as_str() {
                     "hostname" => host.hostname = expand(value, &[('h', &host.alias)]),
-                    "user" => host.user = value.clone(),
+                    "user" => host.user.clone_from(value),
                     "port" => host.port = value.parse().context("Invalid port")?,
                     "identityfile" => {
                         if value != "none" {
@@ -484,7 +484,7 @@ fn jump_host(spec: &str, known: &[HostConfig]) -> Result<HostConfig> {
 }
 
 pub(crate) fn expand_identity_files(host: &mut HostConfig, home: &Path) {
-    let local_user = HostConfig::default().user;
+    let local_user = crate::local_user();
     host.identity_files = host
         .identity_files
         .iter()
@@ -518,7 +518,7 @@ pub(crate) fn expand(text: &str, tokens: &[(char, &str)]) -> String {
             continue;
         }
         match chars.next() {
-            Some('%') => out.push('%'),
+            Some('%') | None => out.push('%'),
             Some(token) => {
                 if let Some((_, value)) = tokens.iter().find(|(k, _)| *k == token) {
                     out.push_str(value);
@@ -527,7 +527,6 @@ pub(crate) fn expand(text: &str, tokens: &[(char, &str)]) -> String {
                     out.push(token);
                 }
             }
-            None => out.push('%'),
         }
     }
     out
@@ -566,27 +565,7 @@ fn forward(values: &[String]) -> Result<ForwardSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-
-    struct Home(PathBuf);
-    impl Home {
-        fn new(name: &str) -> Self {
-            let dir =
-                std::env::temp_dir().join(format!("shcp-ssh-config-{name}-{}", std::process::id()));
-            fs::create_dir_all(dir.join(".ssh")).unwrap();
-            Self(dir)
-        }
-        fn file(&self, relative: &str, text: &str) {
-            let path = self.0.join(".ssh").join(relative);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, text).unwrap();
-        }
-    }
-    impl Drop for Home {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::test_support::Scratch;
 
     fn parsed(text: &str) -> (Vec<HostConfig>, Vec<String>) {
         parse(text, Path::new("/nonexistent-home"))
@@ -611,9 +590,9 @@ mod tests {
 
     #[test]
     fn include_brings_hosts_from_other_files_in_name_order() {
-        let home = Home::new("include");
-        home.file("config.d/b", "Host one\n  User from-b\n");
-        home.file("config.d/a", "Host one\n  User from-a\nHost two\n");
+        let home = Scratch::new("ssh-config-include");
+        home.file(".ssh/config.d/b", "Host one\n  User from-b\n");
+        home.file(".ssh/config.d/a", "Host one\n  User from-a\nHost two\n");
         let (hosts, warnings) = parse("Include config.d/*\n", &home.0);
         assert_eq!(host(&hosts, "one").user, "from-a");
         assert_eq!(hosts.len(), 2);
@@ -622,8 +601,8 @@ mod tests {
 
     #[test]
     fn include_with_a_tilde_and_a_missing_file_are_fine() {
-        let home = Home::new("tilde");
-        home.file("extra", "Host three\n");
+        let home = Scratch::new("ssh-config-tilde");
+        home.file(".ssh/extra", "Host three\n");
         let (hosts, warnings) = parse("Include ~/.ssh/extra ~/.ssh/missing\n", &home.0);
         assert_eq!(hosts.len(), 1);
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -631,8 +610,8 @@ mod tests {
 
     #[test]
     fn an_include_inside_a_block_applies_only_to_that_block() {
-        let home = Home::new("block");
-        home.file("common", "User shared\nHost *\nPort 2222\n");
+        let home = Scratch::new("ssh-config-block");
+        home.file(".ssh/common", "User shared\nHost *\nPort 2222\n");
         let (hosts, _) = parse(
             "Host inside\n  Include common\nHost outside\n  HostName elsewhere\n",
             &home.0,
@@ -645,8 +624,8 @@ mod tests {
 
     #[test]
     fn a_file_including_itself_stops_with_a_warning() {
-        let home = Home::new("loop");
-        home.file("self", "Host looped\nInclude self\n");
+        let home = Scratch::new("ssh-config-loop");
+        home.file(".ssh/self", "Host looped\nInclude self\n");
         let (hosts, warnings) = parse("Include self\n", &home.0);
         assert_eq!(hosts.len(), 1);
         assert!(

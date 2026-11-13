@@ -30,6 +30,14 @@ impl TextInput {
             .or_else(|| self.selection())
             .unwrap_or(self.cursor..self.cursor)
     }
+
+    /// Puts the printable part of `text` in place of `range`, returning where it now is.
+    fn replace(&mut self, range: Option<Range<usize>>, text: &str) -> Range<usize> {
+        let range = self.replacement(range);
+        let text = printable(text);
+        self.text.replace_range(range.clone(), &text);
+        range.start..range.start + text.len()
+    }
 }
 
 impl EntityInputHandler for TextInput {
@@ -80,10 +88,7 @@ impl EntityInputHandler for TextInput {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = self.replacement(range);
-        let text: String = text.chars().filter(|c| !c.is_control()).collect();
-        self.text.replace_range(range.clone(), &text);
-        self.cursor = range.start + text.len();
+        self.cursor = self.replace(range, text).end;
         self.marked = None;
         self.anchor = None;
         self.changed(cx);
@@ -97,16 +102,12 @@ impl EntityInputHandler for TextInput {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = self.replacement(range);
-        let text: String = text.chars().filter(|c| !c.is_control()).collect();
-        self.text.replace_range(range.clone(), &text);
-        self.marked = (!text.is_empty()).then_some(range.start..range.start + text.len());
-        self.cursor = range.start + text.len();
+        let range = self.replace(range, text);
+        self.marked = (!range.is_empty()).then_some(range.clone());
+        self.cursor = range.end;
         if let Some(selected) = selected {
             let start = self.to_utf16(range.start);
-            self.cursor = self
-                .byte_for_utf16(start + selected.end)
-                .min(range.start + text.len());
+            self.cursor = self.byte_for_utf16(start + selected.end).min(range.end);
         }
         self.anchor = None;
         self.changed(cx);
@@ -135,11 +136,7 @@ impl EntityInputHandler for TextInput {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        let bounds = self.last_bounds?;
-        let byte = self
-            .last_line
-            .as_ref()?
-            .closest_index_for_x(position.x - bounds.left() + self.scroll_x);
-        Some(self.to_utf16(self.display_to_byte(byte)))
+        let byte = self.byte_at_x(position.x)?;
+        Some(self.to_utf16(byte))
     }
 }

@@ -195,13 +195,12 @@ fn split_words(text: &str) -> Vec<String> {
     for ch in text.chars() {
         match quote {
             Some(open) if ch == open => quote = None,
-            Some(_) => word.get_or_insert_default().push(ch),
             None if ch == '"' || ch == '\'' => {
                 quote = Some(ch);
                 word.get_or_insert_default();
             }
             None if ch.is_whitespace() => words.extend(word.take()),
-            None => word.get_or_insert_default().push(ch),
+            Some(_) | None => word.get_or_insert_default().push(ch),
         }
     }
     words.extend(word);
@@ -239,8 +238,7 @@ fn parse_target(text: &str) -> Result<Target, String> {
         match place.split_once(':') {
             Some((host, port)) if !port.contains(':') => (host, Some(port)),
             // More than one colon: an IPv6 address.
-            Some(_) => (place, None),
-            None => (place, None),
+            Some(_) | None => (place, None),
         }
     };
     // Nothing after the colon yet is someone still typing the port.

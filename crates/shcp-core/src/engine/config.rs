@@ -32,13 +32,13 @@ impl EngineHandle {
     }
     /// The servers `known_hosts` trusts.
     pub fn known_hosts(&self) -> Result<Vec<KnownHost>> {
-        let path = self.paths().known_hosts;
+        let path = self.0.store.lock().paths.known_hosts.clone();
         let _guard = self.0.known_hosts_lock.lock();
         crate::known_hosts::read(&path)
     }
     /// Stops trusting a server: the next connection asks about its key again.
     pub fn forget_known_host(&self, host: &KnownHost) -> Result<()> {
-        let path = self.paths().known_hosts;
+        let path = self.0.store.lock().paths.known_hosts.clone();
         let _guard = self.0.known_hosts_lock.lock();
         crate::known_hosts::forget(&path, host)
     }
@@ -53,15 +53,15 @@ impl EngineHandle {
         self.0.store.lock().save_settings(s)
     }
     /// Removes the passphrase of a key file from the Credential Manager.
-    pub fn forget_passphrase(&self, key: String) {
-        let account = crate::secrets::passphrase_account(std::path::Path::new(&key));
+    pub fn forget_passphrase(&self, key: &str) {
+        let account = crate::secrets::passphrase_account(std::path::Path::new(key));
         self.0.runtime.handle.spawn_blocking(move || {
             crate::secrets::forget(&account);
         });
     }
     /// Removes the password of `user@host:port` from the Credential Manager.
-    pub fn forget_password(&self, target: String) {
-        let account = crate::secrets::password_account(&target);
+    pub fn forget_password(&self, target: &str) {
+        let account = crate::secrets::password_account(target);
         self.0.runtime.handle.spawn_blocking(move || {
             crate::secrets::forget(&account);
         });

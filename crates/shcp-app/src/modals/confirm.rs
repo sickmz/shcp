@@ -1,4 +1,4 @@
-use super::{button_row, card, title};
+use super::{cancel_and, card, title};
 use crate::theme::ActiveTheme as _;
 use crate::widgets::button::{Button, ButtonStyle};
 use gpui::prelude::*;
@@ -9,7 +9,7 @@ use gpui::{
 type Callback = Box<dyn FnOnce(&mut Window, &mut App)>;
 
 /// "Are you sure?" dialog; runs `on_confirm` only when confirmed.
-pub struct ConfirmModal {
+pub(crate) struct ConfirmModal {
     title: String,
     message: String,
     confirm_label: String,
@@ -27,7 +27,7 @@ impl Focusable for ConfirmModal {
 }
 
 impl ConfirmModal {
-    pub fn new(
+    pub(crate) fn new(
         title: &str,
         message: String,
         confirm_label: &str,
@@ -52,7 +52,7 @@ impl ConfirmModal {
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event.keystroke.key.as_str() {
-            "escape" => cx.emit(DismissEvent),
+            "escape" => cx.emit(super::CancelEvent),
             "enter" => self.confirm(window, cx),
             _ => return,
         }
@@ -72,22 +72,15 @@ impl Render for ConfirmModal {
                     .text_color(theme.text_muted)
                     .child(self.message.clone()),
             )
-            .child(
-                button_row()
-                    .child(
-                        Button::new("cancel")
-                            .keyboard_focus()
-                            .label("Cancel")
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
-                    )
-                    .child(
-                        Button::new("confirm")
-                            .keyboard_focus()
-                            .label(self.confirm_label.clone())
-                            .style(ButtonStyle::Danger)
-                            .on_click(cx.listener(|this, _, window, cx| this.confirm(window, cx))),
-                    ),
-            )
+            .child(cancel_and(
+                "cancel",
+                |_, cx| cx.emit(super::CancelEvent),
+                Button::new("confirm")
+                    .label(self.confirm_label.clone())
+                    .style(ButtonStyle::Danger)
+                    .on_click(cx.listener(|this, _, window, cx| this.confirm(window, cx))),
+                cx,
+            ))
     }
 }
 

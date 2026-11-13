@@ -8,9 +8,7 @@ use crate::widgets::text_input::{TextInput, TextInputEvent};
 use crate::widgets::tooltip::tooltip;
 use gpui::prelude::*;
 use gpui::{AnyElement, Context, Entity, Hsla, SharedString, Subscription, Window, div, px};
-use shcp_core::{
-    ForwardKind, ForwardSpec, ForwardState, HostId, HostSource, SessionId, SessionState,
-};
+use shcp_core::{ForwardKind, ForwardSpec, ForwardState, HostId, HostSource, SessionId};
 
 const PORT_W: f32 = 96.;
 const ACTIONS_W: f32 = 64.;
@@ -63,7 +61,7 @@ fn describe(forward: &ForwardInfo, theme: &Theme) -> (Hsla, String, String) {
     }
 }
 
-pub struct PortsPanel {
+pub(crate) struct PortsPanel {
     state: Entity<AppState>,
     fields: Entity<ForwardFields>,
     adding: bool,
@@ -75,10 +73,14 @@ pub struct PortsPanel {
 }
 
 impl PortsPanel {
-    pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(
+        state: Entity<AppState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let fields = cx.new(|cx| ForwardFields::new(None, cx));
         let [bind, target] = fields.read(cx).inputs().map(Entity::clone);
-        let name_input = cx.new(|cx| TextInput::new("What is this port for?", false, cx));
+        let name_input = cx.new(|cx| TextInput::new("What is this port for?", cx));
         let subscriptions = [
             cx.observe(&state, |_, _, cx| cx.notify()),
             cx.subscribe_in(&bind, window, Self::on_input),
@@ -97,20 +99,17 @@ impl PortsPanel {
     }
 
     /// The active host and its session, when connected.
-    pub fn target(&self, cx: &gpui::App) -> Option<(HostId, SessionId)> {
+    pub(crate) fn target(&self, cx: &gpui::App) -> Option<(HostId, SessionId)> {
         let state = self.state.read(cx);
         let host = state.active_host.clone()?;
         let session = state.host_session_id(&host)?;
-        state
-            .session(session)
-            .is_some_and(|info| matches!(info.state, SessionState::Connected))
-            .then_some((host, session))
+        state.session_connected(session).then_some((host, session))
     }
 
-    pub fn start_adding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn start_adding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.adding = true;
         self.error = None;
-        self.fields.update(cx, |fields, cx| fields.clear(cx));
+        self.fields.update(cx, ForwardFields::clear);
         self.fields.read(cx).focus(window, cx);
         cx.notify();
     }
@@ -212,46 +211,9 @@ impl PortsPanel {
         let state = self.state.read(cx);
         let remembered = state.is_remembered(host, &spec);
         let from_config = state.host(host).map(|h| h.source) == Some(HostSource::SshConfig);
-        let open = matches!(
-            forward.state,
-            ForwardState::Listening | ForwardState::ServerDown
-        );
+        let open = is_open(forward);
         let (color, text, detail) = describe(forward, theme);
-        let name = state.settings.port_name(host, &spec).map(str::to_string);
-        let naming = self
-            .naming
-            .as_ref()
-            .is_some_and(|(of, port)| of == host && port.name_key() == spec.name_key());
-        let name_cell = if naming {
-            div()
-                .flex_1()
-                .min_w_0()
-                .child(self.name_input.clone())
-                .into_any_element()
-        } else {
-            let (of, port) = (host.clone(), spec.clone());
-            div()
-                .id(("port-name", index))
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .cursor_pointer()
-                .text_color(if name.is_some() {
-                    theme.text
-                } else {
-                    theme.text_disabled
-                })
-                .tooltip(tooltip(if name.is_some() {
-                    "Change the name"
-                } else {
-                    "Name this port, to remember what it is for"
-                }))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.start_naming(of.clone(), port.clone(), window, cx)
-                }))
-                .child(name.unwrap_or_else(|| "Add a name".to_string()))
-                .into_any_element()
-        };
+        let name_cell = self.name_cell(index, host, &spec, theme, cx);
         let text = if remembered {
             format!("{text} · added")
         } else {
@@ -269,59 +231,13 @@ impl PortsPanel {
             ForwardKind::Remote => format!("server: {address}"),
             _ => address,
         };
-        let primary = if browsable {
-            let url = url.clone();
-            Some(
-                Button::new(("port-browser", index))
-                    .icon(IconName::ExternalLink)
-                    .tooltip("Open in browser")
-                    .style(ButtonStyle::Ghost)
-                    .on_click(move |_, _, cx| cx.open_url(&url)),
-            )
-        } else if open {
-            None
-        } else {
-            let (entity, spec) = (self.state.clone(), spec.clone());
-            Some(
-                Button::new(("port-open", index))
-                    .icon(IconName::Play)
-                    .tooltip("Open tunnel")
-                    .style(ButtonStyle::Ghost)
-                    .on_click(move |_, _, cx| {
-                        entity.update(cx, |s, cx| s.open_forward(session, &spec, cx))
-                    }),
-            )
-        };
+        let primary = self.primary_button(index, &spec, session, browsable, open, &url);
         let destination = match spec.kind {
             ForwardKind::Local => format!("{}:{}", spec.remote_host, spec.remote_port),
             ForwardKind::Remote => format!("this PC: {}:{}", spec.remote_host, spec.remote_port),
             ForwardKind::Dynamic => "SOCKS proxy".to_string(),
         };
-        let origin = if from_config {
-            "Defined in ~/.ssh/config"
-        } else {
-            "Defined in the host settings"
-        };
-        let close = Button::new(("port-close", index))
-            .icon(IconName::Close)
-            .style(ButtonStyle::Ghost);
-        let close = if remembered {
-            let (entity, host, spec) = (self.state.clone(), host.clone(), spec.clone());
-            close
-                .tooltip("Close and remove this port")
-                .on_click(move |_, _, cx| {
-                    entity.update(cx, |s, cx| s.forget_forward(&host, session, &spec, cx))
-                })
-        } else if open {
-            let (entity, spec) = (self.state.clone(), spec.clone());
-            close
-                .tooltip(format!("Close tunnel. {origin}, so it stays in the list"))
-                .on_click(move |_, _, cx| {
-                    entity.read(cx).engine.stop_forward(session, spec.clone())
-                })
-        } else {
-            close.tooltip(origin).disabled(true)
-        };
+        let close = self.close_button(index, forward, host, session, remembered, from_config);
         div()
             .h(row_px(ROW_H))
             .px(px(SIDE_PADDING))
@@ -390,6 +306,139 @@ impl PortsPanel {
             )
             .into_any_element()
     }
+
+    /// The name of the port, which a click lets change, or the field where it is typed.
+    fn name_cell(
+        &self,
+        index: usize,
+        host: &HostId,
+        spec: &ForwardSpec,
+        theme: &Theme,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let name = self
+            .state
+            .read(cx)
+            .settings
+            .port_name(host, spec)
+            .map(str::to_string);
+        let naming = self
+            .naming
+            .as_ref()
+            .is_some_and(|(of, port)| of == host && port.name_key() == spec.name_key());
+        if naming {
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(self.name_input.clone())
+                .into_any_element()
+        } else {
+            let (of, port) = (host.clone(), spec.clone());
+            div()
+                .id(("port-name", index))
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .cursor_pointer()
+                .text_color(if name.is_some() {
+                    theme.text
+                } else {
+                    theme.text_disabled
+                })
+                .tooltip(tooltip(if name.is_some() {
+                    "Change the name"
+                } else {
+                    "Name this port, to remember what it is for"
+                }))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.start_naming(of.clone(), port.clone(), window, cx)
+                }))
+                .child(name.unwrap_or_else(|| "Add a name".to_string()))
+                .into_any_element()
+        }
+    }
+
+    /// Opens the port in the browser, or the tunnel when it is not open.
+    fn primary_button(
+        &self,
+        index: usize,
+        spec: &ForwardSpec,
+        session: SessionId,
+        browsable: bool,
+        open: bool,
+        url: &str,
+    ) -> Option<Button> {
+        if browsable {
+            let url = url.to_string();
+            Some(
+                Button::new(("port-browser", index))
+                    .icon(IconName::ExternalLink)
+                    .tooltip("Open in browser")
+                    .style(ButtonStyle::Ghost)
+                    .on_click(move |_, _, cx| cx.open_url(&url)),
+            )
+        } else if open {
+            None
+        } else {
+            let (entity, spec) = (self.state.clone(), spec.clone());
+            Some(
+                Button::new(("port-open", index))
+                    .icon(IconName::Play)
+                    .tooltip("Open tunnel")
+                    .style(ButtonStyle::Ghost)
+                    .on_click(move |_, _, cx| {
+                        entity.update(cx, |s, cx| s.open_forward(session, &spec, cx))
+                    }),
+            )
+        }
+    }
+
+    /// Closes the tunnel, and removes the port when it was added here.
+    fn close_button(
+        &self,
+        index: usize,
+        forward: &ForwardInfo,
+        host: &HostId,
+        session: SessionId,
+        remembered: bool,
+        from_config: bool,
+    ) -> Button {
+        let spec = &forward.spec;
+        let open = is_open(forward);
+        let origin = if from_config {
+            "Defined in ~/.ssh/config"
+        } else {
+            "Defined in the host settings"
+        };
+        let close = Button::new(("port-close", index))
+            .icon(IconName::Close)
+            .style(ButtonStyle::Ghost);
+        if remembered {
+            let (entity, host, spec) = (self.state.clone(), host.clone(), spec.clone());
+            close
+                .tooltip("Close and remove this port")
+                .on_click(move |_, _, cx| {
+                    entity.update(cx, |s, cx| s.forget_forward(&host, session, &spec, cx))
+                })
+        } else if open {
+            let (entity, spec) = (self.state.clone(), spec.clone());
+            close
+                .tooltip(format!("Close tunnel. {origin}, so it stays in the list"))
+                .on_click(move |_, _, cx| {
+                    entity.read(cx).engine.stop_forward(session, spec.clone())
+                })
+        } else {
+            close.tooltip(origin).disabled(true)
+        }
+    }
+}
+
+/// A tunnel that listens, whether or not the other end answers.
+fn is_open(forward: &ForwardInfo) -> bool {
+    matches!(
+        forward.state,
+        ForwardState::Listening | ForwardState::ServerDown
+    )
 }
 
 impl Render for PortsPanel {

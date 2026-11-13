@@ -20,7 +20,7 @@ use std::{
 };
 
 #[derive(Clone, Copy)]
-pub struct TerminalMetrics {
+pub(crate) struct TerminalMetrics {
     pub bounds: Bounds<Pixels>,
     pub cell_width: Pixels,
     pub line_height: Pixels,
@@ -35,9 +35,9 @@ pub struct TerminalMetrics {
 /// dragged goes through many sizes, and the program would redraw for each of them.
 const RESIZE_SETTLE: Duration = Duration::from_millis(120);
 
-pub type SharedMetrics = Rc<Cell<Option<TerminalMetrics>>>;
+pub(crate) type SharedMetrics = Rc<Cell<Option<TerminalMetrics>>>;
 
-pub struct TerminalElement {
+pub(crate) struct TerminalElement {
     pub view: Entity<TerminalView>,
     pub terminal: TerminalHandle,
     pub font: Font,
@@ -52,7 +52,7 @@ pub struct TerminalElement {
     pub hovered_link: Option<(GridPoint, GridPoint)>,
 }
 
-pub struct Prepaint {
+pub(crate) struct Prepaint {
     bounds: Bounds<Pixels>,
     backgrounds: Vec<PaintQuad>,
     search: Vec<PaintQuad>,
@@ -64,7 +64,39 @@ pub struct Prepaint {
 }
 
 fn color(rgb_value: Rgb) -> Hsla {
-    rgb((rgb_value.0 as u32) << 16 | (rgb_value.1 as u32) << 8 | rgb_value.2 as u32).into()
+    rgb(crate::theme::rgb_hex(rgb_value)).into()
+}
+
+/// Where a cell starts, `cell` being its width and height.
+fn cell_at(origin: Point<Pixels>, cell: (Pixels, Pixels), col: u16, row: u16) -> Point<Pixels> {
+    point(
+        origin.x + cell.0 * col as f32,
+        origin.y + cell.1 * row as f32,
+    )
+}
+
+/// One rectangle per row of a range of cells; `height` of them, at the bottom of the row.
+fn range_quads(
+    range: (GridPoint, GridPoint),
+    cols: u16,
+    origin: Point<Pixels>,
+    cell: (Pixels, Pixels),
+    height: Pixels,
+    color: Hsla,
+) -> Vec<PaintQuad> {
+    let (start, end) = range;
+    (start.row..=end.row)
+        .map(|row| {
+            let from = if row == start.row { start.col } else { 0 };
+            let to = if row == end.row { end.col } else { cols - 1 };
+            let at = cell_at(origin, cell, from, row);
+            let bounds = Bounds::new(
+                point(at.x, at.y + cell.1 - height),
+                size(cell.0 * (to.saturating_sub(from) + 1) as f32, height),
+            );
+            fill(bounds, color)
+        })
+        .collect()
 }
 
 impl IntoElement for TerminalElement {
@@ -75,7 +107,7 @@ impl IntoElement for TerminalElement {
 }
 
 impl TerminalElement {
-    fn text_run(&self, len: usize, style: &CellStyle) -> TextRun {
+    fn text_run(&self, len: usize, style: CellStyle) -> TextRun {
         let mut fg = color(style.fg);
         if style.dim {
             fg.a *= 0.6;
@@ -106,33 +138,6 @@ impl TerminalElement {
                 color: Some(fg),
             }),
         }
-    }
-
-    /// One rectangle per row of a range of cells; `height` of them, at the bottom of the row.
-    fn range_quads(
-        &self,
-        range: (GridPoint, GridPoint),
-        cols: u16,
-        origin: Point<Pixels>,
-        cell: (Pixels, Pixels),
-        height: Pixels,
-        color: Hsla,
-    ) -> Vec<PaintQuad> {
-        let (start, end) = range;
-        (start.row..=end.row)
-            .map(|row| {
-                let from = if row == start.row { start.col } else { 0 };
-                let to = if row == end.row { end.col } else { cols - 1 };
-                let bounds = Bounds::new(
-                    point(
-                        origin.x + cell.0 * from as f32,
-                        origin.y + cell.1 * row as f32 + cell.1 - height,
-                    ),
-                    size(cell.0 * (to.saturating_sub(from) + 1) as f32, height),
-                );
-                fill(bounds, color)
-            })
-            .collect()
     }
 
     fn cursor_quads(
@@ -240,11 +245,10 @@ impl Element for TerminalElement {
         let cursor_point = snapshot
             .cursor
             .map_or(GridPoint { row: 0, col: 0 }, |c| c.point);
+        let cell = (cell_width, line_height);
+        let origin = bounds.origin;
         let caret = Bounds::new(
-            point(
-                bounds.left() + cell_width * cursor_point.col as f32,
-                bounds.top() + line_height * cursor_point.row as f32,
-            ),
+            cell_at(origin, cell, cursor_point.col, cursor_point.row),
             size(cell_width, line_height),
         );
         self.metrics.set(Some(TerminalMetrics {
@@ -256,8 +260,6 @@ impl Element for TerminalElement {
             caret,
             wanted,
         }));
-        let cell = (cell_width, line_height);
-        let origin = bounds.origin;
         let palette = &self.theme.palette;
         // Use the same visibility for the cursor and the text inverted beneath a block.
         // The unfiltered snapshot still supplies the IME caret bounds during the off phase.
@@ -279,10 +281,7 @@ impl Element for TerminalElement {
             .map(|b| {
                 fill(
                     Bounds::new(
-                        point(
-                            origin.x + cell_width * b.col as f32,
-                            origin.y + line_height * b.row as f32,
-                        ),
+                        cell_at(origin, cell, b.col, b.row),
                         size(cell_width * b.cols as f32, line_height),
                     ),
                     color(b.color),
@@ -294,7 +293,7 @@ impl Element for TerminalElement {
             .selection
             .map(|range| {
                 let color = self.theme.terminal_selection;
-                self.range_quads(range, snapshot.cols, origin, cell, line_height, color)
+                range_quads(range, snapshot.cols, origin, cell, line_height, color)
             })
             .unwrap_or_default();
         let search = snapshot
@@ -311,7 +310,7 @@ impl Element for TerminalElement {
                     ..base
                 };
                 let range = (hit.start, hit.end);
-                self.range_quads(range, snapshot.cols, origin, cell, line_height, color)
+                range_quads(range, snapshot.cols, origin, cell, line_height, color)
             })
             .collect();
         // Links always show as links; the one under the pointer has a thicker line.
@@ -322,18 +321,16 @@ impl Element for TerminalElement {
             .chain(self.hovered_link.map(|range| (range, px(2.))))
             .flat_map(|(range, height)| {
                 let color = self.theme.accent;
-                self.range_quads(range, snapshot.cols, origin, cell, height, color)
+                range_quads(range, snapshot.cols, origin, cell, height, color)
             })
             .collect();
 
         let (cursor_under, cursor_over) = match cursor {
-            Some(c) => {
-                let at = point(
-                    origin.x + cell_width * c.point.col as f32,
-                    origin.y + line_height * c.point.row as f32,
-                );
-                self.cursor_quads(c.shape, at, cell)
-            }
+            Some(c) => self.cursor_quads(
+                c.shape,
+                cell_at(origin, cell, c.point.col, c.point.row),
+                cell,
+            ),
             None => (None, None),
         };
 
@@ -344,7 +341,7 @@ impl Element for TerminalElement {
                 let runs: Vec<TextRun> = segment
                     .runs
                     .iter()
-                    .map(|(len, style)| self.text_run(*len, style))
+                    .map(|&(len, style)| self.text_run(len, style))
                     .collect();
                 let force_width = if segment.wide {
                     cell_width * 2.
@@ -357,11 +354,7 @@ impl Element for TerminalElement {
                     &runs,
                     Some(force_width),
                 );
-                let at = point(
-                    origin.x + cell_width * segment.col as f32,
-                    origin.y + line_height * segment.row as f32,
-                );
-                (at, line)
+                (cell_at(origin, cell, segment.col, segment.row), line)
             })
             .collect();
 
@@ -425,15 +418,15 @@ impl Element for TerminalElement {
 
         // Drag selection must keep working when the pointer leaves the element.
         let view = self.view.clone();
-        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
             if phase == DispatchPhase::Bubble {
-                view.update(cx, |view, cx| view.mouse_move(event, window, cx));
+                view.update(cx, |view, cx| view.mouse_move(event, cx));
             }
         });
         let view = self.view.clone();
         window.on_mouse_event(move |event: &MouseUpEvent, phase, _window, cx| {
             if phase == DispatchPhase::Bubble {
-                view.update(cx, |view, cx| view.mouse_up(event, cx));
+                view.update(cx, |view, _| view.mouse_up(event));
             }
         });
     }

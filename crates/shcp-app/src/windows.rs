@@ -30,7 +30,7 @@ fn wide(text: &str) -> Vec<u16> {
 }
 
 /// Says what went wrong when the app has no window, or no longer can use it. Waits for the OK.
-pub fn error_box(text: &str) {
+pub(crate) fn error_box(text: &str) {
     let (text, caption) = (wide(text), wide("shcp"));
     // SAFETY: both strings end in a zero and outlive the call.
     unsafe {
@@ -75,7 +75,7 @@ fn hold_name(name: &str) -> bool {
 /// Whether this is the only copy running. Two would overwrite each other's settings and tabs.
 /// `after_update`: the copy being replaced is on its way out, so it is given time to leave. If it
 /// does not, the update still starts rather than leave the user with nothing.
-pub fn first_instance(after_update: bool) -> bool {
+pub(crate) fn first_instance(after_update: bool) -> bool {
     if !after_update {
         return hold_name(INSTANCE_NAME);
     }
@@ -91,7 +91,7 @@ pub fn first_instance(after_update: bool) -> bool {
 
 /// Brings the running copy to the front. The class keeps this from finding, say, an Explorer window
 /// on a folder called shcp.
-pub fn focus_running_window() {
+pub(crate) fn focus_running_window() {
     let (class, title) = (wide("Zed::Window"), wide("shcp"));
     // SAFETY: both strings end in a zero, and a window that closed meanwhile only makes the calls
     // fail.

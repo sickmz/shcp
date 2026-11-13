@@ -11,8 +11,8 @@ use std::{
     sync::Arc,
 };
 
-pub const THEME_FILE: &str = "theme.json";
-pub const ICONS_DIR: &str = "icons";
+pub(crate) const THEME_FILE: &str = "theme.json";
+pub(crate) const ICONS_DIR: &str = "icons";
 
 /// What VS Code knows by itself: themes count on it to give an icon to a file by its language,
 /// some of them for nearly every common type. `(language, extensions, exact file names)`.
@@ -137,7 +137,7 @@ impl IconSet {
     }
 }
 
-pub struct IconTheme {
+pub(crate) struct IconTheme {
     pub name: String,
     pub origin: ThemeOrigin,
     /// The folder it lives in, where nothing else is kept.
@@ -172,7 +172,7 @@ impl IconTheme {
 
     /// The picture of a file or folder: its exact name, then its extension, then its language, and
     /// finally the theme's default.
-    pub fn icon(&self, name: &str, is_dir: bool, is_light: bool) -> Option<PathBuf> {
+    pub(crate) fn icon(&self, name: &str, is_dir: bool, is_light: bool) -> Option<PathBuf> {
         let name = name.to_lowercase();
         let sets: &[&IconSet] = if is_light {
             &[&self.light, &self.set]
@@ -201,7 +201,7 @@ impl IconTheme {
 }
 
 /// All the installed icon themes.
-pub struct IconThemeCatalog {
+pub(crate) struct IconThemeCatalog {
     pub themes: Vec<Arc<IconTheme>>,
 }
 
@@ -209,7 +209,7 @@ impl Global for IconThemeCatalog {}
 
 impl IconThemeCatalog {
     /// Reads every theme in `dir`. Returns the catalog and one message per unreadable theme.
-    pub fn load(dir: &Path) -> (Self, Vec<String>) {
+    pub(crate) fn load(dir: &Path) -> (Self, Vec<String>) {
         let mut themes = Vec::new();
         let mut errors = Vec::new();
         let mut folders: Vec<_> = std::fs::read_dir(dir)
@@ -234,12 +234,12 @@ impl IconThemeCatalog {
 }
 
 /// The theme the settings ask for. `None`: the app's own icons.
-pub struct ActiveIconTheme(pub Option<Arc<IconTheme>>);
+pub(crate) struct ActiveIconTheme(pub Option<Arc<IconTheme>>);
 
 impl Global for ActiveIconTheme {}
 
 /// The picture for a file or folder under the active themes, if an icon theme is in use.
-pub fn file_icon(name: &str, is_dir: bool, cx: &App) -> Option<PathBuf> {
+pub(crate) fn file_icon(name: &str, is_dir: bool, cx: &App) -> Option<PathBuf> {
     let theme = cx.global::<ActiveIconTheme>().0.as_ref()?;
     theme.icon(name, is_dir, super::ActiveTheme::theme(cx).is_light)
 }

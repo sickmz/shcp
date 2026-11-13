@@ -2,20 +2,11 @@
 use crate::{
     files::{run_on_server, shell_quote},
     session::Ssh,
+    ssh_keys::public_path,
 };
 use anyhow::{Context, Result};
 use russh::keys::{self, Algorithm, PrivateKey, PublicKey, ssh_key::LineEnding};
-use std::{
-    fs,
-    io::Write,
-    path::{Path, PathBuf},
-};
-
-fn public_path(path: &Path) -> PathBuf {
-    let mut public = path.as_os_str().to_owned();
-    public.push(".pub");
-    PathBuf::from(public)
-}
+use std::{fs, io::Write, path::Path};
 
 /// The public half of the key at `path`, as a line of `authorized_keys`. A key that is not there
 /// yet is created.
@@ -47,8 +38,6 @@ fn generate(path: &Path, passphrase: Option<&str>, comment: &str) -> Result<Stri
     let private = key.to_openssh(LineEnding::LF)?;
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     // On Windows the file takes the permissions of the folder, which OpenSSH accepts in ~/.ssh.
     let mut file = options
         .open(path)

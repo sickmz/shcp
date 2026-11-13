@@ -13,14 +13,28 @@ use std::{
     rc::Rc,
 };
 
-pub type Handler = Rc<dyn Fn(&mut Window, &mut App)>;
+pub(crate) type Handler = Rc<dyn Fn(&mut Window, &mut App)>;
 type HoverHandler = Rc<dyn Fn(&mut App)>;
 
 /// How much space a submenu wants beside its menu before it goes to the other side.
 const SUBMENU_ROOM: Pixels = px(220.);
 
+/// What closes a menu that a view keeps in a field: `menu` gives the field.
+pub(crate) fn dismiss<V: 'static>(
+    view: WeakEntity<V>,
+    menu: fn(&mut V) -> &mut Option<OpenMenu>,
+) -> Handler {
+    Rc::new(move |_, cx| {
+        view.update(cx, |view, cx| {
+            *menu(view) = None;
+            cx.notify();
+        })
+        .ok();
+    })
+}
+
 /// Wraps a view method as a menu handler.
-pub fn handler<V: 'static>(
+pub(crate) fn handler<V: 'static>(
     view: WeakEntity<V>,
     f: impl Fn(&mut V, &mut Window, &mut Context<V>) + 'static,
 ) -> Handler {
@@ -30,7 +44,7 @@ pub fn handler<V: 'static>(
 }
 
 #[derive(Clone)]
-pub enum MenuEntry {
+pub(crate) enum MenuEntry {
     Item {
         label: SharedString,
         icon: Option<IconName>,
@@ -49,7 +63,7 @@ pub enum MenuEntry {
 }
 
 impl MenuEntry {
-    pub fn item(label: impl Into<SharedString>, handler: Handler) -> Self {
+    pub(crate) fn item(label: impl Into<SharedString>, handler: Handler) -> Self {
         Self::Item {
             label: label.into(),
             icon: None,
@@ -59,32 +73,32 @@ impl MenuEntry {
             handler,
         }
     }
-    pub fn submenu(label: impl Into<SharedString>, entries: Vec<MenuEntry>) -> Self {
+    pub(crate) fn submenu(label: impl Into<SharedString>, entries: Vec<MenuEntry>) -> Self {
         Self::Submenu {
             label: label.into(),
             icon: None,
             entries,
         }
     }
-    pub fn icon(mut self, name: IconName) -> Self {
+    pub(crate) fn icon(mut self, name: IconName) -> Self {
         if let Self::Item { icon, .. } | Self::Submenu { icon, .. } = &mut self {
             *icon = Some(name);
         }
         self
     }
-    pub fn shortcut(mut self, text: impl Into<SharedString>) -> Self {
+    pub(crate) fn shortcut(mut self, text: impl Into<SharedString>) -> Self {
         if let Self::Item { shortcut, .. } = &mut self {
             *shortcut = Some(text.into());
         }
         self
     }
-    pub fn disabled(mut self, value: bool) -> Self {
+    pub(crate) fn disabled(mut self, value: bool) -> Self {
         if let Self::Item { disabled, .. } = &mut self {
             *disabled = value;
         }
         self
     }
-    pub fn danger(mut self) -> Self {
+    pub(crate) fn danger(mut self) -> Self {
         if let Self::Item { danger, .. } = &mut self {
             *danger = true;
         }
@@ -94,7 +108,7 @@ impl MenuEntry {
 
 /// A menu waiting to be drawn by its owner view.
 #[derive(Clone)]
-pub struct OpenMenu {
+pub(crate) struct OpenMenu {
     position: Point<Pixels>,
     /// The corner of the menu that sits at `position`.
     corner: Corner,
@@ -103,7 +117,7 @@ pub struct OpenMenu {
 
 impl OpenMenu {
     /// At the pointer, going down and to the right.
-    pub fn at(position: Point<Pixels>, entries: Vec<MenuEntry>) -> Self {
+    pub(crate) fn at(position: Point<Pixels>, entries: Vec<MenuEntry>) -> Self {
         Self {
             position,
             corner: Corner::TopLeft,
@@ -112,7 +126,7 @@ impl OpenMenu {
     }
 
     /// Under a button, lined up with its right edge.
-    pub fn below(button: &MenuAnchor, entries: Vec<MenuEntry>) -> Self {
+    pub(crate) fn below(button: &MenuAnchor, entries: Vec<MenuEntry>) -> Self {
         let position = button.0.get().map_or(Point::default(), |b| {
             b.bottom_right() + point(px(0.), px(4.))
         });
@@ -126,10 +140,10 @@ impl OpenMenu {
 
 /// Remembers where a button is, for the menu it opens. Keep one per button.
 #[derive(Clone, Default)]
-pub struct MenuAnchor(Rc<Cell<Option<Bounds<Pixels>>>>);
+pub(crate) struct MenuAnchor(Rc<Cell<Option<Bounds<Pixels>>>>);
 
 impl MenuAnchor {
-    pub fn wrap(&self, button: impl IntoElement) -> Div {
+    pub(crate) fn wrap(&self, button: impl IntoElement) -> Div {
         let bounds = self.0.clone();
         div()
             .flex_none()
@@ -139,7 +153,7 @@ impl MenuAnchor {
 }
 
 #[derive(IntoElement)]
-pub struct ContextMenu {
+pub(crate) struct ContextMenu {
     menu_id: SharedString,
     position: Point<Pixels>,
     corner: Corner,
@@ -148,7 +162,7 @@ pub struct ContextMenu {
 }
 
 impl ContextMenu {
-    pub fn new(id: impl Into<SharedString>, menu: OpenMenu, on_dismiss: Handler) -> Self {
+    pub(crate) fn new(id: impl Into<SharedString>, menu: OpenMenu, on_dismiss: Handler) -> Self {
         Self {
             menu_id: id.into(),
             position: menu.position,
@@ -260,17 +274,19 @@ fn entry_row(
 
 /// What a menu floats on.
 fn panel(id: impl Into<ElementId>, theme: &Theme) -> Stateful<Div> {
+    list_panel(id, theme).on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+}
+
+/// The floating card of a menu or of a dropdown's list, for its rows to go in.
+pub(crate) fn list_panel(id: impl Into<ElementId>, theme: &Theme) -> Stateful<Div> {
     div()
         .id(id)
         .occlude()
         .p(px(4.))
         .flex()
         .flex_col()
-        .rounded(px(crate::theme::RADIUS_CARD))
-        .map(|this| crate::panel::floating(this, theme, crate::theme::RADIUS_CARD, theme.border))
-        .shadow(crate::theme::float_shadow())
+        .map(|this| crate::panel::floating_card(this, theme, theme.border))
         .text_size(crate::theme::ui_px(13.))
-        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
 }
 
 impl RenderOnce for ContextMenu {
@@ -376,7 +392,7 @@ impl RenderOnce for ContextMenu {
             })
             .collect();
         let dismiss = self.on_dismiss;
-        let outside = state.clone();
+        let outside = state;
         deferred(
             anchored()
                 .anchor(self.corner)

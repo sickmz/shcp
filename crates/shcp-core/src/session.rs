@@ -18,33 +18,94 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 pub(crate) type Ssh = russh::client::Handle<Handler>;
+/// Waits for the server to take what was asked of a channel. `rejected` says it did not.
+pub(crate) async fn accepted(
+    channel: &mut russh::Channel<russh::client::Msg>,
+    rejected: &str,
+) -> Result<()> {
+    loop {
+        match channel.wait().await {
+            Some(russh::ChannelMsg::Success) => return Ok(()),
+            Some(russh::ChannelMsg::Failure | russh::ChannelMsg::Close) | None => {
+                bail!("{rejected}")
+            }
+            _ => {}
+        }
+    }
+}
 /// What the user typed for an encrypted key or a password.
 pub(crate) struct SecretAnswer {
     pub secret: Zeroizing<String>,
     pub remember: bool,
 }
+/// What the connection waits for the user to answer, if anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum PromptKind {
+    None = 0,
+    HostKey = 1,
+    Passphrase = 2,
+    /// A password, or another answer to the server's questions.
+    Password = 3,
+}
 pub(crate) struct Prompts {
-    pub kind: AtomicU8,
-    pub host_tx: Sender<bool>,
-    pub host_rx: Receiver<bool>,
-    pub pass_tx: Sender<Option<SecretAnswer>>,
-    pub pass_rx: Receiver<Option<SecretAnswer>>,
-    pub password_tx: Sender<Option<SecretAnswer>>,
-    pub password_rx: Receiver<Option<SecretAnswer>>,
+    kind: AtomicU8,
+    /// The senders are for `answer_*`, which checks the question is still open; tests answer
+    /// directly.
+    pub(crate) host_tx: Sender<bool>,
+    pub(crate) host_rx: Receiver<bool>,
+    passphrase_tx: Sender<Option<SecretAnswer>>,
+    pub(crate) passphrase_rx: Receiver<Option<SecretAnswer>>,
+    pub(crate) password_tx: Sender<Option<SecretAnswer>>,
+    pub(crate) password_rx: Receiver<Option<SecretAnswer>>,
 }
 impl Prompts {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let (host_tx, host_rx) = async_channel::bounded(1);
-        let (pass_tx, pass_rx) = async_channel::bounded(1);
+        let (passphrase_tx, passphrase_rx) = async_channel::bounded(1);
         let (password_tx, password_rx) = async_channel::bounded(1);
         Self {
-            kind: AtomicU8::new(0),
+            kind: AtomicU8::new(PromptKind::None as u8),
             host_tx,
             host_rx,
-            pass_tx,
-            pass_rx,
+            passphrase_tx,
+            passphrase_rx,
             password_tx,
             password_rx,
+        }
+    }
+    /// From now on an answer of this kind is taken.
+    pub(crate) fn begin(&self, kind: PromptKind) {
+        self.kind.store(kind as u8, Ordering::SeqCst);
+    }
+    /// Nothing is asked any more.
+    pub(crate) fn end(&self) {
+        self.begin(PromptKind::None);
+    }
+    /// Whether the user was asked this, which it then no longer is.
+    fn take(&self, kind: PromptKind) -> bool {
+        self.kind
+            .compare_exchange(
+                kind as u8,
+                PromptKind::None as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+    pub(crate) fn answer_host_key(&self, accept: bool) {
+        if self.take(PromptKind::HostKey) {
+            let _ = self.host_tx.try_send(accept);
+        }
+    }
+    pub(crate) fn answer_passphrase(&self, answer: Option<SecretAnswer>) {
+        if self.take(PromptKind::Passphrase) {
+            let _ = self.passphrase_tx.try_send(answer);
+        }
+    }
+    pub(crate) fn answer_password(&self, answer: Option<SecretAnswer>) {
+        if self.take(PromptKind::Password) {
+            let _ = self.password_tx.try_send(answer);
         }
     }
 }
@@ -67,10 +128,35 @@ pub(crate) struct Context {
     pub tmux: tmux::HostState,
 }
 impl Context {
-    pub fn emit(&self, event: Event) {
+    /// A context that opens no tunnel, keeps no terminal and uses no agent: callers turn those on.
+    pub(crate) fn new(
+        id: SessionId,
+        host: HostConfig,
+        jumps: Vec<HostConfig>,
+        paths: AppPaths,
+        events: Sender<Event>,
+        known_hosts_lock: Arc<Mutex<()>>,
+    ) -> Self {
+        Self {
+            id,
+            host,
+            jumps,
+            remote_forwards: Mutex::new(HashMap::new()),
+            paths,
+            events,
+            cancel: CancellationToken::new(),
+            prompts: Prompts::new(),
+            known_hosts_lock,
+            use_agent: false,
+            open_forwards: false,
+            persist_terminals: false,
+            tmux: Default::default(),
+        }
+    }
+    pub(crate) fn emit(&self, event: Event) {
         let _ = self.events.try_send(event);
     }
-    pub fn state(&self, state: SessionState) {
+    pub(crate) fn state(&self, state: SessionState) {
         tracing::info!(session = self.id.0, host = %self.host.alias, ?state, "Session state changed");
         self.emit(Event::Session {
             id: self.id,
@@ -78,12 +164,12 @@ impl Context {
             state,
         });
     }
-    pub fn notice(&self, level: NoticeLevel, message: String) {
+    pub(crate) fn notice(&self, level: NoticeLevel, message: String) {
         tracing::info!(?level, %message);
         self.emit(Event::Notice { level, message });
     }
     /// `host` is the machine the step is on: the session's host or a jump host on the way to it.
-    pub fn step(&self, host: &HostConfig, step: ConnectStep, detail: Option<String>) {
+    pub(crate) fn step(&self, host: &HostConfig, step: ConnectStep, detail: Option<String>) {
         let hop = self
             .jumps
             .iter()
@@ -173,7 +259,7 @@ pub(crate) enum Command {
     ReportKeeping,
 }
 impl Control {
-    pub fn new(context: Context, concurrency: usize) -> (Arc<Self>, Receiver<Command>) {
+    pub(crate) fn new(context: Context, concurrency: usize) -> (Arc<Self>, Receiver<Command>) {
         let (commands, rx) = async_channel::unbounded();
         let (ready, _) = watch::channel(None);
         (
@@ -188,7 +274,7 @@ impl Control {
             rx,
         )
     }
-    pub async fn files(&self) -> Result<Arc<Files>> {
+    pub(crate) async fn files(&self) -> Result<Arc<Files>> {
         let mut ready = self.ready.subscribe();
         loop {
             if let Some(result) = ready.borrow_and_update().clone() {

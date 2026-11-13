@@ -1,4 +1,4 @@
-use super::{button_row, card, title};
+use super::{cancel_and, card, title};
 use crate::theme::ActiveTheme as _;
 use crate::widgets::button::{Button, ButtonStyle};
 use crate::widgets::text_input::{TextInput, TextInputEvent};
@@ -11,7 +11,7 @@ use gpui::{
 type Callback = Box<dyn FnOnce(String, &mut Window, &mut App)>;
 
 /// One-line text prompt (new folder name, rename).
-pub struct TextPrompt {
+pub(crate) struct TextPrompt {
     title: String,
     ok_label: String,
     input: Entity<TextInput>,
@@ -32,7 +32,7 @@ impl Focusable for TextPrompt {
 }
 
 impl TextPrompt {
-    pub fn new(
+    pub(crate) fn new(
         title: &str,
         ok_label: &str,
         initial: &str,
@@ -40,11 +40,7 @@ impl TextPrompt {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let input = cx.new(|cx| {
-            let mut input = TextInput::new("", false, cx);
-            input.set_text(initial, cx);
-            input
-        });
+        let input = cx.new(|cx| TextInput::new("", cx).with_text(initial));
         let subscription = cx.subscribe_in(
             &input,
             window,
@@ -66,7 +62,7 @@ impl TextPrompt {
     }
 
     /// Accepts any text that is not empty, for what is not a file name.
-    pub fn any_text(mut self) -> Self {
+    pub(crate) fn any_text(mut self) -> Self {
         self.any_text = true;
         self
     }
@@ -101,22 +97,15 @@ impl Render for TextPrompt {
                     .clone()
                     .map(|e| div().text_color(theme.error).child(e)),
             )
-            .child(
-                button_row()
-                    .child(
-                        Button::new("cancel")
-                            .keyboard_focus()
-                            .label("Cancel")
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(super::CancelEvent))),
-                    )
-                    .child(
-                        Button::new("ok")
-                            .keyboard_focus()
-                            .label(self.ok_label.clone())
-                            .style(ButtonStyle::Primary)
-                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
-                    ),
-            )
+            .child(cancel_and(
+                "cancel",
+                |_, cx| cx.emit(super::CancelEvent),
+                Button::new("ok")
+                    .label(self.ok_label.clone())
+                    .style(ButtonStyle::Primary)
+                    .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+                cx,
+            ))
     }
 }
 

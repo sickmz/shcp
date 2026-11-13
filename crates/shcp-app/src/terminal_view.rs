@@ -7,18 +7,18 @@ use crate::clipboard::{self, Clip};
 use crate::session_overlay::{self, Overlay, Surface};
 use crate::state::AppState;
 use crate::terminal_element::{SharedMetrics, TerminalElement};
-use crate::terminal_input::{self, Input};
-use crate::theme::ActiveTheme as _;
+use crate::terminal_input;
+use crate::theme::{ActiveTheme as _, Theme};
 use crate::widgets::button::{Button, ButtonStyle};
 use crate::widgets::icon::IconName;
 use crate::widgets::scrollbar::{ScrollDrag, ScrollMetrics, scrollbar};
 use crate::widgets::text_input::{TextInput, TextInputEvent};
 use gpui::prelude::*;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, Entity, ExternalPaths, FocusHandle,
-    Focusable, Font, FontFeatures, FontStyle, FontWeight, KeyDownEvent, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent,
-    SharedString, Subscription, Task, Window, div, px,
+    AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle, Div, Entity, ExternalPaths,
+    FocusHandle, Focusable, Font, FontFeatures, FontStyle, FontWeight, KeyDownEvent, Modifiers,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Point, ScrollWheelEvent, SharedString, Stateful, Subscription, Task, Window, div, px,
 };
 use shcp_core::term::{self, GridPoint, MouseAction, MouseInput, SelectKind, TerminalLink};
 use shcp_core::{
@@ -31,15 +31,15 @@ use std::{cell::Cell, collections::HashSet, rc::Rc, time::Duration};
 /// draws again for them, and a fast wheel sends many events anyway.
 const MAX_WHEEL_EVENTS: usize = 5;
 
-/// Inset above the first terminal row, also used to align the sidebar's groups.
-pub(crate) const CONTENT_TOP_PADDING: f32 = 14.;
+/// Inset above the first terminal row.
+const CONTENT_TOP_PADDING: f32 = 14.;
 
 struct Selecting {
     origin: GridPoint,
     started: bool,
 }
 
-pub struct TerminalView {
+pub(crate) struct TerminalView {
     state: Entity<AppState>,
     host: HostId,
     /// Its name on the server, when its shell should outlive the app.
@@ -79,17 +79,34 @@ pub struct TerminalView {
     _subscriptions: Vec<Subscription>,
 }
 
-/// The configured family if installed, else Consolas on Windows (always present).
+/// The configured family if installed, else Consolas (always present on Windows).
 fn resolve_font(configured: &str, cx: &App) -> SharedString {
     let installed = cx
         .text_system()
         .all_font_names()
         .iter()
         .any(|name| name.eq_ignore_ascii_case(configured));
-    if cfg!(windows) && !installed {
+    if !installed {
         SharedString::from("Consolas")
     } else {
         SharedString::from(configured.to_string())
+    }
+}
+
+/// What the mouse did, for the program in the terminal. Shift never reaches it: it selects.
+fn mouse_input(
+    action: MouseAction,
+    button: Option<term::MouseButton>,
+    point: GridPoint,
+    modifiers: Modifiers,
+) -> MouseInput {
+    MouseInput {
+        action,
+        button,
+        point,
+        ctrl: modifiers.control,
+        alt: modifiers.alt,
+        shift: false,
     }
 }
 
@@ -111,7 +128,7 @@ impl Focusable for TerminalView {
 impl TerminalView {
     /// `key` names a shell on the server. If `known`, it is from the last run, and a terminal
     /// whose shell is not there any more was closed in the meantime.
-    pub fn new(
+    pub(crate) fn new(
         state: Entity<AppState>,
         host: HostId,
         key: Option<String>,
@@ -133,7 +150,7 @@ impl TerminalView {
             .read(cx)
             .engine
             .open_terminal(session, 80, 24, persist);
-        let search_input = cx.new(|cx| TextInput::new("Find", false, cx));
+        let search_input = cx.new(|cx| TextInput::new("Find", cx));
         let search_focus = search_input.focus_handle(cx);
         let focus = cx.focus_handle();
         let mut viewport_size = window.viewport_size();
@@ -173,7 +190,7 @@ impl TerminalView {
                 } = event
                     && *host == this.host
                     && *id != this.session
-                    && this.session_is_gone(cx)
+                    && this.state.read(cx).session_gone(this.session)
                 {
                     let known = this.expects_shell();
                     this.attach(*id, known, cx);
@@ -238,29 +255,29 @@ impl TerminalView {
     }
 
     /// Its name on the server, to find its shell again at the next start.
-    pub fn key(&self) -> Option<String> {
+    pub(crate) fn key(&self) -> Option<String> {
         self.key.clone()
     }
 
-    pub fn terminal_id(&self) -> TerminalId {
+    pub(crate) fn terminal_id(&self) -> TerminalId {
         self.terminal.id()
     }
 
-    pub fn is_alive(&self) -> bool {
+    pub(crate) fn is_alive(&self) -> bool {
         self.terminal.is_alive()
     }
 
     /// Its shell should be on the server, so if it is not, it was closed in the meantime.
-    pub fn expects_shell(&self) -> bool {
+    pub(crate) fn expects_shell(&self) -> bool {
         self.known || self.terminal.shell_started()
     }
 
-    pub fn area(&self) -> Option<Bounds<Pixels>> {
+    pub(crate) fn area(&self) -> Option<Bounds<Pixels>> {
         self.metrics.get().map(|m| m.bounds)
     }
 
     /// The terminal or its search bar has the keyboard.
-    pub fn contains_focus(&self, window: &Window, cx: &App) -> bool {
+    pub(crate) fn contains_focus(&self, window: &Window, cx: &App) -> bool {
         self.focus.contains_focused(window, cx)
             || self
                 .search_input
@@ -268,29 +285,20 @@ impl TerminalView {
                 .contains_focused(window, cx)
     }
 
-    pub fn selected_text(&self) -> Option<String> {
+    pub(crate) fn selected_text(&self) -> Option<String> {
         self.terminal.selection_text().filter(|t| !t.is_empty())
     }
 
     /// Types a command and presses Enter.
-    pub fn run_command(&mut self, command: &str, cx: &mut Context<Self>) {
+    pub(crate) fn run_command(&mut self, command: &str, cx: &mut Context<Self>) {
         self.reset_cursor_blink(cx);
         self.terminal.text(&format!("{command}\r"));
         cx.notify();
     }
 
-    fn session_is_gone(&self, cx: &App) -> bool {
-        self.state.read(cx).session(self.session).is_none_or(|s| {
-            matches!(
-                s.state,
-                SessionState::Disconnected { .. } | SessionState::Failed { .. }
-            )
-        })
-    }
-
     /// The connection is up and this terminal has no shell: it ended, or the server refused one.
-    pub fn shell_gone(&self, cx: &App) -> bool {
-        !self.terminal.is_alive() && !self.session_is_gone(cx)
+    pub(crate) fn shell_gone(&self, cx: &App) -> bool {
+        !self.terminal.is_alive() && !self.state.read(cx).session_gone(self.session)
     }
 
     /// A new shell on `session`, in the same terminal: what it showed stays in the scrollback.
@@ -304,17 +312,17 @@ impl TerminalView {
         cx.notify();
     }
 
-    pub fn title(&self) -> Option<String> {
+    pub(crate) fn title(&self) -> Option<String> {
         self.terminal.title().filter(|t| !t.is_empty())
     }
 
     /// The folder the shell is in, as far as it says. `~` stands for its home.
-    pub fn cwd(&self) -> Option<String> {
+    pub(crate) fn cwd(&self) -> Option<String> {
         self.terminal.cwd()
     }
 
     /// Releases the backend terminal; call when the tab is closed.
-    pub fn close(&self, cx: &App) {
+    pub(crate) fn close(&self, cx: &App) {
         self.state
             .read(cx)
             .engine
@@ -322,7 +330,7 @@ impl TerminalView {
     }
 
     /// Lets go of the terminal, leaving its shell to whoever else has it.
-    pub fn detach(&self, cx: &App) {
+    pub(crate) fn detach(&self, cx: &App) {
         self.state
             .read(cx)
             .engine
@@ -351,8 +359,7 @@ impl TerminalView {
 
     fn open_search(&mut self, _: &FindInTerminal, window: &mut Window, cx: &mut Context<Self>) {
         // What is selected is usually what to look for.
-        let selected = self.terminal.selection_text().filter(|t| !t.contains('\n'));
-        if let Some(text) = selected.filter(|t| !t.is_empty()) {
+        if let Some(text) = self.selected_text().filter(|t| !t.contains('\n')) {
             self.search_input
                 .update(cx, |input, cx| input.set_text(&text, cx));
         }
@@ -432,38 +439,49 @@ impl TerminalView {
             && keys.modifiers.control
             && !keys.modifiers.shift
             && !keys.modifiers.alt
-            && let Some(text) = self.terminal.selection_text().filter(|t| !t.is_empty())
+            && self.copy_selection(cx)
         {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
             self.terminal.select_clear();
             cx.notify();
             cx.stop_propagation();
             return;
         }
-        match terminal_input::from_keystroke(&event.keystroke) {
-            // Platform text input handles layout, dead keys, AltGr and IME commits.
-            Some(Input::Text) => return,
-            Some(Input::Key(key)) => self.terminal.key(key),
-            None => return,
-        }
+        // Platform text input handles layout, dead keys, AltGr and IME commits.
+        let Some(key) = terminal_input::from_keystroke(&event.keystroke) else {
+            return;
+        };
+        self.terminal.key(key);
         cx.notify();
         cx.stop_propagation();
     }
 
     fn copy(&mut self, _: &CopySelection, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = self.terminal.selection_text().filter(|t| !t.is_empty()) {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
-        }
+        self.copy_selection(cx);
+    }
+
+    /// Copies what is selected. `false`: nothing is.
+    fn copy_selection(&self, cx: &mut Context<Self>) -> bool {
+        let Some(text) = self.selected_text() else {
+            return false;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        true
     }
 
     /// `false`: the clipboard has nothing to paste.
-    pub fn paste_clipboard(&mut self, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn paste_clipboard(&mut self, cx: &mut Context<Self>) -> bool {
         self.reset_cursor_blink(cx);
         match clipboard::read(cx) {
             Some(Clip::Text(text)) => self.terminal.paste(&text),
             Some(Clip::Image { name, data }) => {
-                let name = name.to_string();
-                self.send_file(&name.clone(), PasteFile::Bytes { name, data }, cx);
+                self.send_file(
+                    name,
+                    PasteFile::Bytes {
+                        name: name.to_string(),
+                        data,
+                    },
+                    cx,
+                );
             }
             None => return false,
         }
@@ -537,14 +555,7 @@ impl TerminalView {
             && let (Some(button), Some(point)) =
                 (term_button(event.button), self.grid_point(event.position))
         {
-            let input = MouseInput {
-                action: MouseAction::Press,
-                button: Some(button),
-                point,
-                ctrl: event.modifiers.control,
-                alt: event.modifiers.alt,
-                shift: false,
-            };
+            let input = mouse_input(MouseAction::Press, Some(button), point, event.modifiers);
             if self.terminal.mouse(input) {
                 self.terminal.select_clear();
                 self.reported_button = Some(button);
@@ -587,12 +598,7 @@ impl TerminalView {
         cx.notify();
     }
 
-    pub fn mouse_move(
-        &mut self,
-        event: &MouseMoveEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         self.update_hovered_link(event.position, event.modifiers.control, cx);
         if self.reported_button.is_some()
             || (self.selecting.is_none() && self.terminal.mouse_mode() && !event.modifiers.shift)
@@ -608,14 +614,12 @@ impl TerminalView {
                 return;
             }
             self.last_reported = Some(point);
-            self.terminal.mouse(MouseInput {
-                action: MouseAction::Move,
-                button: self.reported_button,
+            self.terminal.mouse(mouse_input(
+                MouseAction::Move,
+                self.reported_button,
                 point,
-                ctrl: event.modifiers.control,
-                alt: event.modifiers.alt,
-                shift: false,
-            });
+                event.modifiers,
+            ));
             return;
         }
         if event.pressed_button != Some(MouseButton::Left) {
@@ -640,20 +644,18 @@ impl TerminalView {
         cx.notify();
     }
 
-    pub fn mouse_up(&mut self, event: &MouseUpEvent, _cx: &mut Context<Self>) {
+    pub(crate) fn mouse_up(&mut self, event: &MouseUpEvent) {
         self.selecting = None;
         if let Some(button) = self.reported_button.take()
             && term_button(event.button) == Some(button)
             && let Some(point) = self.grid_point(event.position)
         {
-            self.terminal.mouse(MouseInput {
-                action: MouseAction::Release,
-                button: Some(button),
+            self.terminal.mouse(mouse_input(
+                MouseAction::Release,
+                Some(button),
                 point,
-                ctrl: event.modifiers.control,
-                alt: event.modifiers.alt,
-                shift: false,
-            });
+                event.modifiers,
+            ));
         }
     }
 
@@ -679,14 +681,7 @@ impl TerminalView {
                 term::MouseButton::WheelDown
             };
             self.terminal.mouse_repeated(
-                MouseInput {
-                    action: MouseAction::Press,
-                    button: Some(button),
-                    point,
-                    ctrl: event.modifiers.control,
-                    alt: event.modifiers.alt,
-                    shift: false,
-                },
+                mouse_input(MouseAction::Press, Some(button), point, event.modifiers),
                 (lines.abs() as usize).min(MAX_WHEEL_EVENTS),
             );
             return;
@@ -698,97 +693,34 @@ impl TerminalView {
     }
 }
 
-impl Render for TerminalView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let configured = self.state.read(cx).settings.terminal_font_family.clone();
-        if configured != self.configured_font {
-            self.font_family = resolve_font(&configured, cx);
-            self.configured_font = configured;
-            self.metrics.set(None);
-        }
-        let state = self.state.read(cx);
-        let font = Font {
+impl TerminalView {
+    fn terminal_font(&self, theme: &Theme) -> Font {
+        Font {
             family: self.font_family.clone(),
             features: FontFeatures::default(),
             fallbacks: None,
             // Geist Mono has no hinting, and light on dark its strokes come out soft at regular
             // weight. Dark on light gpui thickens them itself, and more would blur them.
-            weight: if self.font_family.as_ref() == crate::theme::MONO_FAMILY
-                && !cx.theme().is_light
-            {
+            weight: if self.font_family.as_ref() == crate::theme::MONO_FAMILY && !theme.is_light {
                 FontWeight::MEDIUM
             } else {
                 FontWeight::NORMAL
             },
             style: FontStyle::Normal,
-        };
-        let font_size = px(state.settings.terminal_font_size);
-        // SSH progress and sign-in cover the whole tab, above every split.
-        let connection_busy = !matches!(
-            state.host_session(&self.host).map(|session| &session.state),
-            Some(SessionState::Connected)
-        ) || state.login_prompt(&self.host, cx).is_some();
-        let shell_started = self.terminal.shell_started();
-        self.had_session |= shell_started
-            && matches!(
-                state.session(self.session).map(|s| &s.state),
-                Some(SessionState::Connected)
-            );
-        let heading = state.host(&self.host).map(session_overlay::heading);
-        let shell_steps = session_overlay::shell_steps(state.host_session(&self.host));
-        let overlay = if connection_busy {
-            None
-        } else if !self.terminal.is_alive() {
-            Some(Overlay::Closed("Shell exited".into()))
-        } else {
-            // A new split can wait for its own shell after the shared connection is ready.
-            (!self.shared_startup && self.starting_shell())
-                .then_some(Overlay::StartingShell { steps: shell_steps })
-        };
-        let focused = self.focus.is_focused(window);
-        if focused != self.was_focused {
-            self.was_focused = focused;
-            self.terminal.focus_changed(focused);
         }
-        let settings = &self.state.read(cx).settings;
-        let (blinks, cursor_shape) = (
-            settings.cursor_blink,
-            match settings.cursor_style {
-                shcp_core::CursorStyle::Program => None,
-                shcp_core::CursorStyle::Block => Some(term::CursorShape::Block),
-                shcp_core::CursorStyle::Bar => Some(term::CursorShape::Beam),
-                shcp_core::CursorStyle::Underline => Some(term::CursorShape::Underline),
-            },
-        );
-        if blinks && focused && window.is_window_active() && overlay.is_none() && !connection_busy {
-            if self.cursor_blink.is_none() {
-                self.start_cursor_blink(cx);
-            }
-        } else {
-            self.cursor_blink = None;
-            self.cursor_visible = true;
-        }
-        let element = TerminalElement {
-            view: cx.entity(),
-            terminal: self.terminal.clone(),
-            font,
-            font_size,
-            focused,
-            // The card waiting for the shell lets the terminal through, which has nothing yet.
-            cursor_visible: self.cursor_visible
-                && !matches!(overlay, Some(Overlay::StartingShell { .. })),
-            cursor_shape,
-            metrics: self.metrics.clone(),
-            theme: theme.clone(),
-            hovered_link: self.hovered_link.as_ref().map(|l| (l.start, l.end)),
-        };
-        let link_url = self.hovered_link.as_ref().map(|link| link.url.clone());
-        // The search bar stays out of the "Terminal" key context: Ctrl+V there goes to its field.
-        let terminal = div()
+    }
+
+    /// The search bar stays out of the "Terminal" key context: Ctrl+V there goes to its field.
+    fn terminal_area(
+        &self,
+        element: TerminalElement,
+        link_hovered: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        div()
             .id("terminal")
             .key_context("Terminal")
-            .when(link_url.is_some() && self.link_armed, |this| {
+            .when(link_hovered && self.link_armed, |this| {
                 this.cursor(CursorStyle::PointingHand)
             })
             .on_modifiers_changed(
@@ -828,53 +760,206 @@ impl Render for TerminalView {
                     .pt(px(CONTENT_TOP_PADDING))
                     .pb(px(18.))
                     .child(element),
+            )
+    }
+
+    fn overlay_card(
+        &self,
+        overlay: Overlay,
+        heading: Option<(String, String)>,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        session_overlay::render(
+            overlay,
+            Surface {
+                heading,
+                reconnecting: false,
+                docked: self.had_session,
+                // Over a card of material nothing: a flat fill would put out its light until
+                // the shell is there, and the terminal under it is still empty.
+                background: if theme.material().is_some() {
+                    gpui::transparent_black()
+                } else {
+                    theme.terminal_bg
+                },
+                focus: self.focus.clone(),
+                shell_step: true,
+                owner: cx.entity_id(),
+            },
+            theme,
+            window,
+            cx,
+            cx.listener(|this, _, window, cx| {
+                this.retry(cx);
+                window.focus(&this.focus);
+            }),
+        )
+    }
+
+    fn scroll_bar(&self, theme: &Theme) -> impl IntoElement + use<> {
+        let (read, moved) = (self.terminal.clone(), self.terminal.clone());
+        scrollbar(
+            self.scroll_drag.clone(),
+            theme.text_muted,
+            move |_| {
+                let (offset, history, rows) = read.scroll_position();
+                (history > 0).then(|| ScrollMetrics {
+                    position: 1. - offset as f32 / history as f32,
+                    visible: rows as f32 / (rows + history) as f32,
+                })
+            },
+            move |position, _, _| {
+                let (_, history, _) = moved.scroll_position();
+                moved.scroll_to_offset(((1. - position) * history as f32).round() as usize);
+            },
+        )
+    }
+
+    /// Find in the scrollback, over the top right corner.
+    fn search_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let missed = self.search_missed;
+        div()
+            .id("terminal-search")
+            .occlude()
+            .absolute()
+            .top(px(8.))
+            .right(px(16.))
+            .w(px(340.))
+            .p(px(4.))
+            .flex()
+            .items_center()
+            .gap(px(2.))
+            .map(|this| {
+                crate::panel::floating_card(
+                    this,
+                    theme,
+                    if missed { theme.error } else { theme.border },
+                )
+            })
+            // The material has no border to turn red.
+            .when(missed && theme.material().is_some(), |this| {
+                this.border_1().border_color(theme.error)
+            })
+            .text_size(crate::theme::ui_px(12.))
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "enter" && event.keystroke.modifiers.shift {
+                    this.search_step(false, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .child(div().flex_1().min_w_0().child(self.search_input.clone()))
+            .when(missed, |this| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .px(px(4.))
+                        .text_color(theme.error)
+                        .child("No results"),
+                )
+            })
+            .child(
+                Button::new("search-older")
+                    .icon(IconName::ChevronUp)
+                    .tooltip("Previous match (Enter)")
+                    .style(ButtonStyle::Ghost)
+                    .on_click(cx.listener(|this, _, _, cx| this.search_step(true, cx))),
+            )
+            .child(
+                Button::new("search-newer")
+                    .icon(IconName::ChevronDown)
+                    .tooltip("Next match (Shift+Enter)")
+                    .style(ButtonStyle::Ghost)
+                    .on_click(cx.listener(|this, _, _, cx| this.search_step(false, cx))),
+            )
+            .child(
+                Button::new("search-close")
+                    .icon(IconName::Close)
+                    .tooltip("Close (Esc)")
+                    .style(ButtonStyle::Ghost)
+                    .on_click(cx.listener(|this, _, window, cx| this.close_search(window, cx))),
+            )
+    }
+}
+
+impl Render for TerminalView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let configured = self.state.read(cx).settings.terminal_font_family.clone();
+        if configured != self.configured_font {
+            self.font_family = resolve_font(&configured, cx);
+            self.configured_font = configured;
+            self.metrics.set(None);
+        }
+        let state = self.state.read(cx);
+        let font = self.terminal_font(&theme);
+        let font_size = px(state.settings.terminal_font_size);
+        // SSH progress and sign-in cover the whole tab, above every split.
+        let connection_busy = !matches!(
+            state.host_session(&self.host).map(|session| &session.state),
+            Some(SessionState::Connected)
+        ) || state.login_prompt(&self.host, cx).is_some();
+        let shell_started = self.terminal.shell_started();
+        self.had_session |= shell_started
+            && matches!(
+                state.session(self.session).map(|s| &s.state),
+                Some(SessionState::Connected)
             );
-        // Outside the terminal: a key pressed in the prompt must never reach the shell.
-        let overlay = overlay.map(|overlay| {
-            session_overlay::render(
-                overlay,
-                Surface {
-                    heading,
-                    reconnecting: false,
-                    docked: self.had_session,
-                    // Over a card of material nothing: a flat fill would put out its light until
-                    // the shell is there, and the terminal under it is still empty.
-                    background: if theme.material().is_some() {
-                        gpui::transparent_black()
-                    } else {
-                        theme.terminal_bg
-                    },
-                    focus: self.focus.clone(),
-                    extra_steps: 1,
-                    owner: cx.entity_id(),
-                },
-                &theme,
-                window,
-                cx,
-                cx.listener(|this, _, window, cx| {
-                    this.retry(cx);
-                    window.focus(&this.focus);
-                }),
-            )
-        });
-        let bar = {
-            let (read, moved) = (self.terminal.clone(), self.terminal.clone());
-            scrollbar(
-                self.scroll_drag.clone(),
-                theme.text_muted,
-                move |_| {
-                    let (offset, history, rows) = read.scroll_position();
-                    (history > 0).then(|| ScrollMetrics {
-                        position: 1. - offset as f32 / history as f32,
-                        visible: rows as f32 / (rows + history) as f32,
-                    })
-                },
-                move |position, _, _| {
-                    let (_, history, _) = moved.scroll_position();
-                    moved.scroll_to_offset(((1. - position) * history as f32).round() as usize);
-                },
-            )
+        let heading = state.host(&self.host).map(session_overlay::heading);
+        let shell_steps = session_overlay::shell_steps(state.host_session(&self.host));
+        let overlay = if connection_busy {
+            None
+        } else if !self.terminal.is_alive() {
+            Some(Overlay::Closed("Shell exited".into()))
+        } else {
+            // A new split can wait for its own shell after the shared connection is ready.
+            (!self.shared_startup && self.starting_shell())
+                .then_some(Overlay::StartingShell { steps: shell_steps })
         };
+        let focused = self.focus.is_focused(window);
+        if focused != self.was_focused {
+            self.was_focused = focused;
+            self.terminal.focus_changed(focused);
+        }
+        let settings = &state.settings;
+        let (blinks, cursor_shape) = (
+            settings.cursor_blink,
+            match settings.cursor_style {
+                shcp_core::CursorStyle::Program => None,
+                shcp_core::CursorStyle::Block => Some(term::CursorShape::Block),
+                shcp_core::CursorStyle::Bar => Some(term::CursorShape::Beam),
+                shcp_core::CursorStyle::Underline => Some(term::CursorShape::Underline),
+            },
+        );
+        if blinks && focused && window.is_window_active() && overlay.is_none() && !connection_busy {
+            if self.cursor_blink.is_none() {
+                self.start_cursor_blink(cx);
+            }
+        } else {
+            self.cursor_blink = None;
+            self.cursor_visible = true;
+        }
+        let element = TerminalElement {
+            view: cx.entity(),
+            terminal: self.terminal.clone(),
+            font,
+            font_size,
+            focused,
+            // The card waiting for the shell lets the terminal through, which has nothing yet.
+            cursor_visible: self.cursor_visible
+                && !matches!(overlay, Some(Overlay::StartingShell { .. })),
+            cursor_shape,
+            metrics: self.metrics.clone(),
+            theme: theme.clone(),
+            hovered_link: self.hovered_link.as_ref().map(|l| (l.start, l.end)),
+        };
+        let link_url = self.hovered_link.as_ref().map(|link| link.url.clone());
+        let terminal = self.terminal_area(element, link_url.is_some(), cx);
+        // Outside the terminal: a key pressed in the prompt must never reach the shell.
+        let overlay =
+            overlay.map(|overlay| self.overlay_card(overlay, heading, &theme, window, cx));
+        let bar = self.scroll_bar(&theme);
         // The search bar is part of this terminal, and a drag ends only where the bar can see it.
         let show_bar = focused
             || self
@@ -889,110 +974,34 @@ impl Render for TerminalView {
             .child(terminal)
             .when(show_bar, |this| this.child(bar))
             .children(overlay)
-            .when_some(link_url, |this, url| {
-                this.child(
-                    // Shows where a link really goes: its text can say anything. The outer box
-                    // gives the text a width to shorten to; alone it would shrink to nothing.
-                    div()
-                        .absolute()
-                        .left(px(8.))
-                        .right(px(8.))
-                        .bottom(px(8.))
-                        .flex()
-                        .child(
-                            div()
-                                .min_w_0()
-                                .px(px(8.))
-                                .py(px(3.))
-                                .truncate()
-                                .rounded(px(crate::theme::RADIUS_SMALL))
-                                .map(|this| {
-                                    crate::panel::floating(
-                                        this,
-                                        &theme,
-                                        crate::theme::RADIUS_SMALL,
-                                        theme.border,
-                                    )
-                                })
-                                .text_size(crate::theme::ui_px(12.))
-                                .text_color(theme.text_muted)
-                                .child(format!("Ctrl+click to open {url}")),
-                        ),
-                )
-            })
+            .when_some(link_url, |this, url| this.child(link_hint(&theme, &url)))
             .when(self.search_open, |this| {
-                let missed = self.search_missed;
-                this.child(
-                    div()
-                        .id("terminal-search")
-                        .occlude()
-                        .absolute()
-                        .top(px(8.))
-                        .right(px(16.))
-                        .w(px(340.))
-                        .p(px(4.))
-                        .flex()
-                        .items_center()
-                        .gap(px(2.))
-                        .rounded(px(crate::theme::RADIUS_CARD))
-                        .map(|this| {
-                            crate::panel::floating(
-                                this,
-                                &theme,
-                                crate::theme::RADIUS_CARD,
-                                if missed { theme.error } else { theme.border },
-                            )
-                        })
-                        // The material has no border to turn red.
-                        .when(missed && theme.material().is_some(), |this| {
-                            this.border_1().border_color(theme.error)
-                        })
-                        .shadow(crate::theme::float_shadow())
-                        .text_size(crate::theme::ui_px(12.))
-                        .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                            if event.keystroke.key == "enter" && event.keystroke.modifiers.shift {
-                                this.search_step(false, cx);
-                                cx.stop_propagation();
-                            }
-                        }))
-                        .child(div().flex_1().min_w_0().child(self.search_input.clone()))
-                        .when(missed, |this| {
-                            this.child(
-                                div()
-                                    .flex_none()
-                                    .px(px(4.))
-                                    .text_color(theme.error)
-                                    .child("No results"),
-                            )
-                        })
-                        .child(
-                            Button::new("search-older")
-                                .icon(IconName::ChevronUp)
-                                .tooltip("Previous match (Enter)")
-                                .style(ButtonStyle::Ghost)
-                                .on_click(cx.listener(|this, _, _, cx| this.search_step(true, cx))),
-                        )
-                        .child(
-                            Button::new("search-newer")
-                                .icon(IconName::ChevronDown)
-                                .tooltip("Next match (Shift+Enter)")
-                                .style(ButtonStyle::Ghost)
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.search_step(false, cx)),
-                                ),
-                        )
-                        .child(
-                            Button::new("search-close")
-                                .icon(IconName::Close)
-                                .tooltip("Close (Esc)")
-                                .style(ButtonStyle::Ghost)
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| {
-                                        this.close_search(window, cx)
-                                    }),
-                                ),
-                        ),
-                )
+                this.child(self.search_bar(&theme, cx))
             })
     }
+}
+
+/// Shows where a link really goes: its text can say anything. The outer box gives the text a
+/// width to shorten to; alone it would shrink to nothing.
+fn link_hint(theme: &Theme, url: &str) -> impl IntoElement + use<> {
+    div()
+        .absolute()
+        .left(px(8.))
+        .right(px(8.))
+        .bottom(px(8.))
+        .flex()
+        .child(
+            div()
+                .min_w_0()
+                .px(px(8.))
+                .py(px(3.))
+                .truncate()
+                .rounded(px(crate::theme::RADIUS_SMALL))
+                .map(|this| {
+                    crate::panel::floating(this, theme, crate::theme::RADIUS_SMALL, theme.border)
+                })
+                .text_size(crate::theme::ui_px(12.))
+                .text_color(theme.text_muted)
+                .child(format!("Ctrl+click to open {url}")),
+        )
 }

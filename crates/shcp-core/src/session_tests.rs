@@ -1,12 +1,13 @@
 //! Real connections on this machine: SSH servers in the test, a jump between them and a SOCKS
 //! proxy through them, down to a service that echoes what it gets.
 use super::*;
+use crate::test_support::Scratch;
 use russh::{
     Channel,
     keys::{PrivateKey, ssh_key::private::Ed25519Keypair},
     server::{self, Auth, ChannelOpenHandle, Msg, Session},
 };
-use std::{path::PathBuf, sync::atomic::AtomicU64};
+use std::sync::atomic::AtomicU64;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -183,49 +184,17 @@ fn test_host(alias: &str, port: u16) -> HostConfig {
     }
 }
 
-struct Scratch(PathBuf);
-impl Scratch {
-    fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "shcp-session-test-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-}
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 /// A session context whose user accepts every host key.
 fn context(dir: &Scratch, host: HostConfig, jumps: Vec<HostConfig>) -> Arc<Context> {
     let (events, receiver) = async_channel::unbounded();
-    let context = Arc::new(Context {
-        id: SessionId(1),
+    let context = Arc::new(Context::new(
+        SessionId(1),
         host,
         jumps,
-        remote_forwards: Mutex::new(HashMap::new()),
-        paths: AppPaths {
-            config_dir: dir.0.clone(),
-            data_dir: dir.0.clone(),
-            log_dir: dir.0.clone(),
-            known_hosts: dir.0.join("known_hosts"),
-            ssh_config: dir.0.join("config"),
-        },
+        dir.paths(),
         events,
-        cancel: CancellationToken::new(),
-        prompts: Prompts::new(),
-        known_hosts_lock: Arc::new(Mutex::new(())),
-        use_agent: false,
-        open_forwards: false,
-        persist_terminals: false,
-        tmux: Default::default(),
-    });
+        Arc::new(Mutex::new(())),
+    ));
     let answers = context.prompts.host_tx.clone();
     tokio::spawn(async move {
         while let Ok(event) = receiver.recv().await {
@@ -309,7 +278,7 @@ fn each_jump_host_adds_its_steps_and_forwards_come_last() {
 
 #[tokio::test]
 async fn a_connection_goes_through_its_jump_hosts() {
-    let dir = Scratch::new();
+    let dir = Scratch::new("session-test");
     let (first, first_opened) = ssh_server(1).await;
     let (second, second_opened) = ssh_server(2).await;
     let (target, target_opened) = ssh_server(3).await;
@@ -353,7 +322,7 @@ async fn a_connection_goes_through_its_jump_hosts() {
 
 #[tokio::test]
 async fn a_jump_host_that_cannot_be_reached_is_named() {
-    let dir = Scratch::new();
+    let dir = Scratch::new("session-test");
     let (target, _) = ssh_server(1).await;
     let closed = closed_port().await;
     let ctx = context(
@@ -367,7 +336,7 @@ async fn a_jump_host_that_cannot_be_reached_is_named() {
 
 #[tokio::test]
 async fn a_target_the_jump_host_cannot_reach_is_an_error() {
-    let dir = Scratch::new();
+    let dir = Scratch::new("session-test");
     let (bastion, _) = ssh_server(1).await;
     let closed = closed_port().await;
     let ctx = context(
@@ -403,7 +372,7 @@ async fn eventually(what: &str, condition: impl Fn() -> bool) {
 
 #[tokio::test]
 async fn a_remote_forward_brings_connections_from_the_server_to_this_pc() {
-    let dir = Scratch::new();
+    let dir = Scratch::new("session-test");
     let (server_port, _, side) = ssh_server_with_side(1).await;
     let echo = echo_service().await;
     let ctx = context(&dir, test_host("target", server_port), vec![]);
@@ -453,7 +422,7 @@ async fn a_remote_forward_brings_connections_from_the_server_to_this_pc() {
 
 #[tokio::test]
 async fn a_remote_forward_the_server_refuses_says_so() {
-    let dir = Scratch::new();
+    let dir = Scratch::new("session-test");
     let (server_port, _, _) = ssh_server_with_side(1).await;
     let (events, receiver) = async_channel::unbounded();
     let mut ctx = Arc::into_inner(context(&dir, test_host("target", server_port), vec![])).unwrap();
@@ -484,7 +453,7 @@ async fn a_remote_forward_the_server_refuses_says_so() {
 
 #[tokio::test]
 async fn the_agent_stays_closed_unless_the_host_allows_it() {
-    let dir = Scratch::new();
+    let dir = Scratch::new("session-test");
     let (server_port, _, side) = ssh_server_with_side(1).await;
     let ctx = context(&dir, test_host("target", server_port), vec![]);
     let (_ssh, _jumps) = connected(&ctx).await.unwrap();
@@ -492,7 +461,6 @@ async fn the_agent_stays_closed_unless_the_host_allows_it() {
 }
 
 /// One test, since it sets where the agent is for the whole process.
-#[cfg(windows)]
 #[tokio::test]
 async fn an_allowed_agent_reaches_the_server_but_never_a_jump_host() {
     use tokio::net::windows::named_pipe::ServerOptions;
@@ -514,7 +482,7 @@ async fn an_allowed_agent_reaches_the_server_but_never_a_jump_host() {
         }
     });
 
-    let dir = Scratch::new();
+    let dir = Scratch::new("session-test");
     let (bastion, _, bastion_side) = ssh_server_with_side(1).await;
     let (target, _, target_side) = ssh_server_with_side(2).await;
     let mut jump = test_host("bastion", bastion);
@@ -536,7 +504,7 @@ async fn an_allowed_agent_reaches_the_server_but_never_a_jump_host() {
 
 #[tokio::test]
 async fn a_copy_runs_cp_with_every_path_quoted_and_reports_what_it_says() {
-    let dir = Scratch::new();
+    let dir = Scratch::new("session-test");
     let (server_port, _, side) = ssh_server_with_side(1).await;
     let ctx = context(&dir, test_host("target", server_port), vec![]);
     let (ssh, _jumps) = connected(&ctx).await.unwrap();
@@ -584,7 +552,7 @@ async fn socks_connect(stream: &mut TcpStream, port: u16) -> u8 {
 
 #[tokio::test]
 async fn a_socks_proxy_reaches_services_through_the_connection() {
-    let dir = Scratch::new();
+    let dir = Scratch::new("session-test");
     let (server_port, opened) = ssh_server(1).await;
     let echo = echo_service().await;
     let closed = closed_port().await;
@@ -625,7 +593,7 @@ async fn a_socks_proxy_reaches_services_through_the_connection() {
 
 #[tokio::test]
 async fn stopping_a_remote_forward_closes_its_connections() {
-    let dir = Scratch::new();
+    let dir = Scratch::new("session-test");
     let (server_port, _, side) = ssh_server_with_side(1).await;
     let echo = echo_service().await;
     let ctx = context(&dir, test_host("target", server_port), vec![]);
@@ -678,7 +646,7 @@ async fn stopping_a_remote_forward_closes_its_connections() {
 
 #[tokio::test]
 async fn a_jump_host_cannot_use_the_remote_forward_of_the_target() {
-    let dir = Scratch::new();
+    let dir = Scratch::new("session-test");
     let (bastion_port, _, bastion_side) = ssh_server_with_side(1).await;
     let (target_port, _, target_side) = ssh_server_with_side(2).await;
     let echo = echo_service().await;

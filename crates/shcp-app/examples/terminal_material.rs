@@ -14,7 +14,7 @@ const GAP: f32 = 6.;
 struct Preview;
 
 impl Preview {
-    fn pane(&self, title: &'static str, active: bool) -> Div {
+    fn pane(title: &'static str, active: bool) -> Div {
         let material = Material {
             radius: 12.,
             ..Material::smoked(rgb(0x22201e).into())
@@ -56,7 +56,7 @@ impl Render for Preview {
                         div()
                             .w(relative(0.55))
                             .h_full()
-                            .child(self.pane("active", true)),
+                            .child(Self::pane("active", true)),
                     )
                     .child(
                         div()
@@ -66,12 +66,12 @@ impl Render for Preview {
                             .flex()
                             .flex_col()
                             .gap(px(GAP))
-                            .child(div().h(relative(0.4)).child(self.pane("idle, top", false)))
+                            .child(div().h(relative(0.4)).child(Self::pane("idle, top", false)))
                             .child(
                                 div()
                                     .flex_1()
                                     .min_h_0()
-                                    .child(self.pane("idle, bottom", false)),
+                                    .child(Self::pane("idle, bottom", false)),
                             ),
                     ),
             )

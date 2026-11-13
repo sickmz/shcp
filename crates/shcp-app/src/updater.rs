@@ -1,13 +1,13 @@
 //! Keeps the exe up to date from the GitHub releases. Windows lets a running exe be renamed, so
 //! the new one takes its place at once and starts the next time the app does. The app never
 //! restarts by itself: that would close the user's connections.
+use crate::net::{self, Service};
 use crate::state::{AppState, NoticeAction};
 use anyhow::{Context as _, Result, bail, ensure};
 use async_channel::Sender;
 use gpui::{App, Context};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
-use shcp_core::{NoticeLevel, SessionState};
+use shcp_core::NoticeLevel;
 use std::{
     ffi::OsString,
     io::Read as _,
@@ -20,7 +20,8 @@ const LATEST_RELEASE: &str = "https://api.github.com/repos/sickmz/shcp/releases/
 const RELEASES_PAGE: &str = "https://github.com/sickmz/shcp/releases/latest";
 /// Assets come only from here. Every other address in the answer is ignored.
 const DOWNLOAD_PREFIX: &str = "https://github.com/sickmz/shcp/releases/download/";
-const CURRENT: &str = env!("CARGO_PKG_VERSION");
+/// The version of this build.
+pub(crate) const CURRENT: &str = env!("CARGO_PKG_VERSION");
 /// The releases hold only this build.
 const SUPPORTED: bool = cfg!(all(windows, target_arch = "x86_64"));
 
@@ -38,14 +39,14 @@ const DOWNLOAD_CHUNK_BYTES: usize = 64 * 1024;
 const REPORT_EVERY: Duration = Duration::from_millis(150);
 
 #[derive(Clone)]
-pub struct Release {
+pub(crate) struct Release {
     pub version: String,
     exe_url: String,
     checksum_url: String,
 }
 
 #[derive(Clone)]
-pub enum UpdateStatus {
+pub(crate) enum UpdateStatus {
     Idle,
     Checking,
     UpToDate,
@@ -69,35 +70,11 @@ pub enum UpdateStatus {
     },
 }
 
-fn agent(timeout: Duration) -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .timeout_global(Some(timeout))
-        .user_agent(concat!("shcp/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .into()
-}
-
-fn request(agent: &ureq::Agent, url: &str) -> Result<ureq::http::Response<ureq::Body>> {
-    agent
-        .get(url)
-        .header("Accept", "application/vnd.github+json")
-        .call()
-        .map_err(|error| match error {
-            ureq::Error::StatusCode(403 | 429) => {
-                anyhow::anyhow!("GitHub is limiting requests. Try again later")
-            }
-            error => anyhow::Error::from(error).context("GitHub could not be reached"),
-        })
-}
-
-fn get(agent: &ureq::Agent, url: &str, limit: u64) -> Result<Vec<u8>> {
-    request(agent, url)?
-        .body_mut()
-        .with_config()
-        .limit(limit)
-        .read_to_vec()
-        .context("GitHub sent an unreadable or too large response")
-}
+const GITHUB: Service = Service {
+    name: "GitHub",
+    rate_limited: &[403, 429],
+    accept: Some("application/vnd.github+json"),
+};
 
 fn version_numbers(version: &str) -> Option<(u64, u64, u64)> {
     let mut parts = version.split('.').map(|part| part.parse::<u64>().ok());
@@ -142,25 +119,17 @@ fn newer_release(release: &Value, current: &str) -> Result<Option<Release>> {
 }
 
 fn fetch_latest() -> Result<Option<Release>> {
-    let bytes = get(
-        &agent(Duration::from_secs(30)),
+    let release = GITHUB.get_json(
+        &net::agent(Duration::from_secs(30)),
         LATEST_RELEASE,
         MAX_JSON_BYTES,
     )?;
-    let release: Value =
-        serde_json::from_slice(&bytes).context("GitHub sent an unreadable response")?;
     newer_release(&release, CURRENT)
 }
 
 fn verify_download(exe: &[u8], checksum: &[u8]) -> Result<()> {
-    let checksum = String::from_utf8_lossy(checksum);
-    let expected = checksum.split_whitespace().next().unwrap_or("");
-    let actual: String = Sha256::digest(exe)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
     ensure!(
-        expected.eq_ignore_ascii_case(&actual),
+        net::sha256_matches(exe, checksum),
         "The download failed its integrity check"
     );
     ensure!(exe.starts_with(b"MZ"), "The download is not a program");
@@ -202,7 +171,7 @@ fn percent_of(received: u64, total: u64) -> u8 {
 
 /// Reads the exe piece by piece, saying how far it got when the server tells its size.
 fn download_exe(agent: &ureq::Agent, url: &str, report: &Sender<u8>) -> Result<Vec<u8>> {
-    let mut response = request(agent, url)?;
+    let mut response = GITHUB.call(agent.get(url))?;
     let total = response.body().content_length();
     let mut reader = response
         .body_mut()
@@ -236,9 +205,9 @@ fn download_exe(agent: &ureq::Agent, url: &str, report: &Sender<u8>) -> Result<V
 }
 
 fn download_and_replace(release: &Release, exe: &Path, report: &Sender<u8>) -> Result<()> {
-    let agent = agent(Duration::from_secs(10 * 60));
+    let agent = net::agent(Duration::from_secs(10 * 60));
     let bytes = download_exe(&agent, &release.exe_url, report)?;
-    let checksum = get(&agent, &release.checksum_url, MAX_CHECKSUM_BYTES)?;
+    let checksum = GITHUB.get(&agent, &release.checksum_url, MAX_CHECKSUM_BYTES)?;
     verify_download(&bytes, &checksum)?;
     replace_exe(exe, &bytes)
 }
@@ -251,7 +220,7 @@ fn now() -> u64 {
 
 impl AppState {
     /// Runs for as long as the app does.
-    pub fn start_update_checks(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn start_update_checks(&mut self, cx: &mut Context<Self>) {
         if !SUPPORTED {
             return;
         }
@@ -291,7 +260,7 @@ impl AppState {
     }
 
     /// `manual`: asked for by the user, who gets to see a failure as well.
-    pub fn check_for_update(&mut self, manual: bool, cx: &mut Context<Self>) {
+    pub(crate) fn check_for_update(&mut self, manual: bool, cx: &mut Context<Self>) {
         if matches!(
             self.update,
             UpdateStatus::Checking | UpdateStatus::Downloading { .. } | UpdateStatus::Ready { .. }
@@ -335,15 +304,7 @@ impl AppState {
         .detach();
     }
 
-    /// The connections a restart would close.
-    pub fn connected_sessions(&self) -> usize {
-        self.sessions
-            .values()
-            .filter(|session| matches!(session.state, SessionState::Connected))
-            .count()
-    }
-
-    pub fn install_update(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn install_update(&mut self, cx: &mut Context<Self>) {
         let release = match &self.update {
             UpdateStatus::Available(release) | UpdateStatus::DownloadFailed { release, .. } => {
                 release.clone()
@@ -410,7 +371,7 @@ impl AppState {
         );
     }
 
-    pub fn restart_into_update(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn restart_into_update(&mut self, cx: &mut Context<Self>) {
         let UpdateStatus::Ready { exe, .. } = &self.update else {
             return;
         };
@@ -426,20 +387,17 @@ impl AppState {
 }
 
 /// Tells a new version that the one starting it is about to close.
-pub const AFTER_UPDATE: &str = "--after-update";
+pub(crate) const AFTER_UPDATE: &str = "--after-update";
 
-pub fn open_releases_page(cx: &mut App) {
+pub(crate) fn open_releases_page(cx: &mut App) {
     cx.open_url(RELEASES_PAGE);
-}
-
-pub fn current_version() -> &'static str {
-    CURRENT
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    use sha2::{Digest, Sha256};
 
     fn release(tag: &str, exe: &str) -> Value {
         json!({

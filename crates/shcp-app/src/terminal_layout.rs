@@ -3,7 +3,7 @@
 use shcp_core::term::{CellFlags, GridPoint, Rgb, TermSnapshot};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct CellStyle {
+pub(crate) struct CellStyle {
     pub fg: Rgb,
     pub bold: bool,
     pub italic: bool,
@@ -12,7 +12,7 @@ pub struct CellStyle {
     pub dim: bool,
 }
 
-pub struct BgRect {
+pub(crate) struct BgRect {
     pub row: u16,
     pub col: u16,
     pub cols: u16,
@@ -21,7 +21,7 @@ pub struct BgRect {
 
 /// A run of cells on one row that is shaped as one gpui line.
 /// Wide (double-width) characters get a segment of their own.
-pub struct Segment {
+pub(crate) struct Segment {
     pub row: u16,
     pub col: u16,
     pub text: String,
@@ -30,7 +30,7 @@ pub struct Segment {
     pub wide: bool,
 }
 
-pub struct Layout {
+pub(crate) struct Layout {
     pub backgrounds: Vec<BgRect>,
     pub segments: Vec<Segment>,
 }
@@ -40,7 +40,7 @@ fn printable(ch: char) -> char {
 }
 
 /// `block_cursor`: cell that is covered by a filled cursor; its text is drawn with `cursor_fg`.
-pub fn build(
+pub(crate) fn build(
     snapshot: &TermSnapshot,
     default_bg: Rgb,
     block_cursor: Option<GridPoint>,

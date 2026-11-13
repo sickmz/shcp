@@ -1,17 +1,18 @@
 //! Picks the color of a host, inside the modals that deal with hosts.
 use crate::theme::{ActiveTheme as _, ui_px};
+use crate::widgets::button::keep_activation_keys;
 use crate::widgets::host_color::HostColor;
 use gpui::prelude::*;
 use gpui::{Context, Window, div, px};
 use shcp_core::HostAppearance;
 
 /// The controls, for a modal to embed. It changes nothing by itself: the modal reads `appearance`.
-pub struct AppearancePicker {
+pub(crate) struct AppearancePicker {
     color: HostColor,
 }
 
 impl AppearancePicker {
-    pub fn new(appearance: &HostAppearance) -> Self {
+    pub(crate) fn new(appearance: &HostAppearance) -> Self {
         Self {
             color: appearance
                 .color
@@ -21,11 +22,11 @@ impl AppearancePicker {
         }
     }
 
-    pub fn color(&self) -> HostColor {
+    pub(crate) fn color(&self) -> HostColor {
         self.color
     }
 
-    pub fn appearance(&self) -> HostAppearance {
+    pub(crate) fn appearance(&self) -> HostAppearance {
         HostAppearance {
             color: Some(self.color.slug().to_string()),
         }
@@ -55,12 +56,7 @@ impl Render for AppearancePicker {
                     .focusable()
                     .tab_stop(true)
                     .when(selected, |this| this.border_2().border_color(ring))
-                    .on_key_down(|event, _, cx| {
-                        // Enter/Space belong to the focused swatch, whose click fires on key-up.
-                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                            cx.stop_propagation();
-                        }
-                    })
+                    .on_key_down(keep_activation_keys)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.color = color;
                         cx.notify();

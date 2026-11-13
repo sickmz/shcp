@@ -2,19 +2,24 @@
 //! there, to the full text of all the current ones. It floats over the panel, so that a notice
 //! never resizes the terminal, and stays inside it, so that it never covers the dock.
 use crate::motion;
-use crate::state::Notice;
+use crate::state::{AppState, Notice, NoticeAction};
 use crate::theme::{ActiveTheme as _, Theme, ui_px};
 use crate::widgets::button::{Button, ButtonStyle};
 use crate::widgets::icon::{Icon, IconName};
 use crate::widgets::tooltip::tooltip;
 use crate::workspace::Workspace;
 use gpui::prelude::*;
-use gpui::{AnyElement, ClipboardItem, Context, Hsla, MouseDownEvent, div, px};
+use gpui::{
+    AnyElement, App, ClickEvent, ClipboardItem, Context, ElementId, Entity, Hsla, MouseDownEvent,
+    Window, div, px,
+};
 use shcp_core::NoticeLevel;
 
 const LABEL_HEIGHT: f32 = 30.;
 /// Distance from the sides of the panel.
 const MARGIN: f32 = 8.;
+/// How far above the panel's lower edge the notices go, to leave what is there in sight.
+const BOTTOM: f32 = 8.;
 /// The widest a notice gets, the same expanded or not: only its height moves.
 const WIDTH: f32 = 460.;
 /// Past this, an expanded notice scrolls.
@@ -29,6 +34,32 @@ const ROW_MIN_HEIGHT: f32 = 36.;
 const CHAR_WIDTH: f32 = 6.5;
 const LINE_HEIGHT: f32 = 19.;
 const CLEAR_ALL_HEIGHT: f32 = 30.;
+
+/// Dismisses a notice, without the click going further.
+fn dismiss(state: Entity<AppState>, id: u64) -> impl Fn(&ClickEvent, &mut Window, &mut App) {
+    move |_, _, cx| {
+        cx.stop_propagation();
+        state.update(cx, |s, cx| s.dismiss_notice(id, cx));
+    }
+}
+
+/// The button of what a notice offers to do: it dismisses the notice, then does it.
+fn action_button(
+    button: impl Into<ElementId>,
+    action: NoticeAction,
+    state: &Entity<AppState>,
+    id: u64,
+) -> Button {
+    let state = state.clone();
+    Button::new(button)
+        .label(action.label)
+        .compact()
+        .on_click(move |_, window, cx| {
+            cx.stop_propagation();
+            state.update(cx, |s, cx| s.dismiss_notice(id, cx));
+            (action.run)(window, cx);
+        })
+}
 
 /// About how big the expanded notice is, to glide there: text is only measured once painted. It
 /// fits short messages, and being off by a little only ends the glide with a small step.
@@ -72,12 +103,7 @@ fn look(level: NoticeLevel, theme: &Theme) -> (IconName, Hsla, Hsla) {
     }
 }
 
-/// `bottom`: how far above the panel's lower edge it goes, to leave what is there in sight.
-pub fn label(
-    workspace: &Workspace,
-    bottom: f32,
-    cx: &mut Context<Workspace>,
-) -> Option<AnyElement> {
+pub(crate) fn label(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<AnyElement> {
     // Expanded, `list` is in its place, until it has folded back.
     if workspace.notices_open || workspace.notices_reveal.moving() {
         return None;
@@ -99,17 +125,10 @@ pub fn label(
     };
     let id = notice.id;
     let state = workspace.state.clone();
-    let notice_action = notice.action.clone().map(|action| {
-        let state = state.clone();
-        Button::new(("notice-action", id as usize))
-            .label(action.label)
-            .compact()
-            .on_click(move |_, window, cx| {
-                cx.stop_propagation();
-                state.update(cx, |s, cx| s.dismiss_notice(id, cx));
-                (action.run)(window, cx);
-            })
-    });
+    let notice_action = notice
+        .action
+        .clone()
+        .map(|action| action_button(("notice-action", id as usize), action, &state, id));
     let (close_hover, close_press) = (theme.hover, theme.active);
     let label = div()
         .id(("notice", id))
@@ -159,10 +178,7 @@ pub fn label(
                 .hover(move |s| s.bg(close_hover))
                 .active(move |s| s.bg(close_press))
                 .tooltip(tooltip("Dismiss"))
-                .on_click(move |_, _, cx| {
-                    cx.stop_propagation();
-                    state.update(cx, |s, cx| s.dismiss_notice(id, cx));
-                })
+                .on_click(dismiss(state, id))
                 .child(Icon::new(IconName::Close).size(px(12.))),
         );
     let label = if notice.leaving {
@@ -173,16 +189,16 @@ pub fn label(
     } else {
         motion::enter(label, ("notice-in", id), motion::NOTICE_IN).into_any_element()
     };
-    Some(corner(bottom).child(label).into_any_element())
+    Some(corner().child(label).into_any_element())
 }
 
 /// Gives what it holds a width to shorten to: alone, a truncated text would shrink to nothing.
-fn corner(bottom: f32) -> gpui::Div {
+fn corner() -> gpui::Div {
     div()
         .absolute()
         .left(px(MARGIN))
         .right(px(MARGIN))
-        .bottom(px(bottom))
+        .bottom(px(BOTTOM))
         .flex()
         .justify_end()
 }
@@ -212,17 +228,11 @@ fn row(notice: &Notice, workspace: &Workspace, theme: &Theme) -> impl IntoElemen
                 .text_color(theme.text)
                 .child(message.clone()),
         )
-        .children(notice.action.clone().map(|action| {
-            let state = state.clone();
-            Button::new(("notice-row-action", id as usize))
-                .label(action.label)
-                .compact()
-                .on_click(move |_, window, cx| {
-                    cx.stop_propagation();
-                    state.update(cx, |s, cx| s.dismiss_notice(id, cx));
-                    (action.run)(window, cx);
-                })
-        }))
+        .children(
+            notice.action.clone().map(|action| {
+                action_button(("notice-row-action", id as usize), action, &state, id)
+            }),
+        )
         .child(
             Button::new(("notice-copy", id as usize))
                 .icon(IconName::Copy)
@@ -240,15 +250,12 @@ fn row(notice: &Notice, workspace: &Workspace, theme: &Theme) -> impl IntoElemen
                 .tooltip("Dismiss")
                 .style(ButtonStyle::Ghost)
                 .compact()
-                .on_click(move |_, _, cx| {
-                    cx.stop_propagation();
-                    state.update(cx, |s, cx| s.dismiss_notice(id, cx));
-                }),
+                .on_click(dismiss(state, id)),
         )
 }
 
 /// The label expanded: the full text of every current notice, newest first.
-pub fn list(workspace: &Workspace, bottom: f32, cx: &mut Context<Workspace>) -> Option<AnyElement> {
+pub(crate) fn list(workspace: &Workspace, cx: &mut Context<Workspace>) -> Option<AnyElement> {
     let moving = workspace.notices_reveal.moving();
     if !workspace.notices_open && !moving {
         return None;
@@ -319,10 +326,10 @@ pub fn list(workspace: &Workspace, bottom: f32, cx: &mut Context<Workspace>) -> 
                             .compact()
                             .on_click(move |_, _, cx| {
                                 cx.stop_propagation();
-                                state.update(cx, |s, cx| s.clear_notices(cx));
+                                state.update(cx, AppState::clear_notices);
                             }),
                     ),
             )
         });
-    Some(corner(bottom).child(list).into_any_element())
+    Some(corner().child(list).into_any_element())
 }

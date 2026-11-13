@@ -12,12 +12,12 @@ use std::{cell::RefCell, rc::Rc, time::Instant};
 
 /// Keep one per list, for the life of the list: it remembers where the pill is.
 #[derive(Clone, Default)]
-pub struct SlidingPill(Rc<RefCell<PillMotion>>);
+pub(crate) struct SlidingPill(Rc<RefCell<PillMotion>>);
 
 impl SlidingPill {
     /// The next change of item came from the mouse, so the pill may show the way, if the user
     /// wants that.
-    pub fn arm(&self, settings: &Settings) {
+    pub(crate) fn arm(&self, settings: &Settings) {
         if settings.animated_selection {
             self.0.borrow_mut().arm();
         }
@@ -25,7 +25,7 @@ impl SlidingPill {
 
     /// For `on_children_prepainted` of the list. The first child must be the pill itself, and
     /// `item` is the index among the children of the current item.
-    pub fn measure(
+    pub(crate) fn measure(
         &self,
         item: Option<usize>,
     ) -> impl Fn(Vec<Bounds<Pixels>>, &mut Window, &mut App) + 'static {
@@ -44,7 +44,7 @@ impl SlidingPill {
 
     /// Without the accent: the neutral fill of the current item, with a faint edge. In a theme
     /// with a material it has the crests of a card too: light along the top, less at the bottom.
-    pub fn neutral(&self, theme: &Theme, radius: f32) -> impl IntoElement + use<> {
+    pub(crate) fn neutral(&self, theme: &Theme, radius: f32) -> impl IntoElement + use<> {
         self.painted(
             theme.active,
             Some(Hsla {

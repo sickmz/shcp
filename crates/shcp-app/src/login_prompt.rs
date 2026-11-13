@@ -1,7 +1,7 @@
 //! What a connection needs from the user: accepting a host key, a passphrase or a password.
 //! All the tabs of a host share its session, so one prompt exists per host, and it is drawn by one
 //! view at a time: the one with the focus. It never takes the focus from anywhere else.
-use crate::actions::{FocusNext, FocusPrev};
+use crate::modals::trap_focus;
 use crate::theme::{ActiveTheme as _, Theme, mono_font, ui_font};
 use crate::widgets::button::{Button, ButtonStyle};
 use crate::widgets::icon::IconName;
@@ -14,7 +14,7 @@ use gpui::{
 use shcp_core::{EngineHandle, HostKeyKind, SessionId, SessionState};
 use std::{cell::Cell, cell::RefCell, path::PathBuf};
 
-pub enum LoginAsk {
+pub(crate) enum LoginAsk {
     HostKey {
         host: String,
         key_type: String,
@@ -37,7 +37,7 @@ pub enum LoginAsk {
 }
 
 impl LoginAsk {
-    pub fn from_state(state: &SessionState) -> Option<Self> {
+    pub(crate) fn from_state(state: &SessionState) -> Option<Self> {
         match state {
             SessionState::AwaitingHostKey {
                 host,
@@ -72,7 +72,7 @@ impl LoginAsk {
     }
 }
 
-pub struct LoginPrompt {
+pub(crate) struct LoginPrompt {
     engine: EngineHandle,
     session: SessionId,
     ask: LoginAsk,
@@ -102,7 +102,7 @@ impl Focusable for LoginPrompt {
 }
 
 impl LoginPrompt {
-    pub fn new(
+    pub(crate) fn new(
         engine: EngineHandle,
         session: SessionId,
         ask: LoginAsk,
@@ -113,7 +113,10 @@ impl LoginPrompt {
         let masked = !matches!(ask, LoginAsk::Answer { echo: true, .. });
         let input = match ask {
             LoginAsk::HostKey { .. } => None,
-            _ => Some(cx.new(|cx| TextInput::new("", masked, cx))),
+            _ => Some(cx.new(|cx| {
+                let input = TextInput::new("", cx);
+                if masked { input.masked() } else { input }
+            })),
         };
         let subscription = input.as_ref().map(|input| {
             cx.subscribe_in(
@@ -141,16 +144,16 @@ impl LoginPrompt {
         }
     }
 
-    pub fn session(&self) -> SessionId {
+    pub(crate) fn session(&self) -> SessionId {
         self.session
     }
 
-    pub fn answered(&self) -> bool {
+    pub(crate) fn answered(&self) -> bool {
         self.answered
     }
 
     /// What the connection is waiting for, as its current step.
-    pub fn waiting_text(&self) -> &'static str {
+    pub(crate) fn waiting_text(&self) -> &'static str {
         match self.ask {
             LoginAsk::HostKey { .. } => "Check the host key",
             LoginAsk::Passphrase { .. } => "Waiting for your passphrase",
@@ -160,11 +163,11 @@ impl LoginPrompt {
     }
 
     /// For a modal, which is the only place that can draw it.
-    pub fn set_owner(&self, owner: EntityId) {
+    pub(crate) fn set_owner(&self, owner: EntityId) {
         self.owner.set(Some(owner));
     }
 
-    pub fn answer(&mut self, accept: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn answer(&mut self, accept: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.answered {
             return;
         }
@@ -193,21 +196,6 @@ impl LoginPrompt {
         }
         cx.emit(DismissEvent);
         cx.notify();
-    }
-
-    fn step_focus(&self, reverse: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let start = window.focused(cx);
-        // Tab stops behind the prompt do not count.
-        for _ in 0..10_000 {
-            if reverse {
-                window.focus_prev();
-            } else {
-                window.focus_next();
-            }
-            if self.focus.contains_focused(window, cx) || window.focused(cx) == start {
-                break;
-            }
-        }
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -408,19 +396,14 @@ impl Render for LoginPrompt {
             .track_focus(&self.focus)
             // Tab stays inside the prompt, as in a modal.
             .key_context("Modal")
-            .on_action(
-                cx.listener(|this, _: &FocusNext, window, cx| this.step_focus(false, window, cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &FocusPrev, window, cx| this.step_focus(true, window, cx)),
-            )
+            .map(|this| trap_focus(this, |prompt: &Self| Some(prompt.focus.clone()), cx))
             .on_key_down(cx.listener(Self::on_key_down))
     }
 }
 
 /// Called while rendering by a view that could draw the prompt. With the focus, the view takes the
 /// prompt over and passes the focus to it. Returns whether the view should draw it.
-pub fn present(
+pub(crate) fn present(
     prompt: &Entity<LoginPrompt>,
     owner: EntityId,
     focus: &FocusHandle,

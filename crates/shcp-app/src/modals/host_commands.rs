@@ -1,7 +1,7 @@
 //! What a host runs: the command every new terminal starts with, and the saved commands the
 //! palette offers. A modal of its own, because `HostEditor` never opens for the read-only
 //! `~/.ssh/config` hosts.
-use super::{button_row, editor_frame, title};
+use super::{cancel_and, editor_frame, title};
 use crate::state::AppState;
 use crate::theme::{ActiveTheme as _, ui_px};
 use crate::widgets::button::{Button, ButtonStyle};
@@ -21,7 +21,7 @@ struct Row {
     everywhere: bool,
 }
 
-pub struct HostCommandsModal {
+pub(crate) struct HostCommandsModal {
     embedded: bool,
     state: Entity<AppState>,
     host: HostId,
@@ -42,12 +42,12 @@ impl Focusable for HostCommandsModal {
 }
 
 impl HostCommandsModal {
-    pub fn embedded(mut self) -> Self {
+    pub(crate) fn embedded(mut self) -> Self {
         self.embedded = true;
         self
     }
 
-    pub fn new(
+    pub(crate) fn new(
         state: Entity<AppState>,
         host: HostId,
         window: &mut Window,
@@ -56,9 +56,7 @@ impl HostCommandsModal {
         let (alias, startup_text, snippets) = {
             let state = state.read(cx);
             (
-                state
-                    .host(&host)
-                    .map_or(host.0.clone(), |h| h.alias.clone()),
+                state.alias(&host),
                 state
                     .settings
                     .startup_commands
@@ -72,11 +70,7 @@ impl HostCommandsModal {
                     .collect::<Vec<_>>(),
             )
         };
-        let startup = cx.new(|cx| {
-            let mut input = TextInput::new("cd /app", false, cx);
-            input.set_text(&startup_text, cx);
-            input
-        });
+        let startup = cx.new(|cx| TextInput::new("cd /app", cx).with_text(&startup_text));
         let subscriptions = vec![Self::watch(&startup, window, cx)];
         let mut this = Self {
             embedded: false,
@@ -112,11 +106,7 @@ impl HostCommandsModal {
 
     fn add_row(&mut self, snippet: &Snippet, window: &mut Window, cx: &mut Context<Self>) {
         let field = |placeholder: &str, text: &str, cx: &mut Context<Self>| {
-            cx.new(|cx| {
-                let mut input = TextInput::new(placeholder, false, cx);
-                input.set_text(text, cx);
-                input
-            })
+            cx.new(|cx| TextInput::new(placeholder, cx).with_text(text))
         };
         let name = field("Name", &snippet.name, cx);
         let command = field("tail -f /var/log/app.log", &snippet.command, cx);
@@ -255,22 +245,15 @@ impl Render for HostCommandsModal {
                         })),
                 ),
             )
-            .child(
-                button_row()
-                    .child(
-                        Button::new("cancel")
-                            .keyboard_focus()
-                            .label("Cancel")
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(super::CancelEvent))),
-                    )
-                    .child(
-                        Button::new("save")
-                            .keyboard_focus()
-                            .label("Save")
-                            .style(ButtonStyle::Primary)
-                            .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
-                    ),
-            )
+            .child(cancel_and(
+                "cancel",
+                |_, cx| cx.emit(super::CancelEvent),
+                Button::new("save")
+                    .label("Save")
+                    .style(ButtonStyle::Primary)
+                    .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                cx,
+            ))
     }
 }
 

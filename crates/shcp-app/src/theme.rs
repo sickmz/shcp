@@ -1,9 +1,9 @@
 //! The active theme and the catalog of available ones. Components read colors only from here.
 //! Themes are VS Code color theme files: the app's own plus any in `<config_dir>/themes`, where
 //! the ones installed from Open VSX end up too.
-pub mod builtin;
-pub mod icon_theme;
-pub mod open_vsx;
+pub(crate) mod builtin;
+pub(crate) mod icon_theme;
+pub(crate) mod open_vsx;
 mod vscode;
 
 use crate::terminal_material::Material;
@@ -12,7 +12,10 @@ use gpui::{
     App, BoxShadow, Global, Hsla, Pixels, SharedString, WindowAppearance,
     WindowBackgroundAppearance, hsla, point, px,
 };
-use shcp_core::{Density, EngineHandle, Settings, term::Palette};
+use shcp_core::{
+    Density, EngineHandle, Settings,
+    term::{Palette, Rgb},
+};
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -23,13 +26,13 @@ use std::{
 
 /// The Open VSX extension a theme was installed from.
 #[derive(Clone)]
-pub struct ThemeOrigin {
+pub(crate) struct ThemeOrigin {
     pub extension: SharedString,
     pub extension_name: SharedString,
 }
 
 #[derive(Clone)]
-pub struct Theme {
+pub(crate) struct Theme {
     pub name: gpui::SharedString,
     pub origin: Option<ThemeOrigin>,
     /// The file it was read from; `None` for the app's own themes.
@@ -75,12 +78,12 @@ pub struct Theme {
 
 impl Theme {
     /// This theme draws hosts in their colors. With the Mono accent they are all gray.
-    pub fn shows_host_colors(&self) -> bool {
+    pub(crate) fn shows_host_colors(&self) -> bool {
         self.lit_c > 0.
     }
 
     /// The color of a host, at the lightness this theme draws accents at.
-    pub fn host_color(&self, color: HostColor) -> Hsla {
+    pub(crate) fn host_color(&self, color: HostColor) -> Hsla {
         let chroma = if color == HostColor::Gray {
             0.012
         } else {
@@ -94,7 +97,7 @@ impl Theme {
     /// cards, as it always was. A theme from a file has them in its accent, thinned into its own
     /// background, over a window that keeps most of its own color. With the effects off in
     /// Settings no theme has it. The strengths are in `Material::smoked`.
-    pub fn material(&self) -> Option<Material> {
+    pub(crate) fn material(&self) -> Option<Material> {
         if !EFFECTS.load(Ordering::Relaxed) {
             return None;
         }
@@ -153,7 +156,7 @@ impl Theme {
     }
 
     /// The tile a session shows its host's color on, and the deck of a split one.
-    pub fn tile_colors(&self) -> TileColors {
+    pub(crate) fn tile_colors(&self) -> TileColors {
         TileColors {
             fill: Hsla {
                 a: 0.08,
@@ -168,7 +171,7 @@ impl Theme {
 
     /// The color under a row of the sidebar, made solid: the surface, or the fill of the current
     /// row over it. For what has to hide something on that row and still look like the row.
-    pub fn row_fill(&self, current: bool) -> Hsla {
+    pub(crate) fn row_fill(&self, current: bool) -> Hsla {
         if current {
             let solid = Hsla {
                 a: 1.,
@@ -182,7 +185,7 @@ impl Theme {
 }
 
 /// See `Theme::tile_colors`.
-pub struct TileColors {
+pub(crate) struct TileColors {
     /// The tile: see-through, so it reads the same on any row.
     pub fill: Hsla,
     /// The card behind the tile of a split session: see-through too, a little stronger.
@@ -191,7 +194,7 @@ pub struct TileColors {
 
 impl Global for Theme {}
 
-pub trait ActiveTheme {
+pub(crate) trait ActiveTheme {
     fn theme(&self) -> &Theme;
 }
 
@@ -202,7 +205,7 @@ impl ActiveTheme for App {
 }
 
 /// All themes the user can pick.
-pub struct ThemeCatalog {
+pub(crate) struct ThemeCatalog {
     pub themes: Vec<Theme>,
 }
 
@@ -211,7 +214,7 @@ impl Global for ThemeCatalog {}
 impl ThemeCatalog {
     /// Reads the bundled themes and `dir`. A user theme replaces a bundled one of the same name.
     /// Returns the catalog and one message per file that could not be read.
-    pub fn load(dir: &Path) -> (Self, Vec<String>) {
+    pub(crate) fn load(dir: &Path) -> (Self, Vec<String>) {
         let mut themes: Vec<Theme> = [builtin::NOCTURNE, builtin::PRUNE]
             .into_iter()
             .map(|name| builtin::build(name, shcp_core::Accent::default()))
@@ -250,6 +253,27 @@ impl ThemeCatalog {
     }
 }
 
+/// Where the color themes of the user are, the ones from Open VSX among them.
+pub(crate) fn themes_dir(config_dir: &Path) -> PathBuf {
+    config_dir.join("themes")
+}
+
+/// Where the file icon themes are, one folder each.
+pub(crate) fn icon_themes_dir(config_dir: &Path) -> PathBuf {
+    config_dir.join("icon-themes")
+}
+
+/// Reads the color and icon themes into the app. Returns one message per file that could not be
+/// read.
+pub(crate) fn load_catalogs(config_dir: &Path, cx: &mut App) -> Vec<String> {
+    let (catalog, mut errors) = ThemeCatalog::load(&themes_dir(config_dir));
+    cx.set_global(catalog);
+    let (icons, icon_errors) = icon_theme::IconThemeCatalog::load(&icon_themes_dir(config_dir));
+    cx.set_global(icons);
+    errors.extend(icon_errors);
+    errors
+}
+
 /// Name of the theme to show under the current settings and system appearance.
 fn active_name(settings: &Settings, appearance: WindowAppearance) -> &str {
     if !settings.sync_theme {
@@ -262,14 +286,14 @@ fn active_name(settings: &Settings, appearance: WindowAppearance) -> &str {
 }
 
 /// The theme the settings ask for, when it is not available: removed, or no longer bundled.
-pub fn missing_theme(settings: &Settings, cx: &App) -> Option<String> {
+pub(crate) fn missing_theme(settings: &Settings, cx: &App) -> Option<String> {
     let name = active_name(settings, cx.window_appearance());
     let themes = &cx.global::<ThemeCatalog>().themes;
     (!themes.iter().any(|t| t.name == name)).then(|| name.to_string())
 }
 
 /// The app's own themes take the accent asked for; a theme from a file keeps the one it has.
-pub fn with_accent(theme: Theme, settings: &Settings) -> Theme {
+pub(crate) fn with_accent(theme: Theme, settings: &Settings) -> Theme {
     if theme.file.is_none() {
         builtin::build(&theme.name, settings.accent)
     } else {
@@ -278,7 +302,7 @@ pub fn with_accent(theme: Theme, settings: &Settings) -> Theme {
 }
 
 /// Makes `settings` take effect: theme, terminal colors, font and row scale.
-pub fn apply(settings: &Settings, engine: &EngineHandle, cx: &mut App) {
+pub(crate) fn apply(settings: &Settings, engine: &EngineHandle, cx: &mut App) {
     EFFECTS.store(settings.glass_effects, Ordering::Relaxed);
     let appearance = cx.window_appearance();
     let name = active_name(settings, appearance);
@@ -295,13 +319,14 @@ pub fn apply(settings: &Settings, engine: &EngineHandle, cx: &mut App) {
         .or_else(|| themes.iter().find(|t| t.is_light == wants_light))
         .or(themes.first())
         .cloned()
-        .unwrap_or_else(vscode::fallback);
+        // `ThemeCatalog::load` always holds the bundled themes, so this is never reached.
+        .unwrap_or_else(|| builtin::build(builtin::NOCTURNE, shcp_core::Accent::default()));
     theme = with_accent(theme, settings);
     if settings.translucent_window {
         theme.window_bg.a = if theme.is_light { 0.88 } else { 0.84 };
         theme.panel_alpha = if theme.is_light { 0.93 } else { 0.86 };
     }
-    engine.set_terminal_palette(theme.palette.clone());
+    engine.set_terminal_palette(&theme.palette);
     cx.set_global(theme);
     // A theme that is gone leaves the app's own icons.
     let icons = cx
@@ -322,20 +347,32 @@ pub fn apply(settings: &Settings, engine: &EngineHandle, cx: &mut App) {
     cx.refresh_windows();
 }
 
+/// A terminal color as `0xRRGGBB`.
+pub(crate) fn rgb_hex(color: Rgb) -> u32 {
+    (color.0 as u32) << 16 | (color.1 as u32) << 8 | color.2 as u32
+}
+
+/// A color as the terminal takes it, without its alpha.
+fn to_rgb(color: Hsla) -> Rgb {
+    let gpui::Rgba { r, g, b, .. } = color.to_rgb();
+    let byte = |v: f32| (v.clamp(0., 1.) * 255.).round() as u8;
+    Rgb(byte(r), byte(g), byte(b))
+}
+
 // The scale of corner radii. Something inset by about 4 inside a surface takes the next step
 // down. What you go somewhere with, the rows of the sidebar and the command field, is a capsule
 // (`rounded_full`) instead.
 /// Cards, modals, menus and whatever else floats.
-pub const RADIUS_CARD: f32 = 12.;
+pub(crate) const RADIUS_CARD: f32 = 12.;
 /// Buttons, inputs, menu items and the rows of a list inside a surface.
-pub const RADIUS_CONTROL: f32 = 8.;
+pub(crate) const RADIUS_CONTROL: f32 = 8.;
 /// Tiles, chips, key caps and tiny buttons.
-pub const RADIUS_SMALL: f32 = 6.;
+pub(crate) const RADIUS_SMALL: f32 = 6.;
 /// Radius for what fills a card up to its edge, so it stays inside the card's border.
-pub const PANEL_INNER_RADIUS: f32 = RADIUS_CARD - 1.;
+pub(crate) const PANEL_INNER_RADIUS: f32 = RADIUS_CARD - 1.;
 
 /// What the window asks of the system behind it.
-pub fn window_background(settings: &Settings) -> WindowBackgroundAppearance {
+pub(crate) fn window_background(settings: &Settings) -> WindowBackgroundAppearance {
     if settings.translucent_window {
         WindowBackgroundAppearance::Blurred
     } else {
@@ -344,7 +381,7 @@ pub fn window_background(settings: &Settings) -> WindowBackgroundAppearance {
 }
 
 /// The soft shadow of what floats over everything else: menus, modals, tooltips.
-pub fn float_shadow() -> Vec<BoxShadow> {
+pub(crate) fn float_shadow() -> Vec<BoxShadow> {
     let shadow = |alpha, y: f32, blur: f32| BoxShadow {
         color: hsla(0., 0., 0., alpha),
         offset: point(px(0.), px(y)),
@@ -358,7 +395,7 @@ static UI_FONT: OnceLock<&'static str> = OnceLock::new();
 
 /// The interface and terminal fonts travel inside the exe. Should they fail to load, the system's
 /// take over.
-pub fn load_fonts(cx: &App) {
+pub(crate) fn load_fonts(cx: &App) {
     let fonts = vec![
         std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/InstrumentSans.ttf").as_slice()),
         std::borrow::Cow::Borrowed(include_bytes!("../assets/fonts/GeistMono.ttf").as_slice()),
@@ -375,7 +412,7 @@ pub fn load_fonts(cx: &App) {
 }
 
 const UI_FAMILY: &str = "Instrument Sans";
-pub const MONO_FAMILY: &str = "Geist Mono";
+pub(crate) const MONO_FAMILY: &str = "Geist Mono";
 
 /// The user wants the materials of the themes: see `Theme::material`.
 static EFFECTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -383,34 +420,25 @@ static UI_SCALE: AtomicU32 = AtomicU32::new(1f32.to_bits());
 static ROW_SCALE: AtomicU32 = AtomicU32::new(1f32.to_bits());
 
 /// A UI font size, given for the default interface font size (14) and scaled to the setting.
-pub fn ui_px(size: f32) -> Pixels {
+pub(crate) fn ui_px(size: f32) -> Pixels {
     px((size * f32::from_bits(UI_SCALE.load(Ordering::Relaxed))).round())
 }
 
 /// A row or bar height, given for default density and scaled to the setting.
-pub fn row_px(size: f32) -> Pixels {
+pub(crate) fn row_px(size: f32) -> Pixels {
     px((size * f32::from_bits(ROW_SCALE.load(Ordering::Relaxed))).round())
 }
 
 /// UI font family for the platform.
-pub fn ui_font() -> &'static str {
-    if let Some(font) = UI_FONT.get() {
-        return font;
-    }
-    if cfg!(windows) {
-        "Segoe UI"
-    } else {
-        ".SystemUIFont"
-    }
+pub(crate) fn ui_font() -> &'static str {
+    UI_FONT.get().map_or("Segoe UI", |font| font)
 }
 
 /// Monospace font for fixed-width UI text (permissions, fingerprints).
-pub fn mono_font() -> &'static str {
+pub(crate) fn mono_font() -> &'static str {
     if UI_FONT.get().is_some() {
         MONO_FAMILY
-    } else if cfg!(windows) {
-        "Consolas"
     } else {
-        "monospace"
+        "Consolas"
     }
 }

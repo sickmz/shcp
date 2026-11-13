@@ -1,11 +1,11 @@
 use crate::{
     Event, NoticeLevel, TerminalHandle,
-    session::{Context, OpenTerminal, Ssh},
+    session::{self, Context, OpenTerminal, Ssh},
     session_log::SessionLog,
     term::TerminalCommand,
     tmux,
 };
-use anyhow::{Result, bail};
+use anyhow::Result;
 use russh::ChannelMsg;
 use std::{path::PathBuf, sync::Arc};
 use tokio_util::sync::CancellationToken;
@@ -39,20 +39,12 @@ enum End {
     /// Closed from elsewhere, so it has no place here any more.
     Closed,
 }
-pub(crate) async fn accepted(channel: &mut russh::Channel<russh::client::Msg>) -> Result<()> {
-    loop {
-        match channel.wait().await {
-            Some(ChannelMsg::Success) => return Ok(()),
-            Some(ChannelMsg::Failure | ChannelMsg::Close) | None => {
-                bail!("Server rejected the terminal request")
-            }
-            _ => {}
-        }
-    }
+async fn accepted(channel: &mut russh::Channel<russh::client::Msg>) -> Result<()> {
+    session::accepted(channel, "Server rejected the terminal request").await
 }
 /// Opens the log of a terminal. Not being able to write it must not cost the terminal.
 pub(crate) fn open_log(ctx: &Context, dir: Option<PathBuf>) -> Option<SessionLog> {
-    match SessionLog::create(&dir?, &ctx.host.alias, terminal_stamp()) {
+    match SessionLog::create(&dir?, &ctx.host.alias, crate::unix_seconds()) {
         Ok(log) => Some(log),
         Err(error) => {
             ctx.notice(
@@ -62,11 +54,6 @@ pub(crate) fn open_log(ctx: &Context, dir: Option<PathBuf>) -> Option<SessionLog
             None
         }
     }
-}
-fn terminal_stamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
 }
 /// Puts output on the terminal and in its log.
 pub(crate) fn show(

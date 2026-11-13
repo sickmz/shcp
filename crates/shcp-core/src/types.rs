@@ -48,6 +48,21 @@ pub struct HostConfig {
     #[serde(skip)]
     pub source: HostSource,
 }
+impl HostConfig {
+    /// Who logs in where, as `user@hostname`.
+    pub fn target(&self) -> String {
+        format!("{}@{}", self.user, self.hostname)
+    }
+}
+/// The user signed in to this PC: who a host without a user logs in as.
+pub fn local_user() -> String {
+    std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_default()
+}
+/// Keepalives that may go unanswered before the connection counts as lost, when a host does not
+/// say.
+pub const DEFAULT_SERVER_ALIVE_COUNT_MAX: u32 = 3;
 impl Default for HostConfig {
     fn default() -> Self {
         Self {
@@ -55,16 +70,14 @@ impl Default for HostConfig {
             alias: String::new(),
             hostname: String::new(),
             port: 22,
-            user: std::env::var("USERNAME")
-                .or_else(|_| std::env::var("USER"))
-                .unwrap_or_default(),
+            user: local_user(),
             identity_files: vec![],
             proxy_command: None,
             proxy_jump: None,
             forward_agent: false,
             local_forwards: vec![],
             server_alive_interval: None,
-            server_alive_count_max: 3,
+            server_alive_count_max: DEFAULT_SERVER_ALIVE_COUNT_MAX,
             source: HostSource::App,
         }
     }
@@ -236,7 +249,7 @@ pub struct Settings {
     pub snippets: Vec<Snippet>,
 }
 /// The look these settings are brought up to once, by `Settings::migrate_style`.
-pub const STYLE_VERSION: u32 = 1;
+const STYLE_VERSION: u32 = 1;
 
 impl Settings {
     /// New terminals of this host should go on after the connection. Without tabs that come back
@@ -246,13 +259,12 @@ impl Settings {
     }
     /// Brings settings written for an older look up to the current one, once: what still has the
     /// old default takes the new one, and anything the user chose stays.
-    pub fn migrate_style(&mut self) {
+    pub(crate) fn migrate_style(&mut self) {
         if self.style_version >= STYLE_VERSION {
             return;
         }
         let renamed = |name: &mut String| match name.as_str() {
-            "Dark" => *name = "Nocturne".into(),
-            "Light" => *name = "Nocturne".into(),
+            "Dark" | "Light" => *name = "Nocturne".into(),
             _ => {}
         };
         renamed(&mut self.theme);
@@ -310,21 +322,24 @@ impl Settings {
                 id.clone_from(&new.0);
             }
         }
-        if self.collapsed_hosts.remove(&old.0) {
-            self.collapsed_hosts.insert(new.0.clone());
+        let move_in_set = |set: &mut BTreeSet<String>| {
+            if set.remove(&old.0) {
+                set.insert(new.0.clone());
+            }
+        };
+        move_in_set(&mut self.collapsed_hosts);
+        move_in_set(&mut self.hidden_hosts);
+        move_in_set(&mut self.session_logs);
+        move_in_set(&mut self.plain_terminal_hosts);
+        move_in_set(&mut self.key_login_offered);
+        fn move_in_map<V>(map: &mut BTreeMap<String, V>, old: &HostId, new: &HostId) {
+            if let Some(value) = map.remove(&old.0) {
+                map.insert(new.0.clone(), value);
+            }
         }
-        if self.hidden_hosts.remove(&old.0) {
-            self.hidden_hosts.insert(new.0.clone());
-        }
-        if self.session_logs.remove(&old.0) {
-            self.session_logs.insert(new.0.clone());
-        }
-        if self.plain_terminal_hosts.remove(&old.0) {
-            self.plain_terminal_hosts.insert(new.0.clone());
-        }
-        if self.key_login_offered.remove(&old.0) {
-            self.key_login_offered.insert(new.0.clone());
-        }
+        move_in_map(&mut self.host_appearance, old, new);
+        move_in_map(&mut self.host_groups, old, new);
+        move_in_map(&mut self.startup_commands, old, new);
         if let Some(specs) = self.extra_forwards.remove(&old.0) {
             let saved = self.extra_forwards.entry(new.0.clone()).or_default();
             for spec in specs {
@@ -332,15 +347,6 @@ impl Settings {
                     saved.push(spec);
                 }
             }
-        }
-        if let Some(appearance) = self.host_appearance.remove(&old.0) {
-            self.host_appearance.insert(new.0.clone(), appearance);
-        }
-        if let Some(group) = self.host_groups.remove(&old.0) {
-            self.host_groups.insert(new.0.clone(), group);
-        }
-        if let Some(command) = self.startup_commands.remove(&old.0) {
-            self.startup_commands.insert(new.0.clone(), command);
         }
         if let Some(names) = self.port_names.remove(&old.0) {
             let kept = self.port_names.entry(new.0.clone()).or_default();
@@ -965,6 +971,12 @@ pub enum TransferState {
     Done,
     Failed(String),
     Cancelled,
+}
+impl TransferState {
+    /// Waiting to start or under way.
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Queued | Self::Running)
+    }
 }
 #[derive(Debug, Clone)]
 pub struct TransferInfo {

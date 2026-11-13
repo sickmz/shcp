@@ -6,11 +6,7 @@ pub(super) async fn download(
     cancel: &CancellationToken,
     p: &mut Progress,
 ) -> Result<()> {
-    let name = remote
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .context("Remote path has no file name")?;
+    let name = files::file_name(remote).context("Remote path has no file name")?;
     files::safe_name(name)?;
     let top = remote.to_string();
     let mut stack = vec![(remote.to_string(), local.join(name))];
@@ -132,9 +128,7 @@ pub(super) async fn download_file(
         tokio::fs::create_dir_all(parent).await?;
     }
     if p.retry && already_there(sftp, item).await.unwrap_or(false) {
-        p.skip(item.size);
-        p.info.files_done += 1;
-        p.emit(false);
+        p.file_skipped(item.size);
         return Ok(());
     }
     let mut input = cancellable(cancel, async { Ok(sftp.open(&item.remote).await?) }).await?;
@@ -152,16 +146,7 @@ pub(super) async fn download_file(
     input.seek(SeekFrom::Start(offset)).await?;
     p.skip(offset);
     let result = async {
-        let mut buffer = vec![0; 256 * 1024];
-        loop {
-            let n = cancellable(cancel, async { Ok(input.read(&mut buffer).await?) }).await?;
-            if n == 0 {
-                break;
-            }
-            cancellable(cancel, async { Ok(output.write_all(&buffer[..n]).await?) }).await?;
-            p.info.bytes_done += n as u64;
-            p.emit(false);
-        }
+        pump(&mut input, &mut output, cancel, p).await?;
         cancellable(cancel, async { Ok(output.flush().await?) }).await?;
         input.close().await?;
         Ok::<(), anyhow::Error>(())
@@ -180,7 +165,6 @@ pub(super) async fn download_file(
     tokio::fs::rename(&part, &item.local)
         .await
         .with_context(|| format!("Replace {}", item.local.display()))?;
-    p.info.files_done += 1;
-    p.emit(false);
+    p.file_done();
     Ok(())
 }

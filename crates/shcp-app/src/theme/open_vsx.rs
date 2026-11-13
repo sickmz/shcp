@@ -2,11 +2,12 @@
 //! only their colors and pictures are read, nothing in them runs. Every call blocks on the network.
 use super::icon_theme::{ICONS_DIR, THEME_FILE};
 use super::vscode;
+use crate::net::{self, Service};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    fmt::Write as _,
     io::{Cursor, Read},
     path::Path,
     thread,
@@ -16,7 +17,7 @@ use zip::ZipArchive;
 
 /// What an extension contributes that shcp can use.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ThemeKind {
+pub(crate) enum ThemeKind {
     Color,
     Icon,
 }
@@ -24,7 +25,7 @@ pub enum ThemeKind {
 const API: &str = "https://open-vsx.org/api";
 const TRUSTED_PREFIX: &str = "https://open-vsx.org/";
 /// Key of an installed theme file holding where it came from.
-pub const ORIGIN_KEY: &str = "shcpOrigin";
+pub(crate) const ORIGIN_KEY: &str = "shcpOrigin";
 
 /// Licenses that let anyone use the theme, whoever publishes it.
 const LICENSES: [&str; 9] = [
@@ -52,7 +53,7 @@ const MAX_INCLUDE_DEPTH: usize = 8;
 const MAX_COLOR_LENGTH: usize = 128;
 
 #[derive(Clone)]
-pub struct Extension {
+pub(crate) struct Extension {
     /// `publisher.name`.
     pub id: String,
     pub publisher: String,
@@ -67,44 +68,19 @@ pub struct Extension {
 }
 
 /// What an install left in the themes folder.
-pub struct Installed {
+pub(crate) struct Installed {
     pub written: usize,
     pub skipped: usize,
 }
 
+const OPEN_VSX: Service = Service {
+    name: "Open VSX",
+    rate_limited: &[429],
+    accept: None,
+};
+
 fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(60)))
-        .user_agent(concat!("shcp/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .into()
-}
-
-fn read_body(
-    response: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
-    limit: u64,
-) -> Result<Vec<u8>> {
-    let mut response = response.map_err(|error| match error {
-        ureq::Error::StatusCode(429) => {
-            anyhow::anyhow!("Open VSX is limiting requests. Try again later")
-        }
-        error => anyhow::Error::from(error).context("Open VSX could not be reached"),
-    })?;
-    response
-        .body_mut()
-        .with_config()
-        .limit(limit)
-        .read_to_vec()
-        .context("Open VSX sent an unreadable or too large response")
-}
-
-fn get(agent: &ureq::Agent, url: &str, limit: u64) -> Result<Vec<u8>> {
-    read_body(agent.get(url).call(), limit)
-}
-
-fn get_json(agent: &ureq::Agent, url: &str) -> Result<Value> {
-    let bytes = get(agent, url, MAX_JSON_BYTES)?;
-    serde_json::from_slice(&bytes).context("Open VSX sent an unreadable response")
+    net::agent(Duration::from_secs(60))
 }
 
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
@@ -123,20 +99,44 @@ fn trusted_file(detail: &Value, key: &str) -> Option<String> {
     url.starts_with(TRUSTED_PREFIX).then(|| url.to_string())
 }
 
-fn contributed_themes(manifest: &Value) -> &[Value] {
+/// The themes of this kind that the manifest contributes.
+fn contributed(manifest: &Value, kind: ThemeKind) -> &[Value] {
+    let key = match kind {
+        ThemeKind::Color => "themes",
+        ThemeKind::Icon => "iconThemes",
+    };
     manifest
         .get("contributes")
-        .and_then(|c| c.get("themes"))
+        .and_then(|c| c.get(key))
         .and_then(Value::as_array)
         .map_or(&[], Vec::as_slice)
 }
 
-fn contributed_icon_themes(manifest: &Value) -> &[Value] {
-    manifest
-        .get("contributes")
-        .and_then(|c| c.get("iconThemes"))
-        .and_then(Value::as_array)
-        .map_or(&[], Vec::as_slice)
+/// Where a contributed theme is in the package.
+fn contribution_path(contribution: &Value) -> Result<String> {
+    package_path(
+        contribution
+            .get("path")
+            .and_then(Value::as_str)
+            .context("The theme has no path")?,
+        "extension",
+    )
+}
+
+/// The contribution's label, unless it is missing or `%key%`, which points to a translation file.
+fn contribution_label(contribution: &Value) -> Option<&str> {
+    let label = text(contribution, "label");
+    (!label.is_empty() && !label.starts_with('%')).then_some(label)
+}
+
+/// What an installed theme file keeps of where it came from, under `ORIGIN_KEY`.
+fn origin_json(extension: &Extension) -> Value {
+    json!({
+        "extension": extension.id,
+        "displayName": extension.display_name,
+        "version": extension.version,
+        "license": extension.license,
+    })
 }
 
 /// `None` when it is not something shcp can install: the category also holds other kinds of
@@ -147,7 +147,7 @@ fn usable_extension(
     name: &str,
     kind: ThemeKind,
 ) -> Result<Option<Extension>> {
-    let detail = get_json(agent, &format!("{API}/{namespace}/{name}"))?;
+    let detail = OPEN_VSX.get_json(agent, &format!("{API}/{namespace}/{name}"), MAX_JSON_BYTES)?;
     let license = text(&detail, "license");
     if !LICENSES.contains(&license) {
         return Ok(None);
@@ -159,11 +159,8 @@ fn usable_extension(
     ) else {
         return Ok(None);
     };
-    let manifest = get_json(agent, &manifest_url)?;
-    let theme_count = match kind {
-        ThemeKind::Color => contributed_themes(&manifest).len(),
-        ThemeKind::Icon => contributed_icon_themes(&manifest).len(),
-    };
+    let manifest = OPEN_VSX.get_json(agent, &manifest_url, MAX_JSON_BYTES)?;
+    let theme_count = contributed(&manifest, kind).len();
     if theme_count == 0
         || theme_count > MAX_THEMES_PER_EXTENSION
         || text(&manifest, "license") != license
@@ -192,7 +189,7 @@ fn usable_extension(
 }
 
 /// Most downloaded first. An empty query lists the most popular themes.
-pub fn search(query: &str, kind: ThemeKind) -> Result<Vec<Extension>> {
+pub(crate) fn search(query: &str, kind: ThemeKind) -> Result<Vec<Extension>> {
     let agent = agent();
     let size = SEARCH_SIZE.to_string();
     let mut request = agent
@@ -209,9 +206,7 @@ pub fn search(query: &str, kind: ThemeKind) -> Result<Vec<Extension>> {
     if !query.is_empty() {
         request = request.query("query", query);
     }
-    let bytes = read_body(request.call(), MAX_JSON_BYTES)?;
-    let found: Value =
-        serde_json::from_slice(&bytes).context("Open VSX sent an unreadable response")?;
+    let found = OPEN_VSX.fetch_json(request, MAX_JSON_BYTES)?;
     let identities: Vec<(String, String)> = found
         .get("extensions")
         .and_then(Value::as_array)
@@ -263,10 +258,10 @@ pub fn search(query: &str, kind: ThemeKind) -> Result<Vec<Extension>> {
 }
 
 /// Downloads an extension and writes its themes of this kind to `dir`.
-pub fn install(extension: &Extension, kind: ThemeKind, dir: &Path) -> Result<Installed> {
+pub(crate) fn install(extension: &Extension, kind: ThemeKind, dir: &Path) -> Result<Installed> {
     let agent = agent();
-    let package = get(&agent, &extension.vsix_url, MAX_PACKAGE_BYTES)?;
-    let checksum = get(&agent, &extension.sha256_url, 256)?;
+    let package = OPEN_VSX.get(&agent, &extension.vsix_url, MAX_PACKAGE_BYTES)?;
+    let checksum = OPEN_VSX.get(&agent, &extension.sha256_url, 256)?;
     verify_checksum(&package, &checksum)?;
     match kind {
         ThemeKind::Color => install_package(extension, &package, dir),
@@ -275,14 +270,8 @@ pub fn install(extension: &Extension, kind: ThemeKind, dir: &Path) -> Result<Ins
 }
 
 fn verify_checksum(package: &[u8], checksum: &[u8]) -> Result<()> {
-    let expected = String::from_utf8_lossy(checksum);
-    let expected = expected.split_whitespace().next().unwrap_or("");
-    let actual: String = Sha256::digest(package)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
     ensure!(
-        expected.eq_ignore_ascii_case(&actual),
+        net::sha256_matches(package, checksum),
         "The downloaded theme failed its integrity check"
     );
     Ok(())
@@ -298,7 +287,7 @@ fn open_package<'a>(
         zip.len() <= MAX_ZIP_ENTRIES,
         "The package has too many files"
     );
-    let manifest = read_json(&mut zip, "extension/package.json")?;
+    let manifest = read_json(&mut zip, "extension/package.json", MAX_THEME_BYTES)?;
     let id = format!(
         "{}.{}",
         text(&manifest, "publisher"),
@@ -317,7 +306,7 @@ fn open_package<'a>(
 
 fn install_package(extension: &Extension, package: &[u8], dir: &Path) -> Result<Installed> {
     let (mut zip, manifest) = open_package(extension, package)?;
-    let contributions = contributed_themes(&manifest);
+    let contributions = contributed(&manifest, ThemeKind::Color);
     ensure!(
         !contributions.is_empty(),
         "The extension has no color themes"
@@ -355,22 +344,15 @@ fn build_theme_file(
     zip: &mut ZipArchive<Cursor<&[u8]>>,
     taken: &[String],
 ) -> Result<(String, String, String)> {
-    let path = package_path(
-        contribution
-            .get("path")
-            .and_then(Value::as_str)
-            .context("The theme has no path")?,
-        "extension",
-    )?;
+    let path = contribution_path(contribution)?;
     let (theme_name, colors) = load_colors(zip, &path, MAX_INCLUDE_DEPTH)?;
     // Without it the theme relies on VS Code's defaults, which shcp does not know.
     ensure!(
         colors.contains_key("editor.background"),
         "The theme does not set its background"
     );
-    let label = text(contribution, "label");
-    // `%key%` points to a translation file; the theme's own name is good enough.
-    let name = if !label.is_empty() && !label.starts_with('%') {
+    // Without a label the theme's own name is good enough.
+    let name = if let Some(label) = contribution_label(contribution) {
         label.to_string()
     } else if !theme_name.is_empty() {
         theme_name
@@ -387,12 +369,7 @@ fn build_theme_file(
     let content = serde_json::to_string_pretty(&json!({
         "name": name,
         "type": kind,
-        ORIGIN_KEY: {
-            "extension": extension.id,
-            "displayName": extension.display_name,
-            "version": extension.version,
-            "license": extension.license,
-        },
+        ORIGIN_KEY: origin_json(extension),
         "colors": colors,
     }))?;
     vscode::parse(&content, &name)?;
@@ -403,7 +380,7 @@ fn build_theme_file(
 
 fn install_icon_package(extension: &Extension, package: &[u8], dir: &Path) -> Result<Installed> {
     let (mut zip, manifest) = open_package(extension, package)?;
-    let contributions = contributed_icon_themes(&manifest);
+    let contributions = contributed(&manifest, ThemeKind::Icon);
     ensure!(
         !contributions.is_empty(),
         "The extension has no file icon themes"
@@ -475,14 +452,8 @@ fn write_icon_theme(
     dir: &Path,
     taken: &[String],
 ) -> Result<String> {
-    let path = package_path(
-        contribution
-            .get("path")
-            .and_then(Value::as_str)
-            .context("The theme has no path")?,
-        "extension",
-    )?;
-    let theme = read_json_limited(zip, &path, MAX_ICON_THEME_BYTES)?;
+    let path = contribution_path(contribution)?;
+    let theme = read_json(zip, &path, MAX_ICON_THEME_BYTES)?;
     let base = path.rsplit_once('/').map_or("extension", |(base, _)| base);
     let empty = Value::Null;
     let light = theme.get("light").unwrap_or(&empty);
@@ -514,21 +485,12 @@ fn write_icon_theme(
         "It draws its icons with a font, which shcp cannot use"
     );
 
-    let label = text(contribution, "label");
-    let name = if !label.is_empty() && !label.starts_with('%') {
-        label.to_string()
-    } else {
-        extension.display_name.clone()
-    };
+    let name = contribution_label(contribution)
+        .map_or_else(|| extension.display_name.clone(), str::to_string);
     ensure!(!taken.contains(&name), "Another variant has this name");
     let content = serde_json::to_string(&json!({
         "name": name,
-        ORIGIN_KEY: {
-            "extension": extension.id,
-            "displayName": extension.display_name,
-            "version": extension.version,
-            "license": extension.license,
-        },
+        ORIGIN_KEY: origin_json(extension),
         "set": renumbered_set(&theme, &numbers),
         "light": renumbered_set(light, &numbers),
     }))?;
@@ -599,12 +561,13 @@ fn normalize_svg(svg: &str) -> Option<String> {
     let mut out = svg[..start].to_string();
     for (name, value) in &attributes {
         if !matches!(*name, "width" | "height" | "viewBox") {
-            out.push_str(&format!(" {name}=\"{value}\""));
+            let _ = write!(out, " {name}=\"{value}\"");
         }
     }
-    out.push_str(&format!(
+    let _ = write!(
+        out,
         " viewBox=\"{view_box}\" width=\"{ICON_SIZE}\" height=\"{ICON_SIZE}\""
-    ));
+    );
     out.push_str(rest);
     Some(out)
 }
@@ -648,7 +611,7 @@ fn load_colors(
     depth: usize,
 ) -> Result<(String, Map<String, Value>)> {
     ensure!(depth > 0, "Theme includes are nested too deeply");
-    let theme = read_json(zip, path)?;
+    let theme = read_json(zip, path, MAX_THEME_BYTES)?;
     let mut colors = Map::new();
     if let Some(include) = theme.get("include").and_then(Value::as_str) {
         let base = path.rsplit_once('/').map_or("extension", |(base, _)| base);
@@ -665,11 +628,7 @@ fn load_colors(
     Ok((text(&theme, "name").to_string(), colors))
 }
 
-fn read_json(zip: &mut ZipArchive<Cursor<&[u8]>>, path: &str) -> Result<Value> {
-    read_json_limited(zip, path, MAX_THEME_BYTES)
-}
-
-fn read_json_limited(zip: &mut ZipArchive<Cursor<&[u8]>>, path: &str, limit: u64) -> Result<Value> {
+fn read_json(zip: &mut ZipArchive<Cursor<&[u8]>>, path: &str, limit: u64) -> Result<Value> {
     let text = read_text_limited(zip, path, limit)?;
     serde_json::from_str(&vscode::strip_jsonc(&text)).with_context(|| format!("{path} is invalid"))
 }

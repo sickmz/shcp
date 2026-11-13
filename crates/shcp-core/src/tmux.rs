@@ -8,7 +8,7 @@
 //! hex, which tells every terminal of every PC when it changes. A server without a recent tmux gets
 //! plain shells instead.
 use crate::{
-    Event, NoticeLevel, Persistence, SharedTabs,
+    Event, NoticeLevel, Persistence, SharedTabs, files,
     session::{Context, OpenTerminal, Ssh},
     session_log::SessionLog,
     term::TerminalCommand,
@@ -19,6 +19,7 @@ use parking_lot::Mutex;
 use russh::ChannelMsg;
 use std::{
     collections::HashSet,
+    fmt::Write as _,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -101,7 +102,7 @@ pub(crate) async fn report_keeping(ctx: Arc<Context>, ssh: Arc<Ssh>) {
          case \"$(\"$T\" -V 2>/dev/null)\" in {OLD_TMUX}) echo {NO_TMUX}; exit 0;; esac; \
          echo {TMUX_USABLE}'"
     );
-    let output = timeout(SURVEY_TIMEOUT, read_all(&ssh, command))
+    let output = timeout(SURVEY_TIMEOUT, files::read_all(&ssh, command))
         .await
         .unwrap_or_default();
     let output = String::from_utf8_lossy(&output);
@@ -176,7 +177,7 @@ pub(crate) async fn survey(ctx: &Context, ssh: &Ssh) {
          \"$T\" -u -L shcp list-sessions -F \"#{{session_name}}\" 2>/dev/null || exit 0; \
          echo {SURVEY_TABS}; \"$T\" -L shcp show-options -gqv @shcp_layout'"
     );
-    let output = timeout(SURVEY_TIMEOUT, read_all(ssh, command))
+    let output = timeout(SURVEY_TIMEOUT, files::read_all(ssh, command))
         .await
         .unwrap_or_default();
     let (names, tabs) = parse_survey(&output);
@@ -193,24 +194,6 @@ pub(crate) async fn survey(ctx: &Context, ssh: &Ssh) {
         live,
         tabs,
     });
-}
-
-pub(crate) async fn read_all(ssh: &Ssh, command: String) -> Vec<u8> {
-    let mut output = Vec::new();
-    let Ok(mut channel) = ssh.channel_open_session().await else {
-        return output;
-    };
-    if channel.exec(true, command).await.is_err() {
-        return output;
-    }
-    while let Some(message) = channel.wait().await {
-        match message {
-            ChannelMsg::Data { data } => output.extend_from_slice(&data),
-            ChannelMsg::Failure | ChannelMsg::Close => break,
-            _ => {}
-        }
-    }
-    output
 }
 
 /// A shell's startup files may have printed anything, so only what can be ours counts.
@@ -635,7 +618,7 @@ fn paste_commands(name: &str, text: &str) -> Vec<u8> {
             '$' => chunk.push_str("\\$"),
             '\n' => chunk.push_str("\\n"),
             ch if (ch as u32) < 0x20 || ch == '\x7f' => {
-                chunk.push_str(&format!("\\{:03o}", ch as u32));
+                let _ = write!(chunk, "\\{:03o}", ch as u32);
             }
             ch => chunk.push(ch),
         }

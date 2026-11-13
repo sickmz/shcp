@@ -18,7 +18,7 @@ use gpui::{
     EventEmitter, FocusHandle, Focusable, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, Point, Subscription, Window, canvas, div, px, relative,
 };
-use shcp_core::{HostId, SavedPane, SplitAxis, TerminalId};
+use shcp_core::{HostConfig, HostId, SavedPane, SplitAxis, TerminalId};
 use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
@@ -156,7 +156,7 @@ impl Node {
     }
 }
 
-pub enum PanesEvent {
+pub(crate) enum PanesEvent {
     /// Show the files next to the terminals.
     Browse,
     /// Show the files, or hide them if they show.
@@ -167,7 +167,7 @@ pub enum PanesEvent {
 
 impl EventEmitter<PanesEvent> for TerminalPanes {}
 
-pub struct TerminalPanes {
+pub(crate) struct TerminalPanes {
     state: Entity<AppState>,
     host: HostId,
     /// Only `None` while the tree is being rebuilt.
@@ -193,7 +193,7 @@ impl Focusable for TerminalPanes {
 
 impl TerminalPanes {
     /// `known`: the terminals of `layout` are from the last run, see `TerminalView::new`.
-    pub fn new(
+    pub(crate) fn new(
         state: Entity<AppState>,
         host: HostId,
         layout: &SavedPane,
@@ -278,11 +278,11 @@ impl TerminalPanes {
         view
     }
 
-    pub fn had_session(&self) -> bool {
+    pub(crate) fn had_session(&self) -> bool {
         self.had_session
     }
 
-    pub fn initial_shell_pending(&self, cx: &App) -> bool {
+    pub(crate) fn initial_shell_pending(&self, cx: &App) -> bool {
         !self.had_session
             && self
                 .leaves()
@@ -290,9 +290,9 @@ impl TerminalPanes {
                 .any(|view| view.read(cx).starting_shell())
     }
 
-    pub fn retry(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn retry(&mut self, cx: &mut Context<Self>) {
         for view in self.leaves() {
-            view.update(cx, |view, cx| view.retry(cx));
+            view.update(cx, TerminalView::retry);
         }
     }
 
@@ -304,70 +304,70 @@ impl TerminalPanes {
         leaves
     }
 
-    pub fn active(&self) -> &Entity<TerminalView> {
+    pub(crate) fn active(&self) -> &Entity<TerminalView> {
         &self.active
     }
 
     /// More than one terminal side by side.
-    pub fn is_split(&self) -> bool {
+    pub(crate) fn is_split(&self) -> bool {
         matches!(self.root, Some(Node::Split { .. }))
     }
 
-    pub fn title(&self, cx: &App) -> Option<String> {
+    pub(crate) fn title(&self, cx: &App) -> Option<String> {
         self.active.read(cx).title()
     }
 
     /// With the connection up, none of them has a shell.
-    pub fn shells_gone(&self, cx: &App) -> bool {
+    pub(crate) fn shells_gone(&self, cx: &App) -> bool {
         self.leaves()
             .iter()
             .all(|terminal| terminal.read(cx).shell_gone(cx))
     }
 
-    pub fn saved(&self, cx: &App) -> SavedPane {
+    pub(crate) fn saved(&self, cx: &App) -> SavedPane {
         self.root
             .as_ref()
             .map_or(SavedPane::Terminal { key: None }, |root| root.saved(cx))
     }
 
     /// Releases every backend terminal; call when the tab is closed.
-    pub fn close(&self, cx: &App) {
+    pub(crate) fn close(&self, cx: &App) {
         for view in self.leaves() {
             view.read(cx).close(cx);
         }
     }
 
     /// Lets go of every backend terminal, leaving the shells to whoever else has them.
-    pub fn detach(&self, cx: &App) {
+    pub(crate) fn detach(&self, cx: &App) {
         for view in self.leaves() {
             view.read(cx).detach(cx);
         }
     }
 
     /// The names of its terminals on the server.
-    pub fn keys(&self, cx: &App) -> Vec<String> {
+    pub(crate) fn keys(&self, cx: &App) -> Vec<String> {
         self.saved(cx).keys()
     }
 
     /// The names of the terminals that should be on a server in use but are not in `live`.
-    pub fn missing_keys(&self, live: &HashSet<String>, cx: &App) -> Vec<String> {
+    pub(crate) fn missing_keys(&self, live: &HashSet<String>, cx: &App) -> Vec<String> {
         self.leaves()
             .iter()
             .map(|view| view.read(cx))
             .filter(|view| view.expects_shell())
-            .filter_map(|view| view.key())
+            .filter_map(TerminalView::key)
             .filter(|key| !live.contains(key))
             .collect()
     }
 
-    pub fn has_terminal(&self, id: TerminalId, cx: &App) -> bool {
+    pub(crate) fn has_terminal(&self, id: TerminalId, cx: &App) -> bool {
         self.leaves()
             .iter()
             .any(|view| view.read(cx).terminal_id() == id)
     }
 
     /// A terminal that can still reach the server.
-    pub fn live_terminal(&self, cx: &App) -> Option<TerminalId> {
+    pub(crate) fn live_terminal(&self, cx: &App) -> Option<TerminalId> {
         self.leaves()
             .iter()
             .map(|view| view.read(cx))
@@ -376,13 +376,13 @@ impl TerminalPanes {
     }
 
     /// A divider is under the pointer, so the layout is on its way to something else.
-    pub fn is_dragging(&self) -> bool {
+    pub(crate) fn is_dragging(&self) -> bool {
         self.dragging.is_some()
     }
 
     /// Takes the layout another PC gave its terminals. The ones in `gone` were closed there; any
     /// other that the layout does not have is new here, so it stays, next to the rest.
-    pub fn apply_layout(
+    pub(crate) fn apply_layout(
         &mut self,
         layout: &SavedPane,
         gone: &HashSet<String>,
@@ -428,7 +428,7 @@ impl TerminalPanes {
     }
 
     /// Lets go of the terminals with these names. `false`: the tab has none left.
-    pub fn drop_keys(
+    pub(crate) fn drop_keys(
         &mut self,
         keys: &HashSet<String>,
         window: &mut Window,
@@ -436,7 +436,7 @@ impl TerminalPanes {
     ) -> bool {
         for view in self.leaves() {
             let closed = view.read(cx).key().is_some_and(|key| keys.contains(&key));
-            if closed && !self.take_pane(view, false, window, cx) {
+            if closed && !self.take_pane(&view, false, window, cx) {
                 return false;
             }
         }
@@ -444,7 +444,7 @@ impl TerminalPanes {
     }
 
     /// Lets go of a terminal closed elsewhere. `false`: it was the last one, the tab goes instead.
-    pub fn remove_terminal(
+    pub(crate) fn remove_terminal(
         &mut self,
         id: TerminalId,
         window: &mut Window,
@@ -454,10 +454,10 @@ impl TerminalPanes {
             .leaves()
             .into_iter()
             .find(|view| view.read(cx).terminal_id() == id);
-        target.is_none_or(|target| self.take_pane(target, false, window, cx))
+        target.is_none_or(|target| self.take_pane(&target, false, window, cx))
     }
 
-    pub fn split(&mut self, axis: SplitAxis, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn split(&mut self, axis: SplitAxis, window: &mut Window, cx: &mut Context<Self>) {
         let new = Self::terminal(&self.state, &self.host, None, false, window, cx);
         let target = self.active.entity_id();
         self.root = self
@@ -470,23 +470,14 @@ impl TerminalPanes {
     }
 
     /// Closes the active terminal. `false`: it was the last one, the tab has to close instead.
-    pub fn close_active(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        self.close_pane(self.active.clone(), window, cx)
-    }
-
-    fn close_pane(
-        &mut self,
-        target: Entity<TerminalView>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        self.take_pane(target, true, window, cx)
+    pub(crate) fn close_active(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.take_pane(&self.active.clone(), true, window, cx)
     }
 
     /// Takes a terminal out of the tree, ending what runs in it if `kill`.
     fn take_pane(
         &mut self,
-        target: Entity<TerminalView>,
+        target: &Entity<TerminalView>,
         kill: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -495,7 +486,7 @@ impl TerminalPanes {
         if leaves.len() < 2 {
             return false;
         }
-        let index = leaves.iter().position(|view| *view == target).unwrap_or(0);
+        let index = leaves.iter().position(|view| view == target).unwrap_or(0);
         // Closed from elsewhere, it must not pull the keyboard away from what it is on.
         let refocus = kill || target.read(cx).contains_focus(window, cx);
         if kill {
@@ -507,7 +498,7 @@ impl TerminalPanes {
             .root
             .take()
             .and_then(|root| root.without(target.entity_id()));
-        if self.active == target {
+        if self.active == *target {
             self.active = leaves[if index == 0 { 1 } else { index - 1 }].clone();
         }
         if refocus {
@@ -553,7 +544,7 @@ impl TerminalPanes {
     }
 
     fn focus_towards(&mut self, dx: f32, dy: f32, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(view) = self.neighbour(&self.active.clone(), dx, dy, cx) {
+        if let Some(view) = self.neighbour(&self.active, dx, dy, cx) {
             window.focus(&view.focus_handle(cx));
             self.set_active(view, cx);
         }
@@ -659,12 +650,12 @@ impl TerminalPanes {
         ]);
         if several {
             entries.push(MenuEntry::Separator);
-            let target = view.clone();
+            let target = view;
             entries.push(
                 MenuEntry::item(
                     "Close terminal",
                     handler(this, move |panes, window, cx| {
-                        panes.close_pane(target.clone(), window, cx);
+                        panes.take_pane(&target, true, window, cx);
                     }),
                 )
                 .icon(IconName::Close)
@@ -724,7 +715,7 @@ impl TerminalPanes {
         let who = host.map_or(self.host.0.clone(), |host| {
             format!("{}@{}", host.user, host.alias)
         });
-        let target = host.map(|host| format!("{}@{}", host.user, host.hostname));
+        let target = host.map(HostConfig::target);
         let color = theme.host_color(state.host_color(&self.host));
         let user = host.map(|host| host.user.clone()).unwrap_or_default();
         let shell = state
@@ -777,7 +768,7 @@ impl TerminalPanes {
                 })
                 .style(ButtonStyle::Ghost)
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    if !this.close_pane(closing.clone(), window, cx) {
+                    if !this.take_pane(&closing, true, window, cx) {
                         cx.emit(PanesEvent::CloseTab);
                     }
                 }))
@@ -896,7 +887,7 @@ impl TerminalPanes {
                     .size_full()
                     .relative()
                     .flex()
-                    .when(!row, |this| this.flex_col())
+                    .when(!row, Styled::flex_col)
                     .child(
                         canvas(move |area, _, _| cell.set(Some(area)), |_, _, _, _| {})
                             .absolute()
@@ -1038,7 +1029,7 @@ impl Render for TerminalPanes {
             self.active = focused.clone();
         }
         // How much of its tools each card shows, with the pointer over it or on its way out.
-        let live: HashSet<EntityId> = leaves.iter().map(|view| view.entity_id()).collect();
+        let live: HashSet<EntityId> = leaves.iter().map(Entity::entity_id).collect();
         self.fades.retain(|id, _| live.contains(id));
         let tools: HashMap<EntityId, f32> = live
             .iter()
@@ -1114,13 +1105,7 @@ impl Render for TerminalPanes {
                 ContextMenu::new(
                     "pane-menu",
                     menu,
-                    Rc::new(move |_, cx| {
-                        this.update(cx, |this, cx| {
-                            this.menu = None;
-                            cx.notify();
-                        })
-                        .ok();
-                    }),
+                    crate::widgets::context_menu::dismiss(this, |view| &mut view.menu),
                 )
             }))
     }

@@ -7,7 +7,7 @@ use crate::{
 use async_channel::{Receiver, Sender};
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, atomic::Ordering},
+    sync::Arc,
 };
 use tokio::runtime::Handle;
 
@@ -58,14 +58,7 @@ impl ConnectionCheck {
 
     /// `accept` trusts the server from now on, as a connection does.
     pub fn answer_host_key(&self, accept: bool) {
-        let prompts = &self.context.prompts;
-        if prompts
-            .kind
-            .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            let _ = prompts.host_tx.try_send(accept);
-        }
+        self.context.prompts.answer_host_key(accept);
     }
 }
 
@@ -185,15 +178,15 @@ fn translate(state: SessionState, notice: &mut Option<String>) -> Option<CheckUp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Scratch;
     use parking_lot::Mutex;
     use russh::{
         MethodKind, MethodSet,
         keys::{PrivateKey, ssh_key::private::Ed25519Keypair},
         server::{self, Auth},
     };
-    use std::{collections::HashMap, time::Duration};
+    use std::time::Duration;
     use tokio::net::TcpListener;
-    use tokio_util::sync::CancellationToken;
 
     #[derive(Clone, Default)]
     struct Seen(Arc<Mutex<Vec<String>>>);
@@ -248,25 +241,6 @@ mod tests {
         (port, seen)
     }
 
-    struct Scratch(PathBuf);
-    impl Scratch {
-        fn new(name: &str) -> Self {
-            let dir =
-                std::env::temp_dir().join(format!("shcp-check-{name}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            Self(dir)
-        }
-        fn known_hosts(&self) -> PathBuf {
-            self.0.join("known_hosts")
-        }
-    }
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     fn check(dir: &Scratch, port: u16) -> ConnectionCheck {
         let host = HostConfig {
             alias: "draft".into(),
@@ -276,27 +250,14 @@ mod tests {
             ..Default::default()
         };
         let (events, receiver) = async_channel::unbounded();
-        let context = Context {
-            id: SessionId(1),
-            host: draft(host, &dir.0),
-            jumps: Vec::new(),
-            remote_forwards: Mutex::new(HashMap::new()),
-            paths: AppPaths {
-                config_dir: dir.0.clone(),
-                data_dir: dir.0.clone(),
-                log_dir: dir.0.clone(),
-                known_hosts: dir.known_hosts(),
-                ssh_config: dir.0.join("config"),
-            },
+        let context = Context::new(
+            SessionId(1),
+            draft(host, &dir.0),
+            Vec::new(),
+            dir.paths(),
             events,
-            cancel: CancellationToken::new(),
-            prompts: session::Prompts::new(),
-            known_hosts_lock: Arc::new(Mutex::new(())),
-            use_agent: false,
-            open_forwards: false,
-            persist_terminals: false,
-            tmux: Default::default(),
-        };
+            Arc::new(Mutex::new(())),
+        );
         start(&Handle::current(), context, receiver, 1)
     }
 
@@ -320,7 +281,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_server_that_lets_you_in_signs_in_and_is_trusted() {
-        let dir = Scratch::new("signs-in");
+        let dir = Scratch::new("check-signs-in");
         let (port, _) = server(true, 1).await;
         let check = check(&dir, port);
         let (seen, outcome) = outcome(&check, true).await;
@@ -329,13 +290,13 @@ mod tests {
             seen.iter()
                 .any(|update| matches!(update, CheckUpdate::NewServer { .. }))
         );
-        let saved = std::fs::read_to_string(dir.known_hosts()).unwrap();
+        let saved = std::fs::read_to_string(dir.paths().known_hosts).unwrap();
         assert!(saved.contains(&port.to_string()));
     }
 
     #[tokio::test]
     async fn a_password_is_never_asked_for_or_sent() {
-        let dir = Scratch::new("password");
+        let dir = Scratch::new("check-password");
         let (port, seen) = server(false, 2).await;
         let check = check(&dir, port);
         let (_, outcome) = outcome(&check, true).await;
@@ -348,7 +309,7 @@ mod tests {
 
     #[tokio::test]
     async fn nothing_listening_is_a_failure_with_a_reason() {
-        let dir = Scratch::new("closed");
+        let dir = Scratch::new("check-closed");
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
@@ -363,7 +324,7 @@ mod tests {
 
     #[tokio::test]
     async fn stopping_at_a_new_server_trusts_nothing() {
-        let dir = Scratch::new("stopped");
+        let dir = Scratch::new("check-stopped");
         let (port, _) = server(true, 3).await;
         let check = check(&dir, port);
         let updates = check.updates();
@@ -383,26 +344,29 @@ mod tests {
         })
         .await;
         assert!(ended.is_ok(), "the check kept going");
-        assert!(!dir.known_hosts().exists());
+        assert!(!dir.paths().known_hosts.exists());
     }
 
     #[tokio::test]
     async fn a_changed_key_fails_and_stays_as_it_was() {
-        let dir = Scratch::new("changed");
+        let dir = Scratch::new("check-changed");
         let (port, _) = server(true, 4).await;
         let old = PrivateKey::from(Ed25519Keypair::from_seed(&[99; 32]));
         let saved = format!(
             "[127.0.0.1]:{port} {}\n",
             old.public_key().to_openssh().unwrap()
         );
-        std::fs::write(dir.known_hosts(), &saved).unwrap();
+        std::fs::write(dir.paths().known_hosts, &saved).unwrap();
         let check = check(&dir, port);
         let (_, outcome) = outcome(&check, true).await;
         let CheckOutcome::Failed(error) = outcome else {
             panic!("it should have failed: {outcome:?}");
         };
         assert_eq!(error.kind, ConnectErrorKind::HostKey);
-        assert_eq!(std::fs::read_to_string(dir.known_hosts()).unwrap(), saved);
+        assert_eq!(
+            std::fs::read_to_string(dir.paths().known_hosts).unwrap(),
+            saved
+        );
     }
 
     #[test]

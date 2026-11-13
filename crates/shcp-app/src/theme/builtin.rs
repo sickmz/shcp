@@ -1,25 +1,25 @@
 //! Built-in themes: cool Nocturne and warm Prune, both in smoked glass unless the user turns
 //! the effects off.
 //! All keep the user's configurable accent.
-use super::Theme;
+use super::{Theme, to_rgb};
 use gpui::{Hsla, Rgba};
 use shcp_core::Accent;
-use shcp_core::term::{Palette, Rgb};
+use shcp_core::term::Palette;
 
 /// The hue of the grays, and of the blue accent.
-pub const HUE: f32 = 268.;
+pub(crate) const HUE: f32 = 268.;
 /// How much of that hue the grays take.
 const TINT: f32 = 0.18;
 
-pub const NOCTURNE: &str = "Nocturne";
-pub const PRUNE: &str = "Prune";
+pub(crate) const NOCTURNE: &str = "Nocturne";
+pub(crate) const PRUNE: &str = "Prune";
 
 /// Lightness and chroma of the accent, and lightness of what is written on it.
-const DARK_LIT: (f32, f32, f32) = (0.80, 0.135, 0.17);
-const LIGHT_LIT: (f32, f32, f32) = (0.50, 0.15, 0.985);
+pub(super) const DARK_LIT: (f32, f32, f32) = (0.80, 0.135, 0.17);
+pub(super) const LIGHT_LIT: (f32, f32, f32) = (0.50, 0.15, 0.985);
 
 /// An OKLCH color, as sRGB in gpui's terms. What falls outside sRGB is clipped.
-pub fn oklch(l: f32, c: f32, h: f32, a: f32) -> Hsla {
+pub(crate) fn oklch(l: f32, c: f32, h: f32, a: f32) -> Hsla {
     let radians = h.to_radians();
     let (ca, cb) = (c * radians.cos(), c * radians.sin());
     let cube = |v: f32| v * v * v;
@@ -41,12 +41,6 @@ pub fn oklch(l: f32, c: f32, h: f32, a: f32) -> Hsla {
         a,
     }
     .into()
-}
-
-fn to_rgb(color: Hsla) -> Rgb {
-    let Rgba { r, g, b, .. } = color.to_rgb();
-    let byte = |v: f32| (v.clamp(0., 1.) * 255.).round() as u8;
-    Rgb(byte(r), byte(g), byte(b))
 }
 
 /// An accent as a theme draws it, and what is written on it.
@@ -94,12 +88,12 @@ fn lit(accent: Accent, is_light: bool) -> Lit {
 }
 
 /// The color of an accent, for showing the choice.
-pub fn accent_color(accent: Accent, is_light: bool) -> Hsla {
+pub(crate) fn accent_color(accent: Accent, is_light: bool) -> Hsla {
     let lit = lit(accent, is_light);
     oklch(lit.l, lit.c, lit.h, 1.)
 }
 
-pub fn build(name: &str, accent: Accent) -> Theme {
+pub(crate) fn build(name: &str, accent: Accent) -> Theme {
     match name {
         PRUNE => prune(accent),
         _ => nocturne(accent),

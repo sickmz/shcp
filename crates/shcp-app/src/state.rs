@@ -8,17 +8,17 @@ use gpui::{App, Context, Entity, EventEmitter};
 use shcp_core::{
     ConnectProgress, ConnectStep, EngineHandle, Event, ForwardSpec, ForwardState, HostAppearance,
     HostConfig, HostId, NoticeLevel, SessionId, SessionState, Settings, Snippet, TransferId,
-    TransferInfo, TransferState,
+    TransferInfo,
 };
 use std::{
     cell::Cell,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, btree_map::Entry},
     rc::Rc,
     time::{Duration, Instant},
 };
 
 #[derive(Clone)]
-pub struct ForwardInfo {
+pub(crate) struct ForwardInfo {
     pub spec: ForwardSpec,
     pub state: ForwardState,
     pub active_conns: u32,
@@ -30,7 +30,7 @@ const STEP_PACE: Duration = Duration::from_millis(180);
 /// How often a notice past its time looks whether it can go.
 const NOTICE_HELD_CHECK: Duration = Duration::from_secs(1);
 
-pub struct SessionInfo {
+pub(crate) struct SessionInfo {
     pub state: SessionState,
     pub forwards: Vec<ForwardInfo>,
     /// The step the connection reached last. It stays once the connection moves on, for a prompt
@@ -69,12 +69,12 @@ impl SessionInfo {
 
 /// A button on a notice.
 #[derive(Clone)]
-pub struct NoticeAction {
+pub(crate) struct NoticeAction {
     pub label: &'static str,
     pub run: Handler,
 }
 
-pub struct Notice {
+pub(crate) struct Notice {
     pub id: u64,
     pub level: NoticeLevel,
     pub message: String,
@@ -83,7 +83,7 @@ pub struct Notice {
     pub leaving: bool,
 }
 
-pub struct AppState {
+pub(crate) struct AppState {
     pub engine: EngineHandle,
     pub hosts: Vec<HostConfig>,
     pub settings: Settings,
@@ -121,20 +121,20 @@ fn saved_position(order: &[String], name: &str) -> usize {
 }
 
 /// The list with `item` right before `target`, or right after it, wherever it came from.
-fn moved(list: &[String], item: &String, target: &String, after: bool) -> Vec<String> {
-    if item == target || !list.contains(item) {
+fn moved(list: &[String], item: &str, target: &str, after: bool) -> Vec<String> {
+    if item == target || !list.iter().any(|name| name == item) {
         return list.to_vec();
     }
     let mut result: Vec<String> = list.iter().filter(|name| *name != item).cloned().collect();
     let Some(at) = result.iter().position(|name| name == target) else {
         return list.to_vec();
     };
-    result.insert(at + usize::from(after), item.clone());
+    result.insert(at + usize::from(after), item.to_string());
     result
 }
 
 impl AppState {
-    pub fn new(engine: EngineHandle) -> Self {
+    pub(crate) fn new(engine: EngineHandle) -> Self {
         Self {
             hosts: engine.hosts(),
             settings: engine.settings(),
@@ -157,21 +157,21 @@ impl AppState {
 
     // ---- queries ----
 
-    pub fn reconnect_attempt(&self, host: &HostId) -> Option<u32> {
+    pub(crate) fn reconnect_attempt(&self, host: &HostId) -> Option<u32> {
         self.reconnecting.get(host).copied()
     }
 
     /// The host had tunnels open when its connection was lost.
-    pub fn has_lost_forwards(&self, host: &HostId) -> bool {
+    pub(crate) fn has_lost_forwards(&self, host: &HostId) -> bool {
         self.lost_forwards.contains_key(host)
     }
 
-    pub fn host_group(&self, host: &HostId) -> Option<&str> {
+    pub(crate) fn host_group(&self, host: &HostId) -> Option<&str> {
         self.settings.host_groups.get(&host.0).map(String::as_str)
     }
 
     /// Every group in use, in the order the user put them; the others follow by name.
-    pub fn groups(&self) -> Vec<String> {
+    pub(crate) fn groups(&self) -> Vec<String> {
         let names: std::collections::BTreeSet<_> =
             self.settings.host_groups.values().cloned().collect();
         let mut names: Vec<String> = names.into_iter().collect();
@@ -180,14 +180,14 @@ impl AppState {
     }
 
     /// Every host, in the order the user put them; the others follow as they are read.
-    pub fn ordered_hosts(&self) -> Vec<HostConfig> {
+    pub(crate) fn ordered_hosts(&self) -> Vec<HostConfig> {
         let mut hosts = self.hosts.clone();
         hosts.sort_by_key(|host| saved_position(&self.settings.host_order, &host.id.0));
         hosts
     }
 
     /// Puts a host where another one is, in its group.
-    pub fn place_host(
+    pub(crate) fn place_host(
         &mut self,
         host: &HostId,
         target: &HostId,
@@ -209,46 +209,76 @@ impl AppState {
     }
 
     /// Puts a group right before another one, or right after it.
-    pub fn place_group(&mut self, group: &str, target: &str, after: bool, cx: &mut Context<Self>) {
+    pub(crate) fn place_group(
+        &mut self,
+        group: &str,
+        target: &str,
+        after: bool,
+        cx: &mut Context<Self>,
+    ) {
         let order = self.groups();
-        self.settings.group_order = moved(&order, &group.to_string(), &target.to_string(), after);
+        self.settings.group_order = moved(&order, group, target, after);
         self.persist_settings(cx);
         cx.notify();
     }
 
-    pub fn host(&self, id: &HostId) -> Option<&HostConfig> {
+    pub(crate) fn host(&self, id: &HostId) -> Option<&HostConfig> {
         self.hosts.iter().find(|h| &h.id == id)
     }
 
-    pub fn host_session(&self, host: &HostId) -> Option<&SessionInfo> {
+    pub(crate) fn host_session(&self, host: &HostId) -> Option<&SessionInfo> {
         self.host_sessions
             .get(host)
             .and_then(|id| self.sessions.get(id))
     }
 
-    pub fn host_session_id(&self, host: &HostId) -> Option<SessionId> {
+    pub(crate) fn host_session_id(&self, host: &HostId) -> Option<SessionId> {
         self.host_sessions.get(host).copied()
     }
 
-    pub fn session(&self, id: SessionId) -> Option<&SessionInfo> {
+    /// The alias of a host, or its id when the host is no longer known.
+    pub(crate) fn alias(&self, id: &HostId) -> String {
+        self.host(id).map_or(id.0.clone(), |h| h.alias.clone())
+    }
+
+    pub(crate) fn session(&self, id: SessionId) -> Option<&SessionInfo> {
         self.sessions.get(&id)
     }
 
-    pub fn active_transfers(&self) -> usize {
+    pub(crate) fn session_connected(&self, id: SessionId) -> bool {
+        self.session(id)
+            .is_some_and(|s| matches!(s.state, SessionState::Connected))
+    }
+
+    /// The session ended, failed, or is no longer known.
+    pub(crate) fn session_gone(&self, id: SessionId) -> bool {
+        self.session(id).is_none_or(|s| {
+            matches!(
+                s.state,
+                SessionState::Disconnected { .. } | SessionState::Failed { .. }
+            )
+        })
+    }
+
+    /// The connections a restart would close.
+    pub(crate) fn connected_sessions(&self) -> usize {
+        self.sessions
+            .values()
+            .filter(|session| matches!(session.state, SessionState::Connected))
+            .count()
+    }
+
+    pub(crate) fn active_transfers(&self) -> usize {
         self.transfers
             .iter()
-            .filter(|t| matches!(t.state, TransferState::Queued | TransferState::Running))
+            .filter(|t| t.state.is_active())
             .count()
     }
 
     /// How far the transfers under way have come, when the size of every one of them is known.
-    pub fn transfers_percent(&self) -> Option<u8> {
+    pub(crate) fn transfers_percent(&self) -> Option<u8> {
         let (mut done, mut total) = (0u64, 0u64);
-        for transfer in self
-            .transfers
-            .iter()
-            .filter(|t| matches!(t.state, TransferState::Queued | TransferState::Running))
-        {
+        for transfer in self.transfers.iter().filter(|t| t.state.is_active()) {
             let size = transfer.bytes_total?;
             done += transfer.bytes_done.min(size);
             total += size;
@@ -259,37 +289,32 @@ impl AppState {
     // ---- commands ----
 
     /// Connects (or reuses the live session of) a host and returns its session id.
-    pub fn connect_host(&mut self, host: &HostId, cx: &mut Context<Self>) -> SessionId {
+    pub(crate) fn connect_host(&mut self, host: &HostId, cx: &mut Context<Self>) -> SessionId {
         let id = self.engine.connect(host);
-        let fresh = !self.sessions.contains_key(&id);
-        self.sessions.entry(id).or_insert_with(|| {
-            SessionInfo::new(SessionState::Connecting {
+        self.host_sessions.insert(host.clone(), id);
+        if let Entry::Vacant(entry) = self.sessions.entry(id) {
+            let state = SessionState::Connecting {
                 step: ConnectStep::Resolving,
                 progress: ConnectProgress::default(),
-            })
-        });
-        self.host_sessions.insert(host.clone(), id);
-        if fresh {
+            };
+            entry.insert(SessionInfo::new(state.clone()));
             cx.emit(Event::Session {
                 id,
                 host: host.clone(),
-                state: SessionState::Connecting {
-                    step: ConnectStep::Resolving,
-                    progress: ConnectProgress::default(),
-                },
+                state,
             });
         }
         cx.notify();
         id
     }
 
-    pub fn disconnect_host(&mut self, host: &HostId) {
+    pub(crate) fn disconnect_host(&mut self, host: &HostId) {
         if let Some(id) = self.host_sessions.get(host) {
             self.engine.disconnect(*id);
         }
     }
 
-    pub fn set_active_host(&mut self, host: Option<HostId>, cx: &mut Context<Self>) {
+    pub(crate) fn set_active_host(&mut self, host: Option<HostId>, cx: &mut Context<Self>) {
         if self.active_host != host {
             self.active_host = host;
             cx.notify();
@@ -297,7 +322,12 @@ impl AppState {
     }
 
     /// Opens a closed tunnel, or tries again one that could not listen.
-    pub fn open_forward(&mut self, session: SessionId, spec: &ForwardSpec, cx: &mut Context<Self>) {
+    pub(crate) fn open_forward(
+        &mut self,
+        session: SessionId,
+        spec: &ForwardSpec,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(forward) = self
             .sessions
             .get_mut(&session)
@@ -310,7 +340,7 @@ impl AppState {
     }
 
     /// Opens a new tunnel on a live session and remembers it for the host.
-    pub fn add_forward(
+    pub(crate) fn add_forward(
         &mut self,
         host: &HostId,
         session: SessionId,
@@ -344,7 +374,7 @@ impl AppState {
         cx.notify();
     }
 
-    pub fn is_remembered(&self, host: &HostId, spec: &ForwardSpec) -> bool {
+    pub(crate) fn is_remembered(&self, host: &HostId, spec: &ForwardSpec) -> bool {
         self.settings
             .extra_forwards
             .get(&host.0)
@@ -352,7 +382,7 @@ impl AppState {
     }
 
     /// Gives a port of `host` the name the user knows it by; an empty one takes it away.
-    pub fn name_port(
+    pub(crate) fn name_port(
         &mut self,
         host: &HostId,
         spec: &ForwardSpec,
@@ -365,7 +395,7 @@ impl AppState {
     }
 
     /// Closes a tunnel added from the sidebar and stops remembering it.
-    pub fn forget_forward(
+    pub(crate) fn forget_forward(
         &mut self,
         host: &HostId,
         session: SessionId,
@@ -396,7 +426,7 @@ impl AppState {
         cx.notify();
     }
 
-    pub fn set_reconnect_attempt(
+    pub(crate) fn set_reconnect_attempt(
         &mut self,
         host: &HostId,
         attempt: Option<u32>,
@@ -414,24 +444,29 @@ impl AppState {
     }
 
     /// Removes every saved passphrase and password from the Credential Manager.
-    pub fn forget_secrets(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn forget_secrets(&mut self, cx: &mut Context<Self>) {
         for key in std::mem::take(&mut self.settings.saved_passphrases) {
-            self.engine.forget_passphrase(key);
+            self.engine.forget_passphrase(&key);
         }
         for target in std::mem::take(&mut self.settings.saved_passwords) {
-            self.engine.forget_password(target);
+            self.engine.forget_password(&target);
         }
         self.persist_settings(cx);
         cx.notify();
     }
 
-    pub fn remember_key_login_offered(&mut self, host: &HostId, cx: &mut Context<Self>) {
+    pub(crate) fn remember_key_login_offered(&mut self, host: &HostId, cx: &mut Context<Self>) {
         self.settings.key_login_offered.insert(host.0.clone());
         self.persist_settings(cx);
     }
 
     /// Moves a host to a group, or out of any with `None`.
-    pub fn set_host_group(&mut self, host: &HostId, group: Option<String>, cx: &mut Context<Self>) {
+    pub(crate) fn set_host_group(
+        &mut self,
+        host: &HostId,
+        group: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         match group
             .map(|g| g.trim().to_string())
             .filter(|g| !g.is_empty())
@@ -451,13 +486,13 @@ impl AppState {
         cx.notify();
     }
 
-    pub fn rename_group(&mut self, old: &str, new: &str, cx: &mut Context<Self>) {
+    pub(crate) fn rename_group(&mut self, old: &str, new: &str, cx: &mut Context<Self>) {
         self.settings.rename_group(old, new);
         self.persist_settings(cx);
         cx.notify();
     }
 
-    pub fn toggle_group_collapsed(&mut self, group: &str, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_group_collapsed(&mut self, group: &str, cx: &mut Context<Self>) {
         if !self.settings.collapsed_groups.remove(group) {
             self.settings.collapsed_groups.insert(group.to_string());
         }
@@ -466,7 +501,7 @@ impl AppState {
     }
 
     /// Replaces the startup command of a host and the commands the host can see.
-    pub fn set_host_commands(
+    pub(crate) fn set_host_commands(
         &mut self,
         host: &HostId,
         startup: String,
@@ -489,7 +524,7 @@ impl AppState {
     }
 
     /// Starts a failed transfer again, on a new connection if its own is gone.
-    pub fn retry_transfer(&mut self, id: TransferId, cx: &mut Context<Self>) {
+    pub(crate) fn retry_transfer(&mut self, id: TransferId, cx: &mut Context<Self>) {
         let Some(index) = self.transfers.iter().position(|t| t.id == id) else {
             return;
         };
@@ -499,12 +534,12 @@ impl AppState {
         cx.notify();
     }
 
-    pub fn is_host_hidden(&self, host: &HostId) -> bool {
+    pub(crate) fn is_host_hidden(&self, host: &HostId) -> bool {
         self.settings.hidden_hosts.contains(&host.0)
     }
 
     /// Hides a host from the sidebar, or shows it again, and remembers the choice.
-    pub fn toggle_host_hidden(&mut self, host: &HostId, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_host_hidden(&mut self, host: &HostId, cx: &mut Context<Self>) {
         if !self.settings.hidden_hosts.remove(&host.0) {
             self.settings.hidden_hosts.insert(host.0.clone());
         }
@@ -512,7 +547,7 @@ impl AppState {
         cx.notify();
     }
 
-    pub fn host_appearance(&self, host: &HostId) -> HostAppearance {
+    pub(crate) fn host_appearance(&self, host: &HostId) -> HostAppearance {
         self.settings
             .host_appearance
             .get(&host.0)
@@ -521,7 +556,7 @@ impl AppState {
     }
 
     /// The color of a host, gray unless picked. A tab can outlive its host: it keeps gray then.
-    pub fn host_color(&self, host: &HostId) -> HostColor {
+    pub(crate) fn host_color(&self, host: &HostId) -> HostColor {
         self.settings
             .host_appearance
             .get(&host.0)
@@ -531,7 +566,7 @@ impl AppState {
     }
 
     /// Remembers how a host looks; the default look leaves nothing behind in the settings.
-    pub fn set_host_appearance(
+    pub(crate) fn set_host_appearance(
         &mut self,
         host: &HostId,
         appearance: HostAppearance,
@@ -552,33 +587,42 @@ impl AppState {
     }
 
     /// A host's id is its alias: keep what is remembered for it when it changes.
-    pub fn host_renamed(&mut self, old: &HostId, new: &HostId, cx: &mut Context<Self>) {
+    pub(crate) fn host_renamed(&mut self, old: &HostId, new: &HostId, cx: &mut Context<Self>) {
         self.settings.rename_host(old, new);
         self.persist_settings(cx);
         cx.notify();
     }
 
-    pub(crate) fn persist_settings(&mut self, cx: &mut Context<Self>) {
-        if let Err(error) = self.engine.save_settings(self.settings.clone()) {
-            self.push_notice(
-                NoticeLevel::Error,
-                format!("Could not save settings: {error:#}"),
-                cx,
-            );
+    /// Saves the settings, with a notice when that fails. Returns whether they were saved.
+    pub(crate) fn persist_settings(&mut self, cx: &mut Context<Self>) -> bool {
+        match self.engine.save_settings(self.settings.clone()) {
+            Ok(()) => true,
+            Err(error) => {
+                self.push_notice(
+                    NoticeLevel::Error,
+                    format!("Could not save settings: {error:#}"),
+                    cx,
+                );
+                false
+            }
         }
     }
 
-    pub fn cancel_transfer(&mut self, id: TransferId) {
+    pub(crate) fn cancel_transfer(&self, id: TransferId) {
         self.engine.cancel_transfer(id);
     }
 
-    pub fn clear_completed_transfers(&mut self, cx: &mut Context<Self>) {
-        self.transfers
-            .retain(|t| matches!(t.state, TransferState::Queued | TransferState::Running));
+    pub(crate) fn clear_completed_transfers(&mut self, cx: &mut Context<Self>) {
+        self.transfers.retain(|t| t.state.is_active());
         cx.notify();
     }
 
-    pub fn push_notice(&mut self, level: NoticeLevel, message: String, cx: &mut Context<Self>) {
+    pub(crate) fn push_notice(
+        &mut self,
+        level: NoticeLevel,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
         // What matters stays until it is closed: it may be read later, and it may need acting on.
         let linger = match level {
             NoticeLevel::Info => Some(Duration::from_secs(5)),
@@ -589,7 +633,7 @@ impl AppState {
     }
 
     /// Stays until the user chooses or closes it.
-    pub fn push_action_notice(
+    pub(crate) fn push_action_notice(
         &mut self,
         level: NoticeLevel,
         message: String,
@@ -637,7 +681,7 @@ impl AppState {
     }
 
     /// Both the close button and the timer end up here: only the first one counts.
-    pub fn dismiss_notice(&mut self, id: u64, cx: &mut Context<Self>) {
+    pub(crate) fn dismiss_notice(&mut self, id: u64, cx: &mut Context<Self>) {
         let Some(notice) = self.notices.iter_mut().find(|n| n.id == id && !n.leaving) else {
             return;
         };
@@ -657,14 +701,14 @@ impl AppState {
     }
 
     /// What the host's connection is asking the user, unless it was just answered.
-    pub fn login_prompt(&self, host: &HostId, cx: &App) -> Option<Entity<LoginPrompt>> {
+    pub(crate) fn login_prompt(&self, host: &HostId, cx: &App) -> Option<Entity<LoginPrompt>> {
         self.login_prompts
             .get(host)
             .filter(|prompt| !prompt.read(cx).answered())
             .cloned()
     }
 
-    pub fn set_login_prompt(
+    pub(crate) fn set_login_prompt(
         &mut self,
         host: &HostId,
         prompt: Entity<LoginPrompt>,
@@ -675,7 +719,7 @@ impl AppState {
     }
 
     /// The session moved on. An older session of the host ending changes nothing.
-    pub fn clear_login_prompt(
+    pub(crate) fn clear_login_prompt(
         &mut self,
         host: &HostId,
         session: SessionId,
@@ -691,7 +735,7 @@ impl AppState {
         }
     }
 
-    pub fn clear_notices(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn clear_notices(&mut self, cx: &mut Context<Self>) {
         let ids: Vec<u64> = self.notices.iter().map(|n| n.id).collect();
         for id in ids {
             self.dismiss_notice(id, cx);
@@ -699,7 +743,7 @@ impl AppState {
     }
 
     /// Replaces and persists all settings.
-    pub fn update_settings(
+    pub(crate) fn update_settings(
         &mut self,
         settings: Settings,
         cx: &mut Context<Self>,
@@ -717,7 +761,7 @@ impl AppState {
     }
 
     /// Replaces settings and hosts with those of a backup. Returns how many hosts came in.
-    pub fn import_backup(
+    pub(crate) fn import_backup(
         &mut self,
         path: &std::path::Path,
         cx: &mut Context<Self>,
@@ -730,23 +774,17 @@ impl AppState {
         Ok(count)
     }
 
-    pub fn logs_sessions(&self, host: &HostId) -> bool {
+    pub(crate) fn logs_sessions(&self, host: &HostId) -> bool {
         self.settings.session_logs.contains(&host.0)
     }
 
     /// Starts or stops writing the new terminals of a host to files.
-    pub fn toggle_session_log(&mut self, host: &HostId, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_session_log(&mut self, host: &HostId, cx: &mut Context<Self>) {
         let on = !self.settings.session_logs.remove(&host.0);
         if on {
             self.settings.session_logs.insert(host.0.clone());
         }
-        if let Err(error) = self.engine.save_settings(self.settings.clone()) {
-            self.push_notice(
-                NoticeLevel::Error,
-                format!("Could not save settings: {error:#}"),
-                cx,
-            );
-        } else {
+        if self.persist_settings(cx) {
             let message = if on {
                 format!(
                     "New terminals of {} are written to {}. Whatever they show goes there, \
@@ -766,34 +804,30 @@ impl AppState {
     }
 
     /// New terminals of this host go on on the server after shcp closes.
-    pub fn keeps_terminals(&self, host: &HostId) -> bool {
+    pub(crate) fn keeps_terminals(&self, host: &HostId) -> bool {
         self.settings.keeps_terminals(&host.0)
     }
 
     /// Whether the server has a tmux that can keep terminals, once it has said so in this run.
-    pub fn has_tmux(&self, host: &HostId) -> Option<bool> {
+    pub(crate) fn has_tmux(&self, host: &HostId) -> Option<bool> {
         self.tmux_hosts.get(host).copied()
     }
 
     /// Whether new terminals of a host stay on the server, or end with the connection.
-    pub fn toggle_keep_terminals(&mut self, host: &HostId, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_keep_terminals(&mut self, host: &HostId, cx: &mut Context<Self>) {
         let keep = self.settings.plain_terminal_hosts.remove(&host.0);
         if !keep {
             self.settings.plain_terminal_hosts.insert(host.0.clone());
         }
-        if let Err(error) = self.engine.save_settings(self.settings.clone()) {
-            self.push_notice(
-                NoticeLevel::Error,
-                format!("Could not save settings: {error:#}"),
-                cx,
-            );
+        if !self.persist_settings(cx) {
+            // The notice of the failure is enough.
         } else if !keep {
             let message = format!("New terminals on {} end when shcp closes", host.0);
             self.push_notice(NoticeLevel::Info, message, cx);
-        } else if let Some(session) = self.host_session_id(host).filter(|id| {
-            self.session(*id)
-                .is_some_and(|info| matches!(info.state, SessionState::Connected))
-        }) {
+        } else if let Some(session) = self
+            .host_session_id(host)
+            .filter(|id| self.session_connected(*id))
+        {
             // Only the server knows if it can, and it answers with a notice of its own.
             self.engine.report_keeping_terminals(session);
         } else {
@@ -808,27 +842,21 @@ impl AppState {
     }
 
     /// Remembers where the window is, for the next start.
-    pub fn remember_window(&mut self, window: shcp_core::SavedWindow, cx: &mut Context<Self>) {
+    pub(crate) fn remember_window(
+        &mut self,
+        window: shcp_core::SavedWindow,
+        cx: &mut Context<Self>,
+    ) {
         if self.settings.window == Some(window) {
             return;
         }
         self.settings.window = Some(window);
-        if let Err(error) = self.engine.save_settings(self.settings.clone()) {
-            self.push_notice(
-                NoticeLevel::Error,
-                format!("Could not save settings: {error:#}"),
-                cx,
-            );
-        }
+        self.persist_settings(cx);
     }
 
     /// What closing the app now would interrupt, in words. `None` when nothing.
-    pub fn closing_would_stop(&self) -> Option<String> {
-        let transfers = self
-            .transfers
-            .iter()
-            .filter(|t| matches!(t.state, TransferState::Queued | TransferState::Running))
-            .count();
+    pub(crate) fn closing_would_stop(&self) -> Option<String> {
+        let transfers = self.active_transfers();
         let edits = self.engine.open_edits();
         let transfers = match transfers {
             0 => None,
@@ -852,62 +880,126 @@ impl AppState {
     }
 
     /// Toggles dot files in every Files tab and persists the choice.
-    pub fn toggle_hidden_files(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_hidden_files(&mut self, cx: &mut Context<Self>) {
         self.settings.show_hidden_files = !self.settings.show_hidden_files;
-        if let Err(error) = self.engine.save_settings(self.settings.clone()) {
-            self.push_notice(
-                NoticeLevel::Error,
-                format!("Could not save settings: {error:#}"),
-                cx,
-            );
-        }
+        self.persist_settings(cx);
         cx.notify();
     }
 
     /// Live sidebar resize; `persist` writes the final width.
-    pub fn set_sidebar_width(&mut self, width: f32, persist: bool, cx: &mut Context<Self>) {
+    pub(crate) fn set_sidebar_width(&mut self, width: f32, persist: bool, cx: &mut Context<Self>) {
         self.settings.sidebar_width = width.clamp(180., 560.);
-        if persist && let Err(error) = self.engine.save_settings(self.settings.clone()) {
-            self.push_notice(
-                NoticeLevel::Error,
-                format!("Could not save settings: {error:#}"),
-                cx,
-            );
+        if persist {
+            self.persist_settings(cx);
         }
         cx.notify();
     }
 
-    pub fn reset_font_size(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn reset_font_size(&mut self, cx: &mut Context<Self>) {
         let delta = Settings::default().terminal_font_size - self.settings.terminal_font_size;
         self.change_font_size(delta, cx);
     }
 
     /// Changes the terminal font size and persists it.
-    pub fn change_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
+    pub(crate) fn change_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
         let size = (self.settings.terminal_font_size + delta).clamp(8., 32.);
         if size == self.settings.terminal_font_size {
             return;
         }
         self.settings.terminal_font_size = size;
-        if let Err(error) = self.engine.save_settings(self.settings.clone()) {
-            self.push_notice(
-                NoticeLevel::Error,
-                format!("Could not save settings: {error:#}"),
-                cx,
-            );
-        }
+        self.persist_settings(cx);
         cx.notify();
     }
 
     // ---- core events ----
 
-    pub fn apply(&mut self, event: Event, cx: &mut Context<Self>) {
+    pub(crate) fn apply(&mut self, event: Event, cx: &mut Context<Self>) {
         // Terminal and file results do not touch our own state: skip the global re-render.
-        let touches_state = !matches!(
-            event,
-            Event::TerminalChanged(_)
+        let touches_state = 'touches: {
+            match &event {
+                Event::HostsChanged => self.hosts = self.engine.hosts(),
+                Event::Session { id, host, state } => self.apply_session(*id, host, state, cx),
+                Event::Forward {
+                    session,
+                    spec,
+                    state,
+                    active_conns,
+                } => {
+                    let key = (*session, spec.clone());
+                    if self.forgotten.contains(&key) {
+                        if matches!(state, ForwardState::Stopped) {
+                            self.forgotten.remove(&key);
+                        }
+                    } else if let Some(info) = self.sessions.get_mut(session) {
+                        match info.forwards.iter_mut().find(|f| &f.spec == spec) {
+                            Some(f) => {
+                                f.state = state.clone();
+                                f.active_conns = *active_conns;
+                            }
+                            None => info.forwards.push(ForwardInfo {
+                                spec: spec.clone(),
+                                state: state.clone(),
+                                active_conns: *active_conns,
+                            }),
+                        }
+                    }
+                }
+                Event::Transfer(info) => {
+                    match self.transfers.iter_mut().find(|t| t.id == info.id) {
+                        Some(t) => *t = info.clone(),
+                        None => self.transfers.push(info.clone()),
+                    }
+                }
+                Event::PassphraseSaved { key, saved } => {
+                    let key = key.display().to_string();
+                    if *saved {
+                        self.settings.saved_passphrases.insert(key);
+                    } else {
+                        self.settings.saved_passphrases.remove(&key);
+                    }
+                    self.persist_settings(cx);
+                }
+                Event::PasswordSaved { target, saved } => {
+                    if *saved {
+                        self.settings.saved_passwords.insert(target.clone());
+                    } else {
+                        self.settings.saved_passwords.remove(target);
+                    }
+                    self.persist_settings(cx);
+                }
+                Event::Notice { level, message } => self.push_notice(*level, message.clone(), cx),
+                Event::LoginShell { session, shell } => {
+                    if let Some(info) = self.sessions.get_mut(session) {
+                        info.login_shell = Some(shell.clone());
+                    }
+                }
+                Event::TmuxFound { host } => {
+                    self.tmux_hosts.insert(host.clone(), true);
+                }
+                // The option goes back off: it never worked, and the server would say so at every
+                // connection. Installing tmux, the user can ask for it again.
+                Event::TmuxMissing { host } => {
+                    self.tmux_hosts.insert(host.clone(), false);
+                    if self.settings.plain_terminal_hosts.insert(host.0.clone()) {
+                        self.persist_settings(cx);
+                        let alias = self.alias(host);
+                        self.push_notice(
+                            NoticeLevel::Important,
+                            format!(
+                                "Terminals on {alias} end when shcp closes: the server needs tmux \
+                             3.2 or newer. Install it, then turn on Keep terminals via tmux in the \
+                             settings of the host"
+                            ),
+                            cx,
+                        );
+                    }
+                }
+                Event::TerminalCopy { text } => {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+                    break 'touches false;
+                }
+                Event::TerminalChanged(_)
                 | Event::TerminalTitle { .. }
-                | Event::TerminalCopy { .. }
                 | Event::TerminalExited { .. }
                 | Event::TerminalClosed { .. }
                 | Event::SharedServer { .. }
@@ -922,105 +1014,10 @@ impl AppState {
                 | Event::SearchDone { .. }
                 | Event::EditConflict { .. }
                 | Event::PastedFile { .. }
-                | Event::PasswordLogin { .. }
-        );
-        match &event {
-            Event::HostsChanged => self.hosts = self.engine.hosts(),
-            Event::Session { id, host, state } => self.apply_session(*id, host, state, cx),
-            Event::Forward {
-                session,
-                spec,
-                state,
-                active_conns,
-            } => {
-                let key = (*session, spec.clone());
-                if self.forgotten.contains(&key) {
-                    if matches!(state, ForwardState::Stopped) {
-                        self.forgotten.remove(&key);
-                    }
-                } else if let Some(info) = self.sessions.get_mut(session) {
-                    match info.forwards.iter_mut().find(|f| &f.spec == spec) {
-                        Some(f) => {
-                            f.state = state.clone();
-                            f.active_conns = *active_conns;
-                        }
-                        None => info.forwards.push(ForwardInfo {
-                            spec: spec.clone(),
-                            state: state.clone(),
-                            active_conns: *active_conns,
-                        }),
-                    }
-                }
+                | Event::PasswordLogin { .. } => break 'touches false,
             }
-            Event::Transfer(info) => match self.transfers.iter_mut().find(|t| t.id == info.id) {
-                Some(t) => *t = info.clone(),
-                None => self.transfers.push(info.clone()),
-            },
-            Event::PassphraseSaved { key, saved } => {
-                let key = key.display().to_string();
-                if *saved {
-                    self.settings.saved_passphrases.insert(key);
-                } else {
-                    self.settings.saved_passphrases.remove(&key);
-                }
-                self.persist_settings(cx);
-            }
-            Event::PasswordSaved { target, saved } => {
-                if *saved {
-                    self.settings.saved_passwords.insert(target.clone());
-                } else {
-                    self.settings.saved_passwords.remove(target);
-                }
-                self.persist_settings(cx);
-            }
-            Event::Notice { level, message } => self.push_notice(*level, message.clone(), cx),
-            // The option goes back off: it never worked, and the server would say so at every
-            // connection. Installing tmux, the user can ask for it again.
-            Event::LoginShell { session, shell } => {
-                if let Some(info) = self.sessions.get_mut(session) {
-                    info.login_shell = Some(shell.clone());
-                }
-            }
-            Event::TmuxFound { host } => {
-                self.tmux_hosts.insert(host.clone(), true);
-            }
-            Event::TmuxMissing { host } => {
-                self.tmux_hosts.insert(host.clone(), false);
-                if self.settings.plain_terminal_hosts.insert(host.0.clone()) {
-                    self.persist_settings(cx);
-                    let alias = self.host(host).map_or(host.0.clone(), |h| h.alias.clone());
-                    self.push_notice(
-                        NoticeLevel::Important,
-                        format!(
-                            "Terminals on {alias} end when shcp closes: the server needs tmux \
-                             3.2 or newer. Install it, then turn on Keep terminals via tmux in the \
-                             settings of the host"
-                        ),
-                        cx,
-                    );
-                }
-            }
-            Event::TerminalCopy { text } => {
-                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
-            }
-            Event::TerminalChanged(_)
-            | Event::TerminalTitle { .. }
-            | Event::TerminalExited { .. }
-            | Event::TerminalClosed { .. }
-            | Event::SharedServer { .. }
-            | Event::SharedTabsChanged { .. }
-            | Event::RemotePath { .. }
-            | Event::RemoteKind { .. }
-            | Event::DirListing { .. }
-            | Event::OpDone { .. }
-            | Event::RemoteSpace { .. }
-            | Event::RemoteHead { .. }
-            | Event::SearchFound { .. }
-            | Event::SearchDone { .. }
-            | Event::EditConflict { .. }
-            | Event::PastedFile { .. }
-            | Event::PasswordLogin { .. } => {}
-        }
+            true
+        };
         cx.emit(event);
         if touches_state {
             cx.notify();
@@ -1134,7 +1131,7 @@ impl AppState {
         if id >= *current {
             *current = id;
         }
-        let alias = self.host(host).map_or(host.0.clone(), |h| h.alias.clone());
+        let alias = self.alias(host);
         match state {
             // The panel says it is trying again: no notice for each attempt.
             SessionState::Failed { .. } if self.reconnecting.contains_key(host) => {}
@@ -1165,16 +1162,14 @@ mod order_tests {
     use super::*;
 
     fn names(list: &[&str]) -> Vec<String> {
-        list.iter().map(|name| name.to_string()).collect()
+        list.iter().map(ToString::to_string).collect()
     }
 
     #[test]
     fn a_move_lands_on_the_chosen_side_of_the_target_in_both_directions() {
         let list = names(&["a", "b", "c", "d"]);
-        let before =
-            |item: &str, target: &str| moved(&list, &item.to_string(), &target.to_string(), false);
-        let after =
-            |item: &str, target: &str| moved(&list, &item.to_string(), &target.to_string(), true);
+        let before = |item: &str, target: &str| moved(&list, item, target, false);
+        let after = |item: &str, target: &str| moved(&list, item, target, true);
         assert_eq!(before("a", "c"), names(&["b", "a", "c", "d"]));
         assert_eq!(after("a", "c"), names(&["b", "c", "a", "d"]));
         assert_eq!(before("d", "b"), names(&["a", "d", "b", "c"]));

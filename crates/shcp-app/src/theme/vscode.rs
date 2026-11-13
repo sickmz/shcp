@@ -1,7 +1,8 @@
 //! Builds a `Theme` from a VS Code color theme file (JSON with comments and trailing commas).
-use super::Theme;
+use super::builtin::{DARK_LIT, LIGHT_LIT};
+use super::{Theme, rgb_hex, to_rgb};
 use anyhow::{Context, Result};
-use gpui::{Hsla, Rgba, SharedString, hsla, rgba};
+use gpui::{Hsla, Rgba, SharedString, hsla, rgb, rgba};
 use serde_json::{Map, Value};
 use shcp_core::term::{Palette, Rgb};
 
@@ -76,14 +77,13 @@ fn parse_hex(value: &str) -> Option<u32> {
     }
 }
 
-struct Colors<'a>(Option<&'a Map<String, Value>>);
+struct Colors<'a>(&'a Map<String, Value>);
 
 impl Colors<'_> {
     /// First key holding a valid color.
     fn raw(&self, keys: &[&str]) -> Option<u32> {
-        let map = self.0?;
         keys.iter()
-            .find_map(|key| map.get(*key)?.as_str().and_then(parse_hex))
+            .find_map(|key| self.0.get(*key)?.as_str().and_then(parse_hex))
     }
     fn get(&self, keys: &[&str]) -> Option<Hsla> {
         self.raw(keys).map(|value| rgba(value).into())
@@ -110,12 +110,6 @@ fn alpha(color: Hsla, a: f32) -> Hsla {
     Hsla { a, ..color }
 }
 
-fn to_rgb(color: Hsla) -> Rgb {
-    let Rgba { r, g, b, .. } = color.to_rgb();
-    let byte = |v: f32| (v.clamp(0., 1.) * 255.).round() as u8;
-    Rgb(byte(r), byte(g), byte(b))
-}
-
 /// `amount` of `a` over the rest of `b`, opaque.
 pub(super) fn mix(a: Hsla, b: Hsla, amount: f32) -> Hsla {
     let (a, b) = (a.to_rgb(), b.to_rgb());
@@ -132,10 +126,6 @@ pub(super) fn mix(a: Hsla, b: Hsla, amount: f32) -> Hsla {
 /// Black or white, whichever reads better on `color`.
 fn contrast(color: Hsla) -> Hsla {
     hsla(0., 0., if color.l > 0.6 { 0.07 } else { 1. }, 1.)
-}
-
-fn hex(value: u32) -> Hsla {
-    rgba(value << 8 | 0xff).into()
 }
 
 const ANSI_DARK: [u32; 16] = [
@@ -165,20 +155,20 @@ const ANSI_KEYS: [&str; 16] = [
     "terminal.ansiBrightWhite",
 ];
 
-fn build(name: SharedString, kind: Option<&str>, colors: Colors) -> Theme {
+fn build(name: SharedString, kind: Option<&str>, colors: &Colors) -> Theme {
     let bg = opaque(
         colors
             .solid(&["editor.background"])
-            .unwrap_or(hex(0x1e1e1e)),
+            .unwrap_or(rgb(0x1e1e1e).into()),
     );
     let is_light = kind.map_or(bg.l > 0.5, |k| k.to_lowercase().contains("light"));
     let text = opaque(
         colors
             .solid(&["editor.foreground", "foreground"])
             .unwrap_or(if is_light {
-                hex(0x333333)
+                rgb(0x333333).into()
             } else {
-                hex(0xd4d4d4)
+                rgb(0xd4d4d4).into()
             }),
     );
     let surface = opaque(
@@ -203,12 +193,12 @@ fn build(name: SharedString, kind: Option<&str>, colors: Colors) -> Theme {
     let accent = opaque(
         colors
             .solid(&["focusBorder", "textLink.foreground", "button.background"])
-            .unwrap_or(hex(if is_light { 0x0969da } else { 0x4493f8 })),
+            .unwrap_or(rgb(if is_light { 0x0969da } else { 0x4493f8 }).into()),
     );
     let primary = opaque(colors.solid(&["button.background"]).unwrap_or(accent));
     let defaults = if is_light { &ANSI_LIGHT } else { &ANSI_DARK };
     let ansi: [Rgb; 16] = std::array::from_fn(|i| colors.ansi(&[ANSI_KEYS[i]], defaults[i]));
-    let color = |rgb: Rgb| hex((rgb.0 as u32) << 16 | (rgb.1 as u32) << 8 | rgb.2 as u32);
+    let color = |color: Rgb| -> Hsla { rgb(rgb_hex(color)).into() };
     let terminal_bg = opaque(colors.solid(&["terminal.background"]).unwrap_or(bg));
     let terminal_fg = opaque(colors.solid(&["terminal.foreground"]).unwrap_or(text));
     let terminal_cursor = opaque(
@@ -264,8 +254,8 @@ fn build(name: SharedString, kind: Option<&str>, colors: Colors) -> Theme {
             .get(&["terminal.selectionBackground", "editor.selectionBackground"])
             .unwrap_or(alpha(accent, 0.35)),
         terminal_cursor,
-        lit_l: if is_light { 0.5 } else { 0.8 },
-        lit_c: if is_light { 0.15 } else { 0.135 },
+        lit_l: if is_light { LIGHT_LIT.0 } else { DARK_LIT.0 },
+        lit_c: if is_light { LIGHT_LIT.1 } else { DARK_LIT.1 },
         palette: Palette {
             ansi,
             fg: to_rgb(terminal_fg),
@@ -276,7 +266,7 @@ fn build(name: SharedString, kind: Option<&str>, colors: Colors) -> Theme {
 }
 
 /// Parses a theme file; `default_name` is used when it has no `name`.
-pub fn parse(text: &str, default_name: &str) -> Result<Theme> {
+pub(super) fn parse(text: &str, default_name: &str) -> Result<Theme> {
     let value: Value = serde_json::from_str(&strip_jsonc(text)).context("Invalid JSON")?;
     let colors = value
         .get("colors")
@@ -288,7 +278,7 @@ pub fn parse(text: &str, default_name: &str) -> Result<Theme> {
         .unwrap_or(default_name)
         .to_string();
     let kind = value.get("type").and_then(Value::as_str);
-    let mut theme = build(name.into(), kind, Colors(Some(colors)));
+    let mut theme = build(name.into(), kind, &Colors(colors));
     theme.origin = value.get(super::open_vsx::ORIGIN_KEY).and_then(|origin| {
         let text = |key: &str| origin.get(key)?.as_str().map(str::to_string);
         Some(super::ThemeOrigin {
@@ -297,9 +287,4 @@ pub fn parse(text: &str, default_name: &str) -> Result<Theme> {
         })
     });
     Ok(theme)
-}
-
-/// Used only if no theme at all could be loaded.
-pub fn fallback() -> Theme {
-    build("Default".into(), Some("dark"), Colors(None))
 }

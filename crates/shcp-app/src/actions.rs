@@ -43,7 +43,7 @@ const NOT_IN_TERMINAL: &str = "Workspace && !Modal && !Terminal";
 const TERMINAL: &str = "Terminal";
 
 /// An action the user can give other keys.
-pub struct Shortcut {
+pub(crate) struct Shortcut {
     /// The name saved in the settings: keep it stable.
     pub id: &'static str,
     pub label: &'static str,
@@ -63,7 +63,7 @@ macro_rules! shortcut {
     };
 }
 
-pub const SHORTCUTS: &[Shortcut] = &[
+pub(crate) const SHORTCUTS: &[Shortcut] = &[
     shortcut!(
         "palette",
         "Command palette",
@@ -232,7 +232,7 @@ impl Shortcut {
     }
 
     /// What the settings show: the keys in force, as people write them.
-    pub fn label_of_keys(&self, settings: &Settings) -> String {
+    pub(crate) fn label_of_keys(&self, settings: &Settings) -> String {
         self.keys(settings)
             .iter()
             .map(|(keys, _)| pretty(keys))
@@ -242,7 +242,7 @@ impl Shortcut {
 }
 
 /// `ctrl-shift-t` as `Ctrl+Shift+T`.
-pub fn pretty(keys: &str) -> String {
+pub(crate) fn pretty(keys: &str) -> String {
     let Ok(stroke) = Keystroke::parse(keys) else {
         return keys.to_string();
     };
@@ -272,7 +272,7 @@ pub fn pretty(keys: &str) -> String {
 }
 
 /// Whether keys can be a shortcut without getting in the way of typing.
-pub fn acceptable(keys: &str) -> bool {
+pub(crate) fn acceptable(keys: &str) -> bool {
     Keystroke::parse(keys).is_ok_and(|stroke| {
         let m = stroke.modifiers;
         m.control
@@ -283,7 +283,7 @@ pub fn acceptable(keys: &str) -> bool {
 }
 
 /// The action already on these keys, other than `id`.
-pub fn taken_by(keys: &str, id: &str, settings: &Settings) -> Option<&'static str> {
+pub(crate) fn taken_by(keys: &str, id: &str, settings: &Settings) -> Option<&'static str> {
     SHORTCUTS
         .iter()
         .filter(|shortcut| shortcut.id != id)
@@ -292,8 +292,7 @@ pub fn taken_by(keys: &str, id: &str, settings: &Settings) -> Option<&'static st
 }
 
 /// Keys named in tooltips and menus, with what they became: `Ctrl+Shift+T` to `Ctrl+Y`.
-#[derive(Clone, Default)]
-pub struct KeyHints(BTreeMap<String, String>);
+struct KeyHints(BTreeMap<String, String>);
 
 impl Global for KeyHints {}
 
@@ -317,7 +316,7 @@ impl KeyHints {
     }
 
     /// The text with the keys in force. Longest names first: `Ctrl+Shift+T` before `Ctrl+T`.
-    pub fn apply(&self, text: &str) -> String {
+    pub(crate) fn apply(&self, text: &str) -> String {
         if self.0.is_empty() {
             return text.to_string();
         }
@@ -343,7 +342,7 @@ impl KeyHints {
 }
 
 /// `text` with the keys in force, wherever it names a key.
-pub fn with_current_keys(text: &str, cx: &App) -> String {
+pub(crate) fn with_current_keys(text: &str, cx: &App) -> String {
     match cx.try_global::<KeyHints>() {
         Some(hints) => hints.apply(text),
         None => text.to_string(),
@@ -352,7 +351,7 @@ pub fn with_current_keys(text: &str, cx: &App) -> String {
 
 /// Puts the keymap in place, replacing the one there. A key that makes no sense, say from an edited
 /// file, is left out: it could not be bound anyway.
-pub fn bind_keys(settings: &Settings, cx: &mut App) {
+pub(crate) fn bind_keys(settings: &Settings, cx: &mut App) {
     cx.clear_key_bindings();
     for shortcut in SHORTCUTS {
         for (keys, context) in shortcut.keys(settings) {

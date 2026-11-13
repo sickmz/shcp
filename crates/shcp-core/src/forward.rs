@@ -37,7 +37,7 @@ pub(crate) async fn listen(
             return;
         }
     };
-    let active = Arc::new(Mutex::new(0u32));
+    let active = Arc::new(Active::default());
     let mut connections = tokio::task::JoinSet::new();
     emit(&ctx, &spec, ForwardState::Listening, 0);
     loop {
@@ -84,7 +84,7 @@ pub(crate) async fn listen(
                                     Some(request) => {
                                         let _ = socks::reply(&mut socket, request.version, false).await;
                                     }
-                                    None => emit(&ctx, &spec, ForwardState::ServerDown, *active.lock()),
+                                    None => emit(&ctx, &spec, ForwardState::ServerDown, active.count()),
                                 }
                                 return;
                             }
@@ -94,13 +94,13 @@ pub(crate) async fn listen(
                         {
                             return;
                         }
-                        { let mut count = active.lock(); *count += 1; emit(&ctx, &spec, ForwardState::Listening, *count); }
+                        active.opened(&ctx, &spec);
                         let mut stream = channel.into_stream();
                         tokio::select! { _ = cancel.cancelled() => {}, result = tokio::io::copy_bidirectional(&mut socket, &mut stream) => { if let Err(error) = result { tracing::debug!(%error, "Forward connection closed"); } } }
-                        { let mut count = active.lock(); *count -= 1; if !cancel.is_cancelled() { emit(&ctx, &spec, ForwardState::Listening, *count); } }
+                        active.closed(&ctx, &spec, !cancel.is_cancelled());
                     });
                 }
-                Err(error) => { emit(&ctx, &spec, ForwardState::Failed(error.to_string()), *active.lock()); break; }
+                Err(error) => { emit(&ctx, &spec, ForwardState::Failed(error.to_string()), active.count()); break; }
             },
             Some(_) = connections.join_next(), if !connections.is_empty() => {},
         }
@@ -110,10 +110,37 @@ pub(crate) async fn listen(
     while connections.join_next().await.is_some() {}
     emit(&ctx, &spec, ForwardState::Stopped, 0);
 }
+
+/// Open connections of one forward. Each change is reported under the lock, so the counts
+/// arrive in order.
+#[derive(Default)]
+struct Active(Mutex<u32>);
+
+impl Active {
+    fn count(&self) -> u32 {
+        *self.0.lock()
+    }
+
+    fn opened(&self, ctx: &Context, spec: &ForwardSpec) {
+        let mut count = self.0.lock();
+        *count += 1;
+        emit(ctx, spec, ForwardState::Listening, *count);
+    }
+
+    /// `report` is false while the forward closes: its `Stopped` comes next.
+    fn closed(&self, ctx: &Context, spec: &ForwardSpec, report: bool) {
+        let mut count = self.0.lock();
+        *count -= 1;
+        if report {
+            emit(ctx, spec, ForwardState::Listening, *count);
+        }
+    }
+}
+
 /// A port of the server listening for this PC.
 pub(crate) struct RemoteForward {
     spec: ForwardSpec,
-    active: Mutex<u32>,
+    active: Active,
     cancel: CancellationToken,
 }
 
@@ -128,7 +155,7 @@ async fn listen_remote(
     let port = spec.bind_port as u32;
     let forward = Arc::new(RemoteForward {
         spec: spec.clone(),
-        active: Mutex::new(0),
+        active: Active::default(),
         cancel: cancel.child_token(),
     });
     // Closing or failing the listener also closes every connection it accepted.
@@ -181,16 +208,11 @@ pub(crate) async fn accept_remote(
     };
     let Ok(Ok(mut socket)) = socket else {
         tracing::debug!(port = spec.remote_port, "Nothing answers on this PC");
-        emit(&ctx, spec, ForwardState::ServerDown, *forward.active.lock());
+        emit(&ctx, spec, ForwardState::ServerDown, forward.active.count());
         return;
     };
     reply.accept().await;
-    let active = {
-        let mut active = forward.active.lock();
-        *active += 1;
-        *active
-    };
-    emit(&ctx, spec, ForwardState::Listening, active);
+    forward.active.opened(&ctx, spec);
     tokio::spawn(async move {
         let mut stream = channel.into_stream();
         tokio::select! { biased;
@@ -202,14 +224,8 @@ pub(crate) async fn accept_remote(
                 }
             }
         }
-        let active = {
-            let mut active = forward.active.lock();
-            *active -= 1;
-            *active
-        };
-        if !ctx.cancel.is_cancelled() && !forward.cancel.is_cancelled() {
-            emit(&ctx, &forward.spec, ForwardState::Listening, active);
-        }
+        let report = !ctx.cancel.is_cancelled() && !forward.cancel.is_cancelled();
+        forward.active.closed(&ctx, &forward.spec, report);
     });
 }
 
@@ -223,16 +239,15 @@ fn emit(ctx: &Context, spec: &ForwardSpec, state: ForwardState, active_conns: u3
 }
 
 fn is_in_use(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::AddrInUse || error.raw_os_error() == Some(10048)
+    // std maps WSAEADDRINUSE to this kind.
+    error.kind() == std::io::ErrorKind::AddrInUse
 }
 
 /// Name of the program listening on a local port, from the tools every Windows has.
-#[cfg(windows)]
 async fn port_owner(port: u16) -> Option<String> {
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let listeners = tokio::process::Command::new("netstat")
         .args(["-ano", "-p", "TCP"])
-        .creation_flags(CREATE_NO_WINDOW)
+        .creation_flags(crate::CREATE_NO_WINDOW)
         .output()
         .await
         .ok()?;
@@ -251,7 +266,7 @@ async fn port_owner(port: u16) -> Option<String> {
     let filter = format!("PID eq {pid}");
     let process = tokio::process::Command::new("tasklist")
         .args(["/FI", filter.as_str(), "/FO", "CSV", "/NH"])
-        .creation_flags(CREATE_NO_WINDOW)
+        .creation_flags(crate::CREATE_NO_WINDOW)
         .output()
         .await
         .ok()?;
@@ -262,16 +277,12 @@ async fn port_owner(port: u16) -> Option<String> {
         .map(str::to_string)
 }
 
-#[cfg(not(windows))]
-async fn port_owner(_port: u16) -> Option<String> {
-    None
-}
-
 /// Readable reason for a failed local bind, with the usual Windows causes spelled out.
 fn bind_error(spec: &ForwardSpec, error: &std::io::Error) -> String {
     let address = format!("{}:{}", spec.bind_addr, spec.bind_port);
-    match (error.kind(), error.raw_os_error()) {
-        (std::io::ErrorKind::PermissionDenied, _) | (_, Some(10013)) => format!(
+    // std maps WSAEACCES to `PermissionDenied`.
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied => format!(
             "Windows blocks port {address} (reserved by Hyper-V/WSL or needs permissions; see `netsh int ipv4 show excludedportrange protocol=tcp`)"
         ),
         _ => format!("Could not listen on {address}: {error}"),

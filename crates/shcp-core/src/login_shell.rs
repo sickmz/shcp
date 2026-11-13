@@ -2,9 +2,8 @@
 //! on a channel of its own: the terminals never see it. This is the login shell, not whatever the
 //! user starts in a terminal later.
 use crate::{
-    Event,
+    Event, files,
     session::{Context, Ssh},
-    tmux,
 };
 use std::{sync::Arc, time::Duration};
 use tokio::time::timeout;
@@ -27,7 +26,7 @@ fn command() -> String {
 pub(crate) async fn learn(ctx: Arc<Context>, ssh: Arc<Ssh>) {
     let output = tokio::select! { biased;
         _ = ctx.cancel.cancelled() => return,
-        output = timeout(ASK_TIMEOUT, tmux::read_all(&ssh, command())) => output,
+        output = timeout(ASK_TIMEOUT, files::read_all(&ssh, command())) => output,
     };
     let Some(shell) = output.ok().and_then(|output| parse(&output)) else {
         tracing::debug!(session = ctx.id.0, "Login shell not known");

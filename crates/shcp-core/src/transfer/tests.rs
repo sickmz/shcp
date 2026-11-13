@@ -1,15 +1,12 @@
 //! Runs transfers against an in-memory SFTP server that behaves like OpenSSH where it matters:
 //! a rename does not replace an existing file.
 use super::*;
-use crate::{HostId, SessionId, TransferId};
+use crate::{HostId, SessionId, TransferId, test_support::Scratch};
 use parking_lot::Mutex;
 use russh_sftp::protocol::{
     Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version,
 };
-use std::{
-    collections::HashMap,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::collections::HashMap;
 
 #[derive(Default)]
 struct Disk {
@@ -255,30 +252,6 @@ async fn settle() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 }
 
-struct Dir(PathBuf);
-impl Dir {
-    fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "shcp-transfer-test-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-    fn file(&self, name: &str, data: &[u8]) -> PathBuf {
-        let path = self.0.join(name);
-        std::fs::write(&path, data).unwrap();
-        path
-    }
-}
-impl Drop for Dir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 fn progress(direction: Direction, retry: bool, session: CancellationToken) -> Progress {
     let (events, receiver) = async_channel::unbounded();
     // Nobody listens: sending must keep working.
@@ -356,7 +329,7 @@ fn folder_with_links(server: &Server) {
 
 #[tokio::test]
 async fn download_of_a_folder_copes_with_links() {
-    let (server, dir) = (Server::default(), Dir::new());
+    let (server, dir) = (Server::default(), Scratch::new("transfer-test"));
     folder_with_links(&server);
     fetch(&server, &dir.0, false).await.unwrap();
     let local = dir.0.join("f");
@@ -368,7 +341,7 @@ async fn download_of_a_folder_copes_with_links() {
 
 #[tokio::test]
 async fn download_says_which_links_stayed_behind() {
-    let (server, dir) = (Server::default(), Dir::new());
+    let (server, dir) = (Server::default(), Scratch::new("transfer-test"));
     folder_with_links(&server);
     let sftp = connect(&server).await;
     let session = CancellationToken::new();
@@ -388,7 +361,7 @@ async fn download_says_which_links_stayed_behind() {
 
 #[tokio::test]
 async fn download_of_a_picked_link_to_a_folder_follows_it() {
-    let (server, dir) = (Server::default(), Dir::new());
+    let (server, dir) = (Server::default(), Scratch::new("transfer-test"));
     {
         let mut disk = server.0.lock();
         disk.files.insert("/real/inside".into(), b"inside".to_vec());
@@ -410,7 +383,7 @@ async fn download_of_a_picked_link_to_a_folder_follows_it() {
 
 #[tokio::test]
 async fn upload_creates_the_file_and_leaves_nothing_else() {
-    let (server, dir) = (Server::default(), Dir::new());
+    let (server, dir) = (Server::default(), Scratch::new("transfer-test"));
     let data = content(1);
     send(&server, &dir.file("f", &data), false).await.unwrap();
     assert!(remote(&server, "/srv/f") == Some(data));
@@ -419,7 +392,7 @@ async fn upload_creates_the_file_and_leaves_nothing_else() {
 
 #[tokio::test]
 async fn upload_replaces_a_file_and_keeps_its_permissions() {
-    let (server, dir) = (Server::default(), Dir::new());
+    let (server, dir) = (Server::default(), Scratch::new("transfer-test"));
     put(&server, "/srv/f", b"old");
     server.0.lock().modes.insert("/srv/f".into(), 0o750);
     let data = content(1);
@@ -431,7 +404,7 @@ async fn upload_replaces_a_file_and_keeps_its_permissions() {
 
 #[tokio::test]
 async fn a_failed_upload_keeps_the_old_file_and_the_next_one_continues() {
-    let (server, dir) = (Server::default(), Dir::new());
+    let (server, dir) = (Server::default(), Scratch::new("transfer-test"));
     put(&server, "/srv/f", b"old");
     let data = content(1);
     let local = dir.file("f", &data);
@@ -457,7 +430,7 @@ async fn a_failed_upload_keeps_the_old_file_and_the_next_one_continues() {
 
 #[tokio::test]
 async fn holes_at_the_end_of_a_partial_upload_do_not_reach_the_file() {
-    let (server, dir) = (Server::default(), Dir::new());
+    let (server, dir) = (Server::default(), Scratch::new("transfer-test"));
     let data = content(1);
     let mut part = data[..2_500_000].to_vec();
     // A write the server refused, with later ones taken.
@@ -470,7 +443,7 @@ async fn holes_at_the_end_of_a_partial_upload_do_not_reach_the_file() {
 
 #[tokio::test]
 async fn a_partial_upload_of_another_file_is_not_continued() {
-    let (server, dir) = (Server::default(), Dir::new());
+    let (server, dir) = (Server::default(), Scratch::new("transfer-test"));
     let data = content(1);
     put(&server, "/srv/f.shcp-part", &content(2)[..2_500_000]);
     let p = send(&server, &dir.file("f", &data), false).await.unwrap();
@@ -480,9 +453,9 @@ async fn a_partial_upload_of_another_file_is_not_continued() {
 
 #[tokio::test]
 async fn cancelling_an_upload_removes_the_partial_and_keeps_the_old_file() {
-    let (server, dir) = (Server::default(), Dir::new());
+    let (server, dir) = (Server::default(), Scratch::new("transfer-test"));
     put(&server, "/srv/f", b"old");
-    let local = dir.file("f", &content(1));
+    let local = dir.file("f", content(1));
     let sftp = connect(&server).await;
     let session = CancellationToken::new();
     let cancel = session.child_token();
@@ -505,9 +478,9 @@ async fn cancelling_an_upload_removes_the_partial_and_keeps_the_old_file() {
 
 #[tokio::test]
 async fn a_lost_connection_keeps_the_partial_upload() {
-    let (server, dir) = (Server::default(), Dir::new());
+    let (server, dir) = (Server::default(), Scratch::new("transfer-test"));
     put(&server, "/srv/f", b"old");
-    let local = dir.file("f", &content(1));
+    let local = dir.file("f", content(1));
     let sftp = connect(&server).await;
     let session = CancellationToken::new();
     let cancel = session.child_token();
@@ -531,7 +504,7 @@ async fn a_lost_connection_keeps_the_partial_upload() {
 
 #[tokio::test]
 async fn a_retried_upload_skips_what_already_matches_but_not_what_differs() {
-    let (server, dir) = (Server::default(), Dir::new());
+    let (server, dir) = (Server::default(), Scratch::new("transfer-test"));
     let data = content(1);
     let local = dir.file("f", &data);
     put(&server, "/srv/f", &data);
@@ -547,7 +520,7 @@ async fn a_retried_upload_skips_what_already_matches_but_not_what_differs() {
 
 #[tokio::test]
 async fn a_new_upload_never_skips_a_file_of_the_same_size() {
-    let (server, dir) = (Server::default(), Dir::new());
+    let (server, dir) = (Server::default(), Scratch::new("transfer-test"));
     let data = content(1);
     put(&server, "/srv/f", &data);
     send(&server, &dir.file("f", &data), false).await.unwrap();
@@ -556,7 +529,7 @@ async fn a_new_upload_never_skips_a_file_of_the_same_size() {
 
 #[tokio::test]
 async fn download_creates_the_file_and_leaves_nothing_else() {
-    let (server, dir) = (Server::default(), Dir::new());
+    let (server, dir) = (Server::default(), Scratch::new("transfer-test"));
     let data = content(1);
     put(&server, "/srv/f", &data);
     fetch(&server, &dir.0, false).await.unwrap();
@@ -566,7 +539,7 @@ async fn download_creates_the_file_and_leaves_nothing_else() {
 
 #[tokio::test]
 async fn download_replaces_a_local_file() {
-    let (server, dir) = (Server::default(), Dir::new());
+    let (server, dir) = (Server::default(), Scratch::new("transfer-test"));
     let data = content(1);
     put(&server, "/srv/f", &data);
     dir.file("f", b"old");
@@ -576,7 +549,7 @@ async fn download_replaces_a_local_file() {
 
 #[tokio::test]
 async fn a_failed_download_keeps_the_old_file_and_the_next_one_continues() {
-    let (server, dir) = (Server::default(), Dir::new());
+    let (server, dir) = (Server::default(), Scratch::new("transfer-test"));
     let data = content(1);
     put(&server, "/srv/f", &data);
     dir.file("f", b"old");
@@ -596,7 +569,7 @@ async fn a_failed_download_keeps_the_old_file_and_the_next_one_continues() {
 
 #[tokio::test]
 async fn a_partial_download_of_another_file_is_not_continued() {
-    let (server, dir) = (Server::default(), Dir::new());
+    let (server, dir) = (Server::default(), Scratch::new("transfer-test"));
     let data = content(1);
     put(&server, "/srv/f", &data);
     dir.file("f.shcp-part", &content(2)[..300_000]);
@@ -607,7 +580,7 @@ async fn a_partial_download_of_another_file_is_not_continued() {
 
 #[tokio::test]
 async fn cancelling_a_download_removes_the_partial_and_keeps_the_old_file() {
-    let (server, dir) = (Server::default(), Dir::new());
+    let (server, dir) = (Server::default(), Scratch::new("transfer-test"));
     put(&server, "/srv/f", &content(1));
     dir.file("f", b"old");
     let sftp = connect(&server).await;
@@ -632,7 +605,7 @@ async fn cancelling_a_download_removes_the_partial_and_keeps_the_old_file() {
 
 #[tokio::test]
 async fn a_retried_download_skips_a_matching_file() {
-    let (server, dir) = (Server::default(), Dir::new());
+    let (server, dir) = (Server::default(), Scratch::new("transfer-test"));
     let data = content(1);
     put(&server, "/srv/f", &data);
     dir.file("f", &data);

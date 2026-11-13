@@ -2,12 +2,12 @@
 //! one it recognizes; screenshot tools may offer just a Windows bitmap, which it does not read.
 use gpui::{App, ClipboardEntry, ImageFormat};
 
-pub enum Clip {
+pub(crate) enum Clip {
     Text(String),
     Image { name: &'static str, data: Vec<u8> },
 }
 
-pub fn read(cx: &App) -> Option<Clip> {
+pub(crate) fn read(cx: &App) -> Option<Clip> {
     let Some(item) = cx.read_from_clipboard() else {
         return read_bitmap();
     };
@@ -115,7 +115,6 @@ fn dib_to_png(dib: &[u8]) -> Option<Vec<u8>> {
     Some(png)
 }
 
-#[cfg(windows)]
 mod platform {
     use std::ffi::c_void;
 
@@ -160,11 +159,11 @@ mod platform {
         }
     }
 
-    pub fn bitmap() -> Option<Vec<u8>> {
+    pub(super) fn bitmap() -> Option<Vec<u8>> {
         read(CF_DIB)
     }
 
-    pub fn text() -> Option<String> {
+    pub(super) fn text() -> Option<String> {
         let bytes = read(CF_UNICODETEXT)?;
         let wide: Vec<u16> = bytes
             .as_chunks::<2>()
@@ -174,16 +173,5 @@ mod platform {
             .take_while(|unit| *unit != 0)
             .collect();
         Some(String::from_utf16_lossy(&wide))
-    }
-}
-
-#[cfg(not(windows))]
-mod platform {
-    pub fn bitmap() -> Option<Vec<u8>> {
-        None
-    }
-
-    pub fn text() -> Option<String> {
-        None
     }
 }

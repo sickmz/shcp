@@ -4,19 +4,19 @@ use gpui::{App, Path, PathBuilder, Pixels, Point, Window, canvas, div, point, px
 
 /// Thin horizontal progress bar. `fraction` is clamped to 0..=1.
 #[derive(IntoElement)]
-pub struct ProgressBar {
+pub(crate) struct ProgressBar {
     fraction: f32,
     failed: bool,
 }
 
 impl ProgressBar {
-    pub fn new(fraction: f32) -> Self {
+    pub(crate) fn new(fraction: f32) -> Self {
         Self {
             fraction: fraction.clamp(0., 1.),
             failed: false,
         }
     }
-    pub fn failed(mut self, failed: bool) -> Self {
+    pub(crate) fn failed(mut self, failed: bool) -> Self {
         self.failed = failed;
         self
     }
@@ -76,13 +76,13 @@ fn arc_from_top(center: Point<Pixels>, radius: f32, degrees: f32) -> Option<Path
 
 /// Round progress, for where a bar has no room. `percent` is clamped to 0..=100.
 #[derive(IntoElement)]
-pub struct ProgressRing {
+pub(crate) struct ProgressRing {
     percent: u8,
     size: Pixels,
 }
 
 impl ProgressRing {
-    pub fn new(percent: u8, size: Pixels) -> Self {
+    pub(crate) fn new(percent: u8, size: Pixels) -> Self {
         Self {
             percent: percent.min(100),
             size,

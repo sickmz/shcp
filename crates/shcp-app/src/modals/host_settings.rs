@@ -5,29 +5,29 @@ use super::host_appearance::AppearancePicker;
 use super::settings::{Setter, row, switch};
 use super::{button_row, editor_frame, title};
 use crate::state::AppState;
-use crate::theme::ActiveTheme as _;
+use crate::theme::{ActiveTheme as _, Theme};
 use crate::widgets::button::{Button, ButtonStyle};
 use crate::widgets::icon::IconName;
 use gpui::prelude::*;
 use gpui::{
-    App, ClipboardItem, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    App, ClipboardItem, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable,
     SharedString, Subscription, Window, div, px,
 };
-use shcp_core::{HostId, HostSource, address_text};
+use shcp_core::{HostConfig, HostId, HostSource, address_text};
 use std::rc::Rc;
 
 /// An editor to go on to.
 #[derive(Clone, Copy)]
-pub enum HostPage {
+pub(crate) enum HostPage {
     Connection,
     KeyLogin,
     Commands,
 }
 
 /// Opens an editor. Only one modal shows at a time, so this one closes first.
-pub type OpenHostPage = Rc<dyn Fn(HostPage, &mut Window, &mut App)>;
+pub(crate) type OpenHostPage = Rc<dyn Fn(HostPage, &mut Window, &mut App)>;
 
-pub struct HostSettingsModal {
+pub(crate) struct HostSettingsModal {
     embedded: bool,
     state: Entity<AppState>,
     host: HostId,
@@ -47,12 +47,12 @@ impl Focusable for HostSettingsModal {
 }
 
 impl HostSettingsModal {
-    pub fn embedded(mut self) -> Self {
+    pub(crate) fn embedded(mut self) -> Self {
         self.embedded = true;
         self
     }
 
-    pub fn new(
+    pub(crate) fn new(
         state: Entity<AppState>,
         host: HostId,
         open: OpenHostPage,
@@ -124,6 +124,78 @@ impl HostSettingsModal {
     }
 }
 
+impl HostSettingsModal {
+    /// Who connects where, with the button that copies it and the one that edits it.
+    fn connection_row(
+        theme: &Theme,
+        alias: String,
+        address: String,
+        target: String,
+        editable: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let connection_help: Option<SharedString> =
+            (!editable).then(|| "Managed in ~/.ssh/config".into());
+        div()
+            .flex()
+            .items_center()
+            .gap(px(16.))
+            .min_h(px(48.))
+            .py(px(8.))
+            .border_b_1()
+            .border_color(theme.hover)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child(alias))
+                            .child(div().text_color(theme.text_muted).child("•"))
+                            .child(div().min_w_0().text_color(theme.text_muted).child(address)),
+                    )
+                    .children(connection_help.map(|help| {
+                        div()
+                            .text_size(crate::theme::ui_px(12.))
+                            .text_color(theme.text_muted)
+                            .child(help)
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(
+                        Button::new("host-copy-target")
+                            .keyboard_focus()
+                            .icon(IconName::Copy)
+                            .tooltip("Copy user@host")
+                            .style(ButtonStyle::Ghost)
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(target.clone()));
+                            }),
+                    )
+                    .when(editable, |this| {
+                        this.child(
+                            Button::new("host-edit-connection")
+                                .keyboard_focus()
+                                .label("Edit")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.go_to(HostPage::Connection, window, cx)
+                                })),
+                        )
+                    }),
+            )
+    }
+}
+
 impl Render for HostSettingsModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
@@ -131,10 +203,8 @@ impl Render for HostSettingsModal {
             let state = self.state.read(cx);
             let host = state.host(&self.host);
             (
-                host.map_or(self.host.0.clone(), |host| host.alias.clone()),
-                host.map_or(String::new(), |host| {
-                    format!("{}@{}", host.user, host.hostname)
-                }),
+                state.alias(&self.host),
+                host.map_or(String::new(), HostConfig::target),
                 host.map_or(String::new(), |host| {
                     address_text(Some(&host.user), &host.hostname, Some(host.port))
                 }),
@@ -144,8 +214,6 @@ impl Render for HostSettingsModal {
                 state.logs_sessions(&self.host),
             )
         };
-        let connection_help: Option<SharedString> =
-            (!editable).then(|| "Managed in ~/.ssh/config".into());
         let toggle = |toggle: fn(&mut AppState, &HostId, &mut Context<AppState>)| -> Setter<bool> {
             let (state, host) = (self.state.clone(), self.host.clone());
             Rc::new(move |_, _, cx: &mut App| {
@@ -163,76 +231,9 @@ impl Render for HostSettingsModal {
                 div()
                     .flex()
                     .flex_col()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(16.))
-                            .min_h(px(48.))
-                            .py(px(8.))
-                            .border_b_1()
-                            .border_color(theme.hover)
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_col()
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_wrap()
-                                            .items_center()
-                                            .gap(px(6.))
-                                            .child(
-                                                div()
-                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                    .child(alias),
-                                            )
-                                            .child(div().text_color(theme.text_muted).child("•"))
-                                            .child(
-                                                div()
-                                                    .min_w_0()
-                                                    .text_color(theme.text_muted)
-                                                    .child(address),
-                                            ),
-                                    )
-                                    .children(connection_help.map(|help| {
-                                        div()
-                                            .text_size(crate::theme::ui_px(12.))
-                                            .text_color(theme.text_muted)
-                                            .child(help)
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(4.))
-                                    .child(
-                                        Button::new("host-copy-target")
-                                            .keyboard_focus()
-                                            .icon(IconName::Copy)
-                                            .tooltip("Copy user@host")
-                                            .style(ButtonStyle::Ghost)
-                                            .on_click(move |_, _, cx| {
-                                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                                    target.clone(),
-                                                ));
-                                            }),
-                                    )
-                                    .when(editable, |this| {
-                                        this.child(
-                                            Button::new("host-edit-connection")
-                                                .keyboard_focus()
-                                                .label("Edit")
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.go_to(HostPage::Connection, window, cx)
-                                                })),
-                                        )
-                                    }),
-                            ),
-                    )
+                    .child(Self::connection_row(
+                        &theme, alias, address, target, editable, cx,
+                    ))
                     .child(row(
                         &theme,
                         "Key login",

@@ -30,7 +30,7 @@ impl Default for Osc7 {
 
 impl Osc7 {
     /// The last folder these bytes report.
-    pub fn feed(&mut self, bytes: &[u8]) -> Option<String> {
+    pub(crate) fn feed(&mut self, bytes: &[u8]) -> Option<String> {
         let mut found = None;
         for &byte in bytes {
             self.step = match self.step {

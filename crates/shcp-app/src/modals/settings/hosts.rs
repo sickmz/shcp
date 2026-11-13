@@ -3,7 +3,7 @@ use super::*;
 
 impl SettingsModal {
     /// Open Settings directly on a host, with the Hosts list as its parent page.
-    pub fn for_host(
+    pub(crate) fn for_host(
         state: Entity<AppState>,
         modals: Entity<ModalLayer>,
         host: HostId,
@@ -88,12 +88,7 @@ impl SettingsModal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let initial = view.read(cx).draft(cx);
-        let weak = view.downgrade();
-        let dirty = Box::new(move |cx: &App| {
-            weak.upgrade()
-                .is_some_and(|view| view.read(cx).has_unsaved_changes(&initial, cx))
-        });
+        let dirty = dirty_since_now(&view, cx);
         let subscriptions = vec![
             cx.subscribe_in(&view, window, |this, _, _: &DismissEvent, window, cx| {
                 // A successful save (or delete) has already committed the form.
@@ -132,19 +127,14 @@ impl SettingsModal {
     ) {
         if self.host_has_edits(cx) {
             let parent = cx.weak_entity();
-            let confirm = cx.new(|cx| {
-                ConfirmModal::new(
-                    "Discard changes?",
-                    "Your unsaved changes will be lost.".into(),
-                    "Discard",
-                    move |window, cx| {
-                        parent
-                            .update(cx, |this, cx| this.go_to(destination, window, cx))
-                            .ok();
-                    },
-                    cx,
-                )
-            });
+            let confirm = discard_confirm(
+                move |window, cx| {
+                    parent
+                        .update(cx, |this, cx| this.go_to(destination, window, cx))
+                        .ok();
+                },
+                cx,
+            );
             self.modals.update(cx, |modals, cx| {
                 modals.show_front(confirm, None, window, cx)
             });

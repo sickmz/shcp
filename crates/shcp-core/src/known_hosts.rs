@@ -2,7 +2,7 @@
 use crate::config;
 use anyhow::{Context, Result, bail};
 use russh::keys::{HashAlg, PublicKey};
-use std::{fs, io::ErrorKind, path::Path};
+use std::{fs, path::Path};
 
 /// One line of `known_hosts`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,11 +43,10 @@ fn parse_line(line: &str) -> Option<KnownHost> {
 
 /// A file that does not exist yet trusts nobody.
 pub(crate) fn read(path: &Path) -> Result<Vec<KnownHost>> {
-    match fs::read_to_string(path) {
-        Ok(text) => Ok(text.lines().filter_map(parse_line).collect()),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(Vec::new()),
-        Err(error) => Err(error).context("Read known_hosts"),
-    }
+    let text = config::read_if_exists(path).context("Read known_hosts")?;
+    Ok(text.map_or_else(Vec::new, |text| {
+        text.lines().filter_map(parse_line).collect()
+    }))
 }
 
 /// Removes that line and leaves the others as they are.

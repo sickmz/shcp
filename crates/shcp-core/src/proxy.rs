@@ -9,7 +9,7 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, BufReader, ReadBuf},
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     process::{Child, ChildStdin, ChildStdout, Command},
 };
 
@@ -17,7 +17,7 @@ pub(crate) struct Proxy {
     child: Child,
     /// The command as configured, which errors look into.
     command: String,
-    pub stderr: Arc<Mutex<VecDeque<String>>>,
+    stderr: Arc<Mutex<VecDeque<String>>>,
     reader: tokio::task::JoinHandle<()>,
 }
 impl Drop for Proxy {
@@ -27,16 +27,16 @@ impl Drop for Proxy {
     }
 }
 impl Proxy {
-    pub async fn settle_stderr(&mut self) {
+    pub(crate) async fn settle_stderr(&mut self) {
         // An exited proxy normally closes stderr immediately; allow its reader to drain.
         let _ = tokio::time::timeout(std::time::Duration::from_millis(200), &mut self.reader).await;
     }
-    pub fn error(&self, error: &str) -> ConnectError {
+    pub(crate) fn error(&self, error: &str) -> ConnectError {
         let stderr = self
             .stderr
             .lock()
             .iter()
-            .cloned()
+            .map(String::as_str)
             .collect::<Vec<_>>()
             .join("\n");
         classify(&self.command, error, &stderr, false)
@@ -50,7 +50,7 @@ pub(crate) struct StdioStream {
 impl StdioStream {
     /// `event` runs when the proxy first says something: the way to the server is open, however
     /// long that took. A tunnel that has to be set up, as with AWS SSM, spends its time here.
-    pub fn on_first_byte(&mut self, event: impl FnOnce() + Send + 'static) {
+    pub(crate) fn on_first_byte(&mut self, event: impl FnOnce() + Send + 'static) {
         self.first_byte = Some(Box::new(event));
     }
 }
@@ -92,10 +92,7 @@ fn command(program: &str, args: &[String]) -> Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    #[cfg(windows)]
-    {
-        cmd.creation_flags(0x0800_0000);
-    }
+    cmd.creation_flags(crate::CREATE_NO_WINDOW);
     cmd
 }
 pub(crate) fn spawn(host: &HostConfig) -> anyhow::Result<(Proxy, StdioStream)> {
@@ -119,11 +116,9 @@ pub(crate) fn spawn(host: &HostConfig) -> anyhow::Result<(Proxy, StdioStream)> {
     let (program, args) = args
         .split_first()
         .ok_or_else(|| anyhow::anyhow!("ProxyCommand is empty"))?;
-    let result = command(program, args).spawn();
-    #[cfg(windows)]
-    let result = match result {
+    let result = match command(program, args).spawn() {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            command("cmd", &["/C".into(), raw.clone()]).spawn()
+            command("cmd", &["/C".into(), raw]).spawn()
         }
         other => other,
     };
@@ -143,7 +138,7 @@ pub(crate) fn spawn(host: &HostConfig) -> anyhow::Result<(Proxy, StdioStream)> {
     let buffer = Arc::new(Mutex::new(VecDeque::new()));
     let log = buffer.clone();
     let reader = tokio::spawn(async move {
-        let mut reader = BufReader::new(stderr);
+        let mut reader = stderr;
         // Fixed-size reads keep a malicious or noisy proxy from buffering an unlimited line.
         let mut bytes = vec![0; 4096];
         use tokio::io::AsyncReadExt;

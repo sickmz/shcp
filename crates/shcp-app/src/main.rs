@@ -1,13 +1,15 @@
-#![cfg_attr(windows, windows_subsystem = "windows")]
+#![windows_subsystem = "windows"]
 
 mod actions;
 mod assets;
 mod clipboard;
+mod dock_panel;
 mod files_format;
 mod files_view;
 mod login_prompt;
 mod modals;
 mod motion;
+mod net;
 mod notices;
 mod panel;
 mod ports_panel;
@@ -23,10 +25,8 @@ mod terminal_panes;
 mod terminal_view;
 mod theme;
 mod title_bar;
-mod transfers_panel;
 mod updater;
 mod widgets;
-#[cfg(windows)]
 mod windows;
 mod workspace;
 
@@ -63,10 +63,7 @@ fn initial_bounds(saved: Option<shcp_core::SavedWindow>, cx: &gpui::App) -> Wind
 
 /// Tells the user, as there is no console. Logging may be what failed.
 fn show_fatal_error(text: &str) {
-    #[cfg(windows)]
     windows::error_box(text);
-    #[cfg(not(windows))]
-    eprintln!("{text}");
 }
 
 /// A crash of the interface ends the app: the user is told where the details are. A crash in a
@@ -86,15 +83,12 @@ fn tell_about_crashes(log_dir: &std::path::Path) {
 }
 
 fn main() {
-    #[cfg(windows)]
-    {
-        let after_update = std::env::args().any(|arg| arg == updater::AFTER_UPDATE);
-        if !windows::first_instance(after_update) {
-            windows::focus_running_window();
-            return;
-        }
+    let after_update = std::env::args().any(|arg| arg == updater::AFTER_UPDATE);
+    if !windows::first_instance(after_update) {
+        windows::focus_running_window();
+        return;
     }
-    let (engine, events) = match shcp_core::start(None) {
+    let (engine, events) = match shcp_core::start() {
         Ok(started) => started,
         Err(error) => {
             show_fatal_error(&format!("Could not start shcp: {error:#}"));
@@ -107,13 +101,7 @@ fn main() {
     Application::new()
         .with_assets(assets::Assets)
         .run(move |cx| {
-            let themes_dir = engine.paths().config_dir.join("themes");
-            let (catalog, mut theme_errors) = theme::ThemeCatalog::load(&themes_dir);
-            cx.set_global(catalog);
-            let icon_themes_dir = engine.paths().config_dir.join("icon-themes");
-            let (icons, icon_errors) = theme::icon_theme::IconThemeCatalog::load(&icon_themes_dir);
-            cx.set_global(icons);
-            theme_errors.extend(icon_errors);
+            let theme_errors = theme::load_catalogs(&engine.paths().config_dir, cx);
             theme::load_fonts(cx);
             theme::apply(&engine.settings(), &engine, cx);
             actions::bind_keys(&engine.settings(), cx);
@@ -149,8 +137,8 @@ fn main() {
                     window_background,
                     titlebar: Some(TitlebarOptions {
                         title: Some("shcp".into()),
-                        // Windows gets our own title bar, with the caption buttons inside it.
-                        appears_transparent: cfg!(windows),
+                        // Our own title bar, with the caption buttons inside it.
+                        appears_transparent: true,
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -172,7 +160,7 @@ fn main() {
                 return;
             }
 
-            state.update(cx, |state, cx| state.start_update_checks(cx));
+            state.update(cx, AppState::start_update_checks);
 
             // Core events → AppState. Drain whatever is queued in one update.
             cx.spawn(async move |cx| {

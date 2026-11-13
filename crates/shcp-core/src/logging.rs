@@ -3,7 +3,6 @@ use std::{
     io::Write as _,
     path::{Path, PathBuf},
     sync::OnceLock,
-    time::{SystemTime, UNIX_EPOCH},
 };
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
@@ -19,9 +18,7 @@ fn record_panics(dir: PathBuf) {
         let thread = std::thread::current();
         let text = format!(
             "{} thread {}: {info}\n{}\n\n",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_secs()),
+            crate::unix_seconds(),
             thread.name().unwrap_or("?"),
             std::backtrace::Backtrace::force_capture()
         );

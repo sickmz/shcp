@@ -26,7 +26,7 @@ const KINDS: [(ForwardKind, &str, &str); 3] = [
 ];
 const LOOPBACK: &str = "127.0.0.1";
 
-pub struct ForwardFields {
+pub(crate) struct ForwardFields {
     kind: ForwardKind,
     bind: Entity<TextInput>,
     target: Entity<TextInput>,
@@ -64,7 +64,7 @@ fn parse_port(text: &str) -> Result<u16> {
 }
 
 impl ForwardFields {
-    pub fn new(spec: Option<&ForwardSpec>, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(spec: Option<&ForwardSpec>, cx: &mut Context<Self>) -> Self {
         let bind_text = spec.map_or_else(String::new, |spec| {
             if spec.bind_addr == LOOPBACK {
                 spec.bind_port.to_string()
@@ -78,12 +78,7 @@ impl ForwardFields {
                 format!("{}:{}", spec.remote_host, spec.remote_port)
             });
         let field = |placeholder: &str, text: &str, cx: &mut Context<Self>| {
-            let (placeholder, text) = (placeholder.to_string(), text.to_string());
-            cx.new(|cx| {
-                let mut input = TextInput::new(&placeholder, false, cx);
-                input.set_text(&text, cx);
-                input
-            })
+            cx.new(|cx| TextInput::new(placeholder, cx).with_text(text))
         };
         Self {
             kind: spec.map_or(ForwardKind::Local, |spec| spec.kind),
@@ -93,12 +88,12 @@ impl ForwardFields {
     }
 
     /// The two text fields, for whoever wants to know about Enter and Esc in them.
-    pub fn inputs(&self) -> [&Entity<TextInput>; 2] {
+    pub(crate) fn inputs(&self) -> [&Entity<TextInput>; 2] {
         [&self.bind, &self.target]
     }
 
     /// Raw values, including incomplete ports, for detecting unsaved edits.
-    pub fn draft(&self, cx: &gpui::App) -> [String; 3] {
+    pub(crate) fn draft(&self, cx: &gpui::App) -> [String; 3] {
         [
             format!("{:?}", self.kind),
             self.bind.read(cx).text().to_string(),
@@ -106,21 +101,21 @@ impl ForwardFields {
         ]
     }
 
-    pub fn focus(&self, window: &mut Window, cx: &gpui::App) {
+    pub(crate) fn focus(&self, window: &mut Window, cx: &gpui::App) {
         self.bind.read(cx).focus(window);
     }
 
-    pub fn clear(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn clear(&mut self, cx: &mut Context<Self>) {
         self.bind.update(cx, |input, cx| input.set_text("", cx));
         self.target.update(cx, |input, cx| input.set_text("", cx));
     }
 
     /// Nothing was typed: a row left empty is no tunnel.
-    pub fn is_blank(&self, cx: &gpui::App) -> bool {
+    pub(crate) fn is_blank(&self, cx: &gpui::App) -> bool {
         self.bind.read(cx).text().trim().is_empty() && self.target.read(cx).text().trim().is_empty()
     }
 
-    pub fn spec(&self, cx: &gpui::App) -> Result<ForwardSpec> {
+    pub(crate) fn spec(&self, cx: &gpui::App) -> Result<ForwardSpec> {
         let bind = self.bind.read(cx).text().trim().to_string();
         if bind.is_empty() {
             bail!("A tunnel needs the port it listens on");

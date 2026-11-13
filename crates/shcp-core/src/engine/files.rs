@@ -5,40 +5,8 @@ impl EngineHandle {
         let control = self.control(session);
         let events = self.0.events.clone();
         self.0.runtime.handle.spawn(async move {
-            let result = async { control.context("Session does not exist")?.files().await }.await;
-            let event = match result {
-                Ok(files) => crate::files::execute(&files, req, op).await,
-                Err(error) => match op {
-                    FileOp::Home => Event::RemotePath {
-                        req,
-                        path: Err(error.to_string()),
-                    },
-                    FileOp::List(path) => Event::DirListing {
-                        req,
-                        path,
-                        entries: Err(error.to_string()),
-                    },
-                    FileOp::Kind(path) => Event::RemoteKind {
-                        req,
-                        path,
-                        kind: Err(error.to_string()),
-                    },
-                    FileOp::FreeSpace(_) => Event::RemoteSpace {
-                        req,
-                        free: None,
-                        total: None,
-                    },
-                    FileOp::ReadHead(path) => Event::RemoteHead {
-                        req,
-                        path,
-                        text: Err(error.to_string()),
-                    },
-                    _ => Event::OpDone {
-                        req,
-                        result: Err(error.to_string()),
-                    },
-                },
-            };
+            let files = async { control.context("Session does not exist")?.files().await }.await;
+            let event = crate::files::execute(files, req, op).await;
             let _ = events.try_send(event);
         });
         req
@@ -118,24 +86,20 @@ impl EngineHandle {
     ) -> RequestId {
         let req = RequestId(self.next());
         let control = self.control(s);
-        let cancel = control
-            .as_ref()
-            .map(|c| c.context.cancel.child_token())
-            .unwrap_or_default();
+        let cancel = child_cancel(control.as_ref());
         self.0.searches.lock().insert(req, cancel.clone());
         let registry = self.0.searches.clone();
         let events = self.0.events.clone();
-        self.0.runtime.handle.spawn(async move {
-            let result = async {
-                let control = control.context("Session does not exist")?;
-                let files = control.files().await?;
+        self.on_files(
+            control,
+            move |files| async move {
                 crate::files::search(&files, &root, &query, &scope, req, &events, &cancel).await
-            }
-            .await
-            .map_err(|error: anyhow::Error| format!("{error:#}"));
-            registry.lock().remove(&req);
-            let _ = events.try_send(Event::SearchDone { req, result });
-        });
+            },
+            move |result| {
+                registry.lock().remove(&req);
+                Event::SearchDone { req, result }
+            },
+        );
         req
     }
     pub fn cancel_search(&self, req: RequestId) {
@@ -147,12 +111,9 @@ impl EngineHandle {
     /// how it went.
     pub fn install_key(&self, s: SessionId, key: PathBuf, passphrase: Option<String>) -> RequestId {
         let req = RequestId(self.next());
-        let control = self.control(s);
-        let events = self.0.events.clone();
-        self.0.runtime.handle.spawn(async move {
-            let result = async {
-                let control = control.context("Session does not exist")?;
-                let files = control.files().await?;
+        self.on_files(
+            self.control(s),
+            move |files| async move {
                 let comment = format!(
                     "{}@{}",
                     std::env::var("USERNAME").unwrap_or_else(|_| "shcp".into()),
@@ -168,34 +129,48 @@ impl EngineHandle {
                 })
                 .await??;
                 crate::key_setup::install(files.ssh(), &line).await
-            }
-            .await
-            .map_err(|error: anyhow::Error| format!("{error:#}"));
-            let _ = events.try_send(Event::OpDone { req, result });
-        });
+            },
+            move |result| Event::OpDone { req, result },
+        );
         req
     }
     /// Puts a file in a private folder of the server; `Event::PastedFile` tells its path.
     pub fn paste_file(&self, s: SessionId, file: PasteFile) -> RequestId {
         let req = RequestId(self.next());
-        let control = self.control(s);
+        self.on_files(
+            self.control(s),
+            move |files| async move {
+                let sftp = files.get().await?;
+                crate::paste::upload(&sftp, file, req.0).await
+            },
+            move |result| Event::PastedFile { req, result },
+        );
+        req
+    }
+    /// Does `work` with the files of a session, away from the caller, and sends the event `done`
+    /// makes of how it went.
+    fn on_files<T, Work>(
+        &self,
+        control: Option<Arc<Control>>,
+        work: impl FnOnce(Arc<crate::files::Files>) -> Work + Send + 'static,
+        done: impl FnOnce(Result<T, String>) -> Event + Send + 'static,
+    ) where
+        Work: Future<Output = Result<T>> + Send,
+    {
         let events = self.0.events.clone();
         self.0.runtime.handle.spawn(async move {
             let result = async {
-                let control = control.context("Session does not exist")?;
-                let files = control.files().await?;
-                let sftp = files.get().await?;
-                crate::paste::upload(&sftp, file, req.0).await
+                let files = control.context("Session does not exist")?.files().await?;
+                work(files).await
             }
             .await
             .map_err(|error| format!("{error:#}"));
-            let _ = events.try_send(Event::PastedFile { req, result });
+            let _ = events.try_send(done(result));
         });
-        req
     }
     /// Opens a remote file in the local editor and writes every save back to the server.
     pub fn edit_file(&self, s: SessionId, remote: String) {
-        let editor = self.settings().editor;
+        let editor = self.0.store.lock().settings.editor.clone();
         let key = (s, remote.clone());
         let mut edits = self.0.edits.lock();
         if let Some(commands) = edits.get(&key)
@@ -211,9 +186,7 @@ impl EngineHandle {
         let (commands, receiver) = async_channel::unbounded();
         edits.insert(key.clone(), commands);
         // Session ids restart with the app: the time keeps an old copy from being overwritten.
-        let started = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_secs());
+        let started = crate::unix_seconds();
         let dir = crate::edit::root(&self.0.store.lock().paths.data_dir)
             .join(format!("{started}-{}", self.next()));
         let registry = self.0.edits.clone();
@@ -242,29 +215,21 @@ impl EngineHandle {
             .as_ref()
             .map(|c| c.context.host.id.clone())
             .unwrap_or_default();
-        let cancel = control
-            .as_ref()
-            .map(|c| c.context.cancel.child_token())
-            .unwrap_or_default();
+        let cancel = child_cancel(control.as_ref());
         let label = match direction {
-            Direction::Upload => local
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| local.display().to_string()),
-            Direction::Download => remote
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .unwrap_or(&remote)
-                .into(),
+            Direction::Upload => local.file_name().map_or_else(
+                || local.display().to_string(),
+                |s| s.to_string_lossy().into_owned(),
+            ),
+            Direction::Download => crate::files::file_name(&remote).unwrap_or(&remote).into(),
         };
         let info = TransferInfo {
             id,
             session,
             host,
             direction,
-            local: local.clone(),
-            remote: remote.clone(),
+            local,
+            remote,
             label,
             bytes_done: 0,
             bytes_total: None,
@@ -281,8 +246,6 @@ impl EngineHandle {
             transfer::run(
                 Job {
                     info,
-                    local,
-                    remote,
                     cancel,
                     retry,
                 },
@@ -315,4 +278,10 @@ impl EngineHandle {
             cancel.cancel();
         }
     }
+}
+/// A token cancelled with the session, or a token of its own once the session is gone.
+fn child_cancel(control: Option<&Arc<Control>>) -> CancellationToken {
+    control
+        .map(|c| c.context.cancel.child_token())
+        .unwrap_or_default()
 }

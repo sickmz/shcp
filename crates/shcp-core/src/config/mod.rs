@@ -43,8 +43,10 @@ const BACKUP_VERSION: u32 = 1;
 fn keep_local(settings: &mut Settings, local: &Settings) {
     settings.window = local.window;
     settings.last_update_check = local.last_update_check;
-    settings.saved_passphrases = local.saved_passphrases.clone();
-    settings.saved_passwords = local.saved_passwords.clone();
+    settings
+        .saved_passphrases
+        .clone_from(&local.saved_passphrases);
+    settings.saved_passwords.clone_from(&local.saved_passwords);
 }
 
 /// Settings and backups saved before the bundled themes were renamed still use the old names.
@@ -63,7 +65,7 @@ fn rename_old_themes(settings: &mut Settings) {
 }
 
 impl Store {
-    pub fn export_backup(&self, path: &Path) -> Result<()> {
+    pub(crate) fn export_backup(&self, path: &Path) -> Result<()> {
         let mut settings = self.settings.clone();
         keep_local(&mut settings, &Settings::default());
         write(
@@ -77,7 +79,7 @@ impl Store {
     }
     /// Replaces the settings and adds the hosts, replacing those with the same name. Nothing
     /// changes if the file is not good. Returns the warnings of reloading and the hosts imported.
-    pub fn import_backup(&mut self, path: &Path) -> Result<(Vec<String>, usize)> {
+    pub(crate) fn import_backup(&mut self, path: &Path) -> Result<(Vec<String>, usize)> {
         let text = fs::read_to_string(path).with_context(|| format!("Read {}", path.display()))?;
         let mut backup: Backup = toml::from_str(&text).context("It is not a shcp backup")?;
         if backup.version > BACKUP_VERSION {
@@ -94,14 +96,11 @@ impl Store {
         let mut hosts = self.app_hosts()?;
         hosts.retain(|host| !backup.hosts.iter().any(|new| new.alias == host.alias));
         hosts.extend(backup.hosts);
-        write(
-            &self.paths.config_dir.join("hosts.toml"),
-            &HostsFile { hosts },
-        )?;
+        self.write_hosts(hosts)?;
         self.save_settings(backup.settings)?;
         Ok((self.load(), count))
     }
-    pub fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         let dirs = ProjectDirs::from("dev", "shcp", "shcp")
             .context("Application directories unavailable")?;
         let home = home()?;
@@ -119,13 +118,14 @@ impl Store {
             settings: Settings::default(),
         })
     }
-    pub fn load(&mut self) -> Vec<String> {
+    pub(crate) fn load(&mut self) -> Vec<String> {
         let mut warnings = Vec::new();
         let mut hosts = BTreeMap::new();
+        let home = home();
         match read_optional(&self.paths.ssh_config) {
-            Ok(Some(text)) => match home() {
+            Ok(Some(text)) => match &home {
                 Ok(home) => {
-                    let (parsed, notices) = ssh::parse(&text, &home);
+                    let (parsed, notices) = ssh::parse(&text, home);
                     warnings.extend(notices);
                     for host in parsed {
                         hosts.insert(host.id.clone(), host);
@@ -144,8 +144,8 @@ impl Store {
                         warnings.push(format!("Host {}: {error}", host.alias));
                         continue;
                     }
-                    if let Ok(home) = home() {
-                        ssh::expand_identity_files(&mut host, &home);
+                    if let Ok(home) = &home {
+                        ssh::expand_identity_files(&mut host, home);
                     }
                     hosts.insert(host.id.clone(), host);
                 }
@@ -155,15 +155,19 @@ impl Store {
         self.hosts = hosts.into_values().collect();
         warnings
     }
-    fn app_hosts(&self) -> Result<Vec<HostConfig>> {
-        Ok(
-            match read_optional(&self.paths.config_dir.join("hosts.toml"))? {
-                Some(text) => toml::from_str::<HostsFile>(&text)?.hosts,
-                None => vec![],
-            },
-        )
+    fn hosts_path(&self) -> PathBuf {
+        self.paths.config_dir.join("hosts.toml")
     }
-    pub fn load_settings(&mut self) -> Result<()> {
+    fn write_hosts(&self, hosts: Vec<HostConfig>) -> Result<()> {
+        write(&self.hosts_path(), &HostsFile { hosts })
+    }
+    fn app_hosts(&self) -> Result<Vec<HostConfig>> {
+        Ok(match read_optional(&self.hosts_path())? {
+            Some(text) => toml::from_str::<HostsFile>(&text)?.hosts,
+            None => vec![],
+        })
+    }
+    pub(crate) fn load_settings(&mut self) -> Result<()> {
         if let Some(text) = read_optional(&self.paths.config_dir.join("settings.toml"))? {
             let mut settings: Settings = toml::from_str(&text)?;
             rename_old_themes(&mut settings);
@@ -173,7 +177,7 @@ impl Store {
         }
         Ok(())
     }
-    pub fn save_host(&mut self, mut host: HostConfig) -> Result<Vec<String>> {
+    pub(crate) fn save_host(&mut self, mut host: HostConfig) -> Result<Vec<String>> {
         if host.source != HostSource::App {
             bail!("SSH config hosts are read-only");
         }
@@ -182,13 +186,10 @@ impl Store {
         let mut hosts = self.app_hosts()?;
         hosts.retain(|h| h.alias != host.alias);
         hosts.push(host);
-        write(
-            &self.paths.config_dir.join("hosts.toml"),
-            &HostsFile { hosts },
-        )?;
+        self.write_hosts(hosts)?;
         Ok(self.load())
     }
-    pub fn delete_host(&mut self, id: &HostId) -> Result<Vec<String>> {
+    pub(crate) fn delete_host(&mut self, id: &HostId) -> Result<Vec<String>> {
         if !self
             .hosts
             .iter()
@@ -198,19 +199,16 @@ impl Store {
         }
         let mut hosts = self.app_hosts()?;
         hosts.retain(|h| h.alias != id.0);
-        write(
-            &self.paths.config_dir.join("hosts.toml"),
-            &HostsFile { hosts },
-        )?;
+        self.write_hosts(hosts)?;
         Ok(self.load())
     }
-    pub fn save_settings(&mut self, settings: Settings) -> Result<()> {
+    pub(crate) fn save_settings(&mut self, settings: Settings) -> Result<()> {
         validate_settings(&settings)?;
         write(&self.paths.config_dir.join("settings.toml"), &settings)?;
         self.settings = settings;
         Ok(())
     }
-    pub fn load_tabs(&self) -> Result<SavedTabs> {
+    pub(crate) fn load_tabs(&self) -> Result<SavedTabs> {
         Ok(
             match read_optional(&self.paths.config_dir.join("tabs.toml"))? {
                 Some(text) => toml::from_str(&text)?,
@@ -218,7 +216,7 @@ impl Store {
             },
         )
     }
-    pub fn save_tabs(&self, tabs: &SavedTabs) -> Result<()> {
+    pub(crate) fn save_tabs(&self, tabs: &SavedTabs) -> Result<()> {
         write(&self.paths.config_dir.join("tabs.toml"), tabs)
     }
 }
@@ -259,10 +257,14 @@ pub(crate) fn validate_settings(settings: &Settings) -> Result<()> {
 }
 
 fn read_optional(path: &Path) -> Result<Option<String>> {
+    read_if_exists(path).with_context(|| format!("Read {}", path.display()))
+}
+/// The text of a file, `None` when there is no such file.
+pub(crate) fn read_if_exists(path: &Path) -> std::io::Result<Option<String>> {
     match fs::read_to_string(path) {
         Ok(text) => Ok(Some(text)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("Read {}", path.display())),
+        Err(e) => Err(e),
     }
 }
 fn write(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -290,35 +292,16 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{Scratch, paths_in};
 
-    struct Scratch(PathBuf);
-    impl Scratch {
-        fn new(name: &str) -> Self {
-            let dir =
-                std::env::temp_dir().join(format!("shcp-backup-{name}-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&dir);
-            fs::create_dir_all(&dir).unwrap();
-            Self(dir)
-        }
-        fn store(&self, name: &str) -> Store {
-            let dir = self.0.join(name);
-            fs::create_dir_all(&dir).unwrap();
-            Store {
-                paths: AppPaths {
-                    config_dir: dir.clone(),
-                    data_dir: dir.clone(),
-                    log_dir: dir.clone(),
-                    known_hosts: dir.join("known_hosts"),
-                    ssh_config: dir.join("config"),
-                },
-                hosts: vec![],
-                settings: Settings::default(),
-            }
-        }
-    }
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+    /// A store whose files are all in a folder of their own in `scratch`.
+    fn scratch_store(scratch: &Scratch, name: &str) -> Store {
+        let dir = scratch.0.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        Store {
+            paths: paths_in(&dir),
+            hosts: vec![],
+            settings: Settings::default(),
         }
     }
     fn host(alias: &str, hostname: &str) -> HostConfig {
@@ -332,8 +315,8 @@ mod tests {
 
     #[test]
     fn old_theme_names_become_the_new_ones_and_others_stay() {
-        let scratch = Scratch::new("themes");
-        let mut store = scratch.store("store");
+        let scratch = Scratch::new("backup-themes");
+        let mut store = scratch_store(&scratch, "store");
         fs::write(
             store.paths.config_dir.join("settings.toml"),
             "theme = \"shcp Light\"\ndark_theme = \"shcp Dark\"\nlight_theme = \"Solarized\"\n",
@@ -347,9 +330,9 @@ mod tests {
 
     #[test]
     fn a_backup_moves_hosts_and_settings_but_not_what_belongs_to_the_pc() {
-        let scratch = Scratch::new("move");
+        let scratch = Scratch::new("backup-move");
         let file = scratch.0.join("backup.toml");
-        let mut source = scratch.store("source");
+        let mut source = scratch_store(&scratch, "source");
         source.save_host(host("web", "web.example")).unwrap();
         let mut settings = Settings {
             terminal_font_size: 19.,
@@ -376,7 +359,7 @@ mod tests {
         let text = fs::read_to_string(&file).unwrap();
         assert!(!text.contains("me@web:22"), "{text}");
 
-        let mut target = scratch.store("target");
+        let mut target = scratch_store(&scratch, "target");
         target.save_host(host("web", "old.example")).unwrap();
         target.save_host(host("kept", "kept.example")).unwrap();
         let mut local = Settings::default();
@@ -398,9 +381,9 @@ mod tests {
 
     #[test]
     fn a_bad_file_changes_nothing() {
-        let scratch = Scratch::new("bad");
+        let scratch = Scratch::new("backup-bad");
         let file = scratch.0.join("bad.toml");
-        let mut store = scratch.store("store");
+        let mut store = scratch_store(&scratch, "store");
         store.save_host(host("web", "web.example")).unwrap();
         for text in [
             "not toml at all [",

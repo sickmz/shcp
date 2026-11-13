@@ -8,7 +8,7 @@ use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Subscription, Window,
 };
 
-pub struct LoginModal {
+pub(crate) struct LoginModal {
     host: String,
     prompt: Entity<LoginPrompt>,
     _subscription: Subscription,
@@ -24,7 +24,7 @@ impl Focusable for LoginModal {
 }
 
 impl LoginModal {
-    pub fn new(host: String, prompt: Entity<LoginPrompt>, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(host: String, prompt: Entity<LoginPrompt>, cx: &mut Context<Self>) -> Self {
         prompt.read(cx).set_owner(cx.entity_id());
         let subscription = cx.subscribe(&prompt, |_, _, _: &DismissEvent, cx| {
             cx.emit(DismissEvent);

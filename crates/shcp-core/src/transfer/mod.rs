@@ -28,8 +28,6 @@ const TAIL_CHECK: u64 = 256 * 1024;
 
 pub(crate) struct Job {
     pub info: TransferInfo,
-    pub local: PathBuf,
-    pub remote: String,
     pub cancel: CancellationToken,
     /// A second attempt: destinations that already match the source are skipped.
     pub retry: bool,
@@ -78,6 +76,15 @@ impl Progress {
         self.info.bytes_done += bytes;
         self.skipped += bytes;
     }
+    /// Counts a file that was already there in full.
+    fn file_skipped(&mut self, size: u64) {
+        self.skip(size);
+        self.file_done();
+    }
+    fn file_done(&mut self) {
+        self.info.files_done += 1;
+        self.emit(false);
+    }
     /// The user pressed cancel: nobody wants the partial file. After a lost connection it stays.
     fn cancelled_by_user(&self, cancel: &CancellationToken) -> bool {
         cancel.is_cancelled() && !self.session.is_cancelled()
@@ -93,6 +100,8 @@ pub(crate) async fn run(
         .as_ref()
         .map(|c| c.context.cancel.clone())
         .unwrap_or_default();
+    // Progress takes the info, which it updates while these are read.
+    let (local, remote) = (job.info.local.clone(), job.info.remote.clone());
     let mut progress = Progress {
         info: job.info,
         events,
@@ -102,7 +111,7 @@ pub(crate) async fn run(
         retry: job.retry,
         session,
     };
-    let result = queued(&job.local, &job.remote, &job.cancel, control, &mut progress).await;
+    let result = queued(&local, &remote, &job.cancel, control, &mut progress).await;
     progress.info.state = if progress.cancelled_by_user(&job.cancel) {
         TransferState::Cancelled
     } else if progress.session.is_cancelled() {
@@ -123,9 +132,9 @@ async fn queued(
     progress: &mut Progress,
 ) -> Result<()> {
     let control = control.context("Session does not exist")?;
-    let files = tokio::select! { biased; _ = cancel.cancelled() => bail!("Transfer cancelled"), result = control.files() => result? };
+    let files = cancellable(cancel, control.files()).await?;
     let semaphore: &Semaphore = &control.transfers;
-    let _permit = tokio::select! { biased; _ = cancel.cancelled() => bail!("Transfer cancelled"), permit = semaphore.acquire() => permit? };
+    let _permit = cancellable(cancel, async { Ok(semaphore.acquire().await?) }).await?;
     progress.info.state = TransferState::Running;
     progress.start = Instant::now();
     progress.emit(true);
@@ -140,6 +149,29 @@ async fn cancellable<T>(
     future: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
     tokio::select! { biased; _ = cancel.cancelled() => bail!("Transfer cancelled"), result = future => result }
+}
+/// Copies the rest of `input` to `output`, counting it as it goes. Finishing `output` is up to
+/// the caller.
+async fn pump<R, W>(
+    input: &mut R,
+    output: &mut W,
+    cancel: &CancellationToken,
+    p: &mut Progress,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buffer = vec![0; 256 * 1024];
+    loop {
+        let n = cancellable(cancel, async { Ok(input.read(&mut buffer).await?) }).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        cancellable(cancel, async { Ok(output.write_all(&buffer[..n]).await?) }).await?;
+        p.info.bytes_done += n as u64;
+        p.emit(false);
+    }
 }
 struct Item {
     local: PathBuf,

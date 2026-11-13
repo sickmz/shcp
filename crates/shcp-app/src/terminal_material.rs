@@ -35,7 +35,7 @@ const LARGEST: u32 = 8192;
 /// A tint of the field: `alpha` of `color` at the share `from` of the area, fading to nothing
 /// at the share `to`. Shares go from 0, the top or the left, to 1.
 #[derive(Clone, Copy)]
-pub struct Tint {
+pub(crate) struct Tint {
     pub color: Hsla,
     pub alpha: f32,
     pub from: f32,
@@ -51,13 +51,13 @@ impl Tint {
 
 /// A glow inside an edge: `alpha` at the edge, nothing `reach` pixels in.
 #[derive(Clone, Copy)]
-pub struct Glow {
+pub(crate) struct Glow {
     pub alpha: f32,
     pub reach: f32,
 }
 
 #[derive(Clone)]
-pub struct Material {
+pub(crate) struct Material {
     /// The surface where no tint reaches.
     pub base: Hsla,
     /// How much of what is behind the window the surface lets through: 1 for none.
@@ -93,7 +93,7 @@ pub struct Material {
 impl Material {
     /// The material over a dark `base`. With the reference's own base, #22201e, the tints land
     /// on the colors measured there.
-    pub fn smoked(base: Hsla) -> Self {
+    pub(crate) fn smoked(base: Hsla) -> Self {
         let color = |hex| -> Hsla { rgb(hex).into() };
         let (plum, amber) = (color(0x72488c), color(0x723400));
         let (copper, warm) = (color(0xae3e14), color(0x86481e));
@@ -151,14 +151,14 @@ impl Material {
 
     /// The same material, letting nothing through: for what floats over the window, where what
     /// would show through is the window's own content.
-    pub fn opaque(self) -> Self {
+    pub(crate) fn opaque(self) -> Self {
         Self { alpha: 1., ..self }
     }
 
     /// The same material in other colors, at the same strengths: the tints from the top, the
     /// bottom, the left and the right of the area, the light of the crests, and the veil of the
     /// backdrop.
-    pub fn recolored(mut self, tints: [Hsla; 4], glass: Hsla, shade: Hsla) -> Self {
+    pub(crate) fn recolored(mut self, tints: [Hsla; 4], glass: Hsla, shade: Hsla) -> Self {
         let [top, bottom, left, right] = tints;
         for tint in &mut self.top {
             tint.color = top;
@@ -440,7 +440,7 @@ fn noise(x: u32, y: u32) -> f32 {
 
 /// The field of the window: where the cards are, all of them together, and its picture.
 #[derive(Default)]
-pub struct Ambient {
+struct Ambient {
     area: Cell<Option<Bounds<Pixels>>>,
     baked: RefCell<Option<Baked>>,
     /// The size in device pixels the area was last seen at without a picture for it, and since
@@ -459,13 +459,13 @@ thread_local! {
 }
 
 /// The one field of the window. Every tab shows its cards in the same place, so they share it.
-pub fn ambient() -> Rc<Ambient> {
+fn ambient() -> Rc<Ambient> {
     AMBIENT.with(Rc::clone)
 }
 
 impl Ambient {
     /// Where the cards are. To call while laying out: the cards read it while painting.
-    pub fn set_area(&self, area: Bounds<Pixels>) {
+    fn set_area(&self, area: Bounds<Pixels>) {
         self.area.set(Some(area));
     }
 
@@ -534,7 +534,7 @@ impl Ambient {
 /// darker, so the cards and the rest of the window are one surface and not two colors side by
 /// side. It fills what it is put in, which is from then on the area of the field; `alpha` is how
 /// much of it there is, under 1 for a window that lets the desktop through.
-pub fn backdrop(material: Material, alpha: f32) -> Div {
+pub(crate) fn backdrop(material: Material, alpha: f32) -> Div {
     let (ambient, field) = (ambient(), ambient());
     div().absolute().inset_0().opacity(alpha).child(
         canvas(
@@ -570,7 +570,7 @@ pub fn backdrop(material: Material, alpha: f32) -> Div {
 /// material and keeps its own opacity; the material takes no pointer. `active`: it has the
 /// keyboard, and its rim shows in full. `lifted`: it is lighter for it too, which says something
 /// only among several cards.
-pub fn frame(material: Material, active: bool, lifted: bool) -> Div {
+pub(crate) fn frame(material: Material, active: bool, lifted: bool) -> Div {
     div()
         .relative()
         .flex()
@@ -584,7 +584,7 @@ pub fn frame(material: Material, active: bool, lifted: bool) -> Div {
 
 /// The material alone, for what is not laid out as a card of the main area: a modal. To add
 /// first to something `relative` with no fill and no border of its own, which it then fills.
-pub fn layers(material: Material, active: bool, lifted: bool) -> Div {
+pub(crate) fn layers(material: Material, active: bool, lifted: bool) -> Div {
     let ambient = ambient();
     let field = material.clone();
     div()
@@ -612,7 +612,7 @@ pub fn layers(material: Material, active: bool, lifted: bool) -> Div {
 
 /// The crests alone, for what keeps a fill of its own and is `relative`: a field, a capsule.
 /// `radius` is what it is rounded with.
-pub fn crests(material: Material, radius: f32) -> Div {
+pub(crate) fn crests(material: Material, radius: f32) -> Div {
     div().absolute().inset_0().child(
         canvas(
             |_, _, _| {},

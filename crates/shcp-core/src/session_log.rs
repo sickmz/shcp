@@ -95,7 +95,7 @@ pub(crate) struct SessionLog {
 
 impl SessionLog {
     /// A new file named after the host and the moment, which is in UTC.
-    pub fn create(dir: &Path, alias: &str, seconds: u64) -> io::Result<Self> {
+    pub(crate) fn create(dir: &Path, alias: &str, seconds: u64) -> io::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let name: String = alias
             .chars()
@@ -108,12 +108,13 @@ impl SessionLog {
             })
             .collect();
         let stamp = stamp(seconds);
-        for attempt in 0.. {
+        // Terminals opened in the same second each get their own file; up to 1000 get a number.
+        let mut attempt = 0;
+        loop {
             let suffix = match attempt {
                 0 => String::new(),
                 n => format!("-{n}"),
             };
-            // Terminals opened in the same second each get their own file.
             match File::create_new(dir.join(format!("{name}-{stamp}{suffix}.log"))) {
                 Ok(file) => {
                     return Ok(Self {
@@ -121,14 +122,15 @@ impl SessionLog {
                         cleaner: Cleaner::default(),
                     });
                 }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists && attempt < 1000 => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists && attempt < 1000 => {
+                    attempt += 1;
+                }
                 Err(error) => return Err(error),
             }
         }
-        unreachable!("the loop returns")
     }
 
-    pub fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+    pub(crate) fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
         let text = self.cleaner.clean(bytes);
         if text.is_empty() {
             return Ok(());
@@ -211,8 +213,9 @@ mod tests {
 
     #[test]
     fn files_are_named_after_the_host_and_never_replaced() {
-        let dir = std::env::temp_dir().join(format!("shcp-session-log-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = crate::test_support::Scratch::new("session-log");
+        // A folder that does not exist yet: creating the log makes it.
+        let dir = scratch.0.join("logs");
         let mut first = SessionLog::create(&dir, "web/01 prod", 0).unwrap();
         let mut second = SessionLog::create(&dir, "web/01 prod", 0).unwrap();
         first.write(b"\x1b[31mone\x1b[0m\r\n").unwrap();
@@ -221,6 +224,5 @@ mod tests {
         let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
         assert_eq!(read("web_01_prod-19700101-000000Z.log"), "one\n");
         assert_eq!(read("web_01_prod-19700101-000000Z-1.log"), "two");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -8,13 +8,13 @@ use std::time::Duration;
 macro_rules! icons {
     ($($variant:ident => $file:literal),* $(,)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub enum IconName { $($variant),* }
+        pub(crate) enum IconName { $($variant),* }
         impl IconName {
-            pub const ALL: &'static [IconName] = &[$(IconName::$variant),*];
-            pub fn path(self) -> &'static str {
+            pub(crate) const ALL: &'static [IconName] = &[$(IconName::$variant),*];
+            pub(crate) fn path(self) -> &'static str {
                 match self { $(IconName::$variant => concat!("icons/", $file, ".svg")),* }
             }
-            pub fn bytes(self) -> &'static [u8] {
+            pub(crate) fn bytes(self) -> &'static [u8] {
                 match self { $(IconName::$variant => include_bytes!(concat!("../../assets/icons/", $file, ".svg"))),* }
             }
         }
@@ -33,7 +33,6 @@ icons! {
     Plus => "plus",
     Close => "close",
     ChevronRight => "chevron_right",
-    ChevronLeft => "chevron_left",
     ArrowUp => "arrow_up",
     Refresh => "refresh",
     Upload => "upload",
@@ -62,31 +61,12 @@ icons! {
     Keyboard => "keyboard",
     Plug => "plug",
     Info => "info",
-    PanelBottom => "panel_bottom",
     Eye => "eye",
     EyeOff => "eye_off",
     ExternalLink => "external_link",
     Play => "play",
-    Server => "server",
-    Database => "database",
-    Cloud => "cloud",
     Globe => "globe",
-    Shield => "shield",
     Lock => "lock",
-    Container => "box",
-    Cpu => "cpu",
-    Router => "router",
-    Network => "network",
-    HardDrive => "hard_drive",
-    Archive => "archive",
-    Flask => "flask",
-    GitBranch => "git_branch",
-    Monitor => "monitor",
-    Briefcase => "briefcase",
-    Wrench => "wrench",
-    Mail => "mail",
-    Zap => "zap",
-    Star => "star",
     SplitRight => "split_right",
     SplitDown => "split_down",
     Swap => "swap",
@@ -95,7 +75,7 @@ icons! {
 }
 
 #[derive(IntoElement)]
-pub struct Icon {
+pub(crate) struct Icon {
     name: IconName,
     size: Pixels,
     color: Option<Hsla>,
@@ -103,7 +83,7 @@ pub struct Icon {
 }
 
 impl Icon {
-    pub fn new(name: IconName) -> Self {
+    pub(crate) fn new(name: IconName) -> Self {
         Self {
             name,
             size: px(14.),
@@ -111,15 +91,15 @@ impl Icon {
             spin: false,
         }
     }
-    pub fn size(mut self, size: Pixels) -> Self {
+    pub(crate) fn size(mut self, size: Pixels) -> Self {
         self.size = size;
         self
     }
-    pub fn color(mut self, color: Hsla) -> Self {
+    pub(crate) fn color(mut self, color: Hsla) -> Self {
         self.color = Some(color);
         self
     }
-    pub fn spin(mut self) -> Self {
+    pub(crate) fn spin(mut self) -> Self {
         self.spin = true;
         self
     }

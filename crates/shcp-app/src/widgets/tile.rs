@@ -16,7 +16,7 @@ const GAP: f32 = 1.;
 
 /// What a tile shows.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Mark {
+pub(crate) enum Mark {
     Icon(IconName),
     /// A few characters, as a prompt shows them.
     Glyph(&'static str),
@@ -27,7 +27,7 @@ pub enum Mark {
 /// What the tile of a session says of its shell: `#` for root whatever the shell, the prompt of a
 /// shell it knows, the terminal icon for any other or none. `shell` is the login shell the server
 /// named, not what the user started later.
-pub fn shell_mark(shell: Option<&str>, user: &str) -> Mark {
+fn shell_mark(shell: Option<&str>, user: &str) -> Mark {
     if user == "root" {
         return Mark::Glyph("#");
     }
@@ -41,7 +41,7 @@ pub fn shell_mark(shell: Option<&str>, user: &str) -> Mark {
 }
 
 /// The tile of a session, saying its shell when known.
-pub fn shell_tile(
+pub(crate) fn shell_tile(
     id: impl Into<ElementId>,
     shell: Option<&str>,
     user: &str,
@@ -62,7 +62,7 @@ pub fn shell_tile(
 /// `mark` in `color` on a tile. A split session gives `deck`, the color of the row under it: one
 /// more card shows behind the tile, up and to the right, whatever the number of its terminals.
 /// The tile itself stays where and how it is on any other row, so the tiles of a list line up.
-pub fn tile(mark: Mark, color: Hsla, deck: Option<Hsla>, theme: &Theme) -> Div {
+pub(crate) fn tile(mark: Mark, color: Hsla, deck: Option<Hsla>, theme: &Theme) -> Div {
     let (width, height) = (row_px(WIDTH), row_px(HEIGHT));
     let colors = theme.tile_colors();
     let face = div()

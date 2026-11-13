@@ -6,36 +6,37 @@ use crate::widgets::icon::IconName;
 use crate::workspace::Workspace;
 use gpui::{Context, Entity, Pixels, Point, Subscription, Window};
 use shcp_core::{HostId, SplitAxis};
+use std::rc::Rc;
 
 /// How a tab shows its place.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Face {
+pub(crate) enum Face {
     Terminal,
     /// The terminals and, beside them, the files.
     Files,
 }
 
 impl Face {
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Face::Terminal => "Terminal",
             Face::Files => "Files",
         }
     }
 
-    pub fn icon(self) -> IconName {
+    pub(crate) fn icon(self) -> IconName {
         match self {
             Face::Terminal => IconName::Terminal,
             Face::Files => IconName::Folder,
         }
     }
 
-    pub fn shows_files(self) -> bool {
+    pub(crate) fn shows_files(self) -> bool {
         self == Face::Files
     }
 }
 
-pub struct Tab {
+pub(crate) struct Tab {
     pub id: u64,
     pub host: HostId,
     pub label: String,
@@ -66,7 +67,7 @@ fn folder_title(path: &str) -> Option<String> {
 }
 
 /// A folder as a tab's row shows it: from the home of `user` if inside it, and only its end if deep.
-pub fn short_folder(folder: &str, user: &str) -> String {
+pub(crate) fn short_folder(folder: &str, user: &str) -> String {
     let home = if user == "root" {
         "/root".to_string()
     } else {
@@ -88,18 +89,18 @@ pub fn short_folder(folder: &str, user: &str) -> String {
 
 impl Tab {
     /// The folder of the terminal in focus, when the shell has said.
-    pub fn terminal_folder(&self, cx: &gpui::App) -> Option<String> {
+    pub(crate) fn terminal_folder(&self, cx: &gpui::App) -> Option<String> {
         self.panes.read(cx).active().read(cx).cwd()
     }
 
     /// The files take all the room when there is no shell to give the rest to: the server does
     /// not allow one, or it was closed.
-    pub fn files_alone(&self, cx: &gpui::App) -> bool {
+    pub(crate) fn files_alone(&self, cx: &gpui::App) -> bool {
         self.face.shows_files() && self.files.is_some() && self.panes.read(cx).shells_gone(cx)
     }
 
     /// The folder the tab is at, as far as it is known.
-    pub fn folder(&self, cx: &gpui::App) -> Option<String> {
+    pub(crate) fn folder(&self, cx: &gpui::App) -> Option<String> {
         if self.face.shows_files()
             && let Some(files) = &self.files
         {
@@ -112,7 +113,7 @@ impl Tab {
     }
 
     /// What the tab is called: the name given to it, the folder it is at, or what its terminal says.
-    pub fn title(&self, cx: &gpui::App) -> String {
+    pub(crate) fn title(&self, cx: &gpui::App) -> String {
         if let Some(name) = &self.name {
             return name.clone();
         }
@@ -126,14 +127,30 @@ impl Tab {
     }
 }
 
-pub fn tab_menu(
+/// The ways to split a terminal: label, icon, shortcut and axis.
+pub(crate) const SPLITS: [(&str, IconName, &str, SplitAxis); 2] = [
+    (
+        "Split right",
+        IconName::SplitRight,
+        "Ctrl+Shift+D",
+        SplitAxis::Row,
+    ),
+    (
+        "Split down",
+        IconName::SplitDown,
+        "Ctrl+Shift+S",
+        SplitAxis::Column,
+    ),
+];
+
+pub(crate) fn tab_menu(
     workspace: &mut Workspace,
     id: u64,
     position: Point<Pixels>,
     cx: &mut Context<Workspace>,
 ) {
     let this = cx.entity().downgrade();
-    let Some(index) = workspace.tabs.iter().position(|tab| tab.id == id) else {
+    let Some(index) = workspace.tab_index(id) else {
         return;
     };
     let count = workspace.tabs.len();
@@ -160,25 +177,12 @@ pub fn tab_menu(
         .icon(IconName::Folder)
         .shortcut("Ctrl+Shift+E"),
     ];
-    for (label, icon, shortcut, axis) in [
-        (
-            "Split right",
-            IconName::SplitRight,
-            "Ctrl+Shift+D",
-            SplitAxis::Row,
-        ),
-        (
-            "Split down",
-            IconName::SplitDown,
-            "Ctrl+Shift+S",
-            SplitAxis::Column,
-        ),
-    ] {
+    for (label, icon, shortcut, axis) in SPLITS {
         let panes = panes.clone();
         entries.push(
             MenuEntry::item(
                 label,
-                std::rc::Rc::new(move |window: &mut Window, cx: &mut gpui::App| {
+                Rc::new(move |window: &mut Window, cx: &mut gpui::App| {
                     panes.update(cx, |panes, cx| panes.split(axis, window, cx));
                 }),
             )

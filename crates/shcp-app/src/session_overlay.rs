@@ -27,7 +27,7 @@ struct Row {
 
 /// Where the connection stands, ready to be drawn.
 #[derive(Clone, Default)]
-pub struct Steps {
+pub(crate) struct Steps {
     position: u32,
     /// The steps shown have reached the connection: what it asks of the user can appear.
     caught_up: bool,
@@ -37,7 +37,7 @@ pub struct Steps {
     detail: Option<String>,
 }
 
-pub enum Overlay {
+pub(crate) enum Overlay {
     Progress {
         steps: Steps,
     },
@@ -64,7 +64,7 @@ pub enum Overlay {
 }
 
 /// A lost connection being retried reads differently from one that needs the user.
-pub fn with_reconnect(overlay: Option<Overlay>, attempt: Option<u32>) -> Option<Overlay> {
+pub(crate) fn with_reconnect(overlay: Option<Overlay>, attempt: Option<u32>) -> Option<Overlay> {
     match (overlay, attempt) {
         (Some(Overlay::Closed(_) | Overlay::Failed { .. }), Some(attempt)) => {
             Some(Overlay::Reconnecting { attempt })
@@ -87,7 +87,7 @@ fn step_name(step: ConnectStep) -> &'static str {
 }
 
 /// The step the session reached last, among all of them.
-pub fn steps_of(session: Option<&SessionInfo>) -> Steps {
+pub(crate) fn steps_of(session: Option<&SessionInfo>) -> Steps {
     let Some((info, (_, progress))) =
         session.and_then(|info| info.step.as_ref().map(|step| (info, step)))
     else {
@@ -125,7 +125,7 @@ pub fn steps_of(session: Option<&SessionInfo>) -> Steps {
 }
 
 /// The last step of a terminal, which the session knows nothing about: it comes after all of its.
-pub fn shell_steps(session: Option<&SessionInfo>) -> Steps {
+pub(crate) fn shell_steps(session: Option<&SessionInfo>) -> Steps {
     let rows = steps_of(session).rows;
     Steps {
         position: rows.len() as u32,
@@ -137,7 +137,7 @@ pub fn shell_steps(session: Option<&SessionInfo>) -> Steps {
 }
 
 /// `None` when the session is connected.
-pub fn overlay_for(session: Option<&SessionInfo>) -> Option<Overlay> {
+pub(crate) fn overlay_for(session: Option<&SessionInfo>) -> Option<Overlay> {
     let Some(info) = session else {
         return Some(Overlay::Closed("Not connected".into()));
     };
@@ -161,16 +161,13 @@ pub fn overlay_for(session: Option<&SessionInfo>) -> Option<Overlay> {
 }
 
 /// The two lines at the top of the card.
-pub fn heading(host: &HostConfig) -> (String, String) {
+pub(crate) fn heading(host: &HostConfig) -> (String, String) {
     let port = if host.port == 22 {
         String::new()
     } else {
         format!(":{}", host.port)
     };
-    (
-        host.alias.clone(),
-        format!("{}@{}{port}", host.user, host.hostname),
-    )
+    (host.alias.clone(), format!("{}{port}", host.target()))
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -182,15 +179,15 @@ enum Activity {
     Failed,
 }
 
-/// One segment per step. `extra` is a step the session does not count, as the shell of a terminal.
+/// One segment per step. `shell_step` adds one the session does not count: the shell of a terminal.
 fn segments(
     steps: &Steps,
-    extra: u32,
+    shell_step: bool,
     activity: Activity,
     owner: EntityId,
     theme: &Theme,
 ) -> Option<Div> {
-    let total = steps.rows.len() as u32 + extra;
+    let total = steps.rows.len() as u32 + u32::from(shell_step);
     if total == 0 {
         return None;
     }
@@ -244,16 +241,19 @@ fn step_line(
                     .text_color(theme.text)
                     .child(text),
             )
-            .children(detail.map(|detail| {
-                div()
-                    .flex_shrink_0()
-                    .text_size(ui_px(11.))
-                    .text_color(theme.text_muted)
-                    .child(detail)
-            })),
+            .children(detail.map(|detail| step_detail(detail, theme))),
         ("connect-step", element_key(owner, u64::from(key))),
         STEP_TEXT,
     )
+}
+
+/// What a step adds to its line, such as the address it reached, in smaller and fainter text.
+fn step_detail(detail: String, theme: &Theme) -> Div {
+    div()
+        .flex_shrink_0()
+        .text_size(ui_px(11.))
+        .text_color(theme.text_muted)
+        .child(detail)
 }
 
 /// Views that share a session keep independent animation identities.
@@ -264,13 +264,13 @@ fn element_key(owner: EntityId, part: u64) -> u64 {
 /// All the steps, ticked as the connection moves on. `waiting` replaces the text of the current one.
 fn step_list(
     steps: &Steps,
-    waiting: Option<String>,
-    extra: u32,
+    waiting: Option<&str>,
+    shell_step: bool,
     activity: Activity,
     theme: &Theme,
 ) -> Div {
     let current = steps.position;
-    let shell = (extra > 0).then(|| Row {
+    let shell = shell_step.then(|| Row {
         now: "Starting shell".to_string(),
         detail: None,
     });
@@ -312,7 +312,7 @@ fn step_list(
                 }
             };
             let text = if is_current {
-                waiting.clone().unwrap_or_else(|| row.now.clone())
+                waiting.unwrap_or(&row.now).to_string()
             } else {
                 row.now.clone()
             };
@@ -345,13 +345,7 @@ fn step_list(
                         .child(mark),
                 )
                 .child(div().flex_1().min_w_0().truncate().child(text))
-                .children(detail.map(|detail| {
-                    div()
-                        .flex_shrink_0()
-                        .text_size(ui_px(11.))
-                        .text_color(theme.text_muted)
-                        .child(detail)
-                }))
+                .children(detail.map(|detail| step_detail(detail, theme)))
         }))
 }
 
@@ -359,16 +353,16 @@ fn step_list(
 fn progress_view(
     steps: Steps,
     waiting: Option<String>,
-    extra: u32,
+    shell_step: bool,
     activity: Activity,
     docked: bool,
     owner: EntityId,
     theme: &Theme,
 ) -> Div {
     if !docked && !steps.rows.is_empty() {
-        return step_list(&steps, waiting, extra, activity, theme);
+        return step_list(&steps, waiting.as_deref(), shell_step, activity, theme);
     }
-    let bar = segments(&steps, extra, activity, owner, theme);
+    let bar = segments(&steps, shell_step, activity, owner, theme);
     let view = div().flex().flex_col().gap(px(10.)).children(bar);
     if activity == Activity::Failed {
         return view;
@@ -382,7 +376,7 @@ fn progress_view(
 
 /// `docked`: the view has something worth reading, so the card becomes a strip along the bottom of
 /// it and leaves the rest visible. Otherwise it sits in the middle of an empty view.
-pub struct Surface {
+pub(crate) struct Surface {
     pub heading: Option<(String, String)>,
     pub docked: bool,
     pub reconnecting: bool,
@@ -390,11 +384,11 @@ pub struct Surface {
     /// A click on it gives the view the focus, which moves on to the prompt.
     pub focus: FocusHandle,
     /// A step after those of the session: the terminal's shell.
-    pub extra_steps: u32,
+    pub shell_step: bool,
     pub owner: EntityId,
 }
 
-pub fn render(
+pub(crate) fn render(
     overlay: Overlay,
     surface: Surface,
     theme: &Theme,
@@ -414,7 +408,7 @@ pub fn render(
         reconnecting,
         background,
         focus,
-        extra_steps,
+        shell_step,
         owner,
     } = surface;
     // Keep the status and its action together, above the output retained by the terminal.
@@ -434,104 +428,150 @@ pub fn render(
         _ => None,
     };
     if let Some((title, detail, reconnecting)) = banner {
-        return div()
-            .absolute()
-            .top_0()
-            .bottom_0()
-            .left_0()
-            .right_0()
-            .occlude()
-            // Over a terminal under its header, or over all the cards of a tab.
-            .map(|this| {
-                if docked {
-                    this.rounded_b(px(PANEL_INNER_RADIUS))
-                } else {
-                    this.rounded(px(PANEL_INNER_RADIUS))
-                }
-            })
-            .bg(theme.scrim)
-            .flex()
-            .items_center()
-            .justify_center()
-            .p(px(12.))
-            .font_family(ui_font())
-            .child(
-                div()
-                    .id("reconnect-banner")
-                    .occlude()
-                    // As wide as what it says: wider, the text and the button drift apart.
-                    .w(px(360.))
-                    .min_w_0()
-                    .max_w_full()
-                    .flex()
-                    .items_center()
-                    .gap(px(12.))
-                    .p(px(10.))
-                    .pr(px(12.))
-                    .rounded(px(crate::theme::RADIUS_CARD))
-                    .map(|this| {
-                        crate::panel::floating(
-                            this,
-                            theme,
-                            crate::theme::RADIUS_CARD,
-                            theme.strong_border,
-                        )
-                    })
-                    .shadow(crate::theme::float_shadow())
-                    .text_size(ui_px(13.))
-                    .text_color(theme.text)
-                    // The one color of the card: a tile for the sign, as a host has for its own.
-                    .child(
-                        div()
-                            .size(px(34.))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(crate::theme::RADIUS_CONTROL))
-                            .bg(gpui::Hsla {
-                                a: 0.13,
-                                ..theme.warning
-                            })
-                            .child(
-                                Icon::new(if reconnecting {
-                                    IconName::Refresh
-                                } else {
-                                    IconName::Warning
-                                })
-                                .size(px(16.))
-                                .color(theme.warning)
-                                .when(reconnecting, |icon| icon.spin()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(title),
-                            )
-                            .child(
-                                div()
-                                    .text_size(ui_px(12.))
-                                    .text_color(theme.text_muted)
-                                    .child(detail),
-                            ),
-                    )
-                    .child(
-                        // Outlined: a fill in the accent beside the sign would be a second
-                        // color shouting on a card this small.
-                        Button::new("retry")
-                            .label(if reconnecting { "Try now" } else { "Reconnect" })
-                            .style(ButtonStyle::Filled)
-                            .on_click(on_retry),
-                    ),
-            )
+        return reconnect_banner(title, detail, reconnecting, docked, theme, on_retry);
+    }
+    let content = overlay_content(overlay, shell_step, docked, owner, theme, cx, on_retry);
+    let root = div()
+        .absolute()
+        .bottom_0()
+        .left_0()
+        .right_0()
+        .occlude()
+        .bg(background)
+        .font_family(ui_font())
+        .text_size(ui_px(12.))
+        .on_mouse_down(MouseButton::Left, move |_, window, _| window.focus(&focus));
+    if docked {
+        return root
+            .rounded_b(px(PANEL_INNER_RADIUS))
+            .border_t_1()
+            .border_color(theme.border)
+            .px(px(12.))
+            .py(px(10.))
+            .child(content)
             .into_any_element();
     }
+    let card = connect_card(heading, reconnecting, content, theme);
+    // All of the card it covers, or all the cards of a tab: round at the top too.
+    root.top_0()
+        .rounded(px(PANEL_INNER_RADIUS))
+        .p(px(8.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(motion::enter(card, ("connect-card", owner.as_u64()), CARD))
+        .into_any_element()
+}
+
+/// The card while reconnecting, or once disconnected, over the whole view.
+fn reconnect_banner(
+    title: &'static str,
+    detail: String,
+    reconnecting: bool,
+    docked: bool,
+    theme: &Theme,
+    on_retry: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .left_0()
+        .right_0()
+        .occlude()
+        // Over a terminal under its header, or over all the cards of a tab.
+        .map(|this| {
+            if docked {
+                this.rounded_b(px(PANEL_INNER_RADIUS))
+            } else {
+                this.rounded(px(PANEL_INNER_RADIUS))
+            }
+        })
+        .bg(theme.scrim)
+        .flex()
+        .items_center()
+        .justify_center()
+        .p(px(12.))
+        .font_family(ui_font())
+        .child(
+            div()
+                .id("reconnect-banner")
+                .occlude()
+                // As wide as what it says: wider, the text and the button drift apart.
+                .w(px(360.))
+                .min_w_0()
+                .max_w_full()
+                .flex()
+                .items_center()
+                .gap(px(12.))
+                .p(px(10.))
+                .pr(px(12.))
+                .map(|this| crate::panel::floating_card(this, theme, theme.strong_border))
+                .text_size(ui_px(13.))
+                .text_color(theme.text)
+                // The one color of the card: a tile for the sign, as a host has for its own.
+                .child(
+                    div()
+                        .size(px(34.))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(crate::theme::RADIUS_CONTROL))
+                        .bg(gpui::Hsla {
+                            a: 0.13,
+                            ..theme.warning
+                        })
+                        .child(
+                            Icon::new(if reconnecting {
+                                IconName::Refresh
+                            } else {
+                                IconName::Warning
+                            })
+                            .size(px(16.))
+                            .color(theme.warning)
+                            .when(reconnecting, Icon::spin),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .truncate()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .text_size(ui_px(12.))
+                                .text_color(theme.text_muted)
+                                .child(detail),
+                        ),
+                )
+                .child(
+                    // Outlined: a fill in the accent beside the sign would be a second
+                    // color shouting on a card this small.
+                    Button::new("retry")
+                        .label(if reconnecting { "Try now" } else { "Reconnect" })
+                        .style(ButtonStyle::Filled)
+                        .on_click(on_retry),
+                ),
+        )
+        .into_any_element()
+}
+
+/// The steps, the prompt or the failure, with the action they need.
+fn overlay_content(
+    overlay: Overlay,
+    shell_step: bool,
+    docked: bool,
+    owner: EntityId,
+    theme: &Theme,
+    cx: &App,
+    on_retry: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Div {
     let retry = |label: &str| {
         div().flex().justify_end().child(
             Button::new("retry")
@@ -541,10 +581,10 @@ pub fn render(
     };
     let view = |steps, waiting: Option<&str>, activity| {
         let waiting = waiting.map(str::to_string);
-        progress_view(steps, waiting, extra_steps, activity, docked, owner, theme)
+        progress_view(steps, waiting, shell_step, activity, docked, owner, theme)
     };
     let content = div().flex().flex_col().gap(px(10.));
-    let content = match overlay {
+    match overlay {
         Overlay::Progress { steps } | Overlay::StartingShell { steps } => {
             content.child(view(steps, None, Activity::Working))
         }
@@ -586,28 +626,17 @@ pub fn render(
             .child(div().text_color(theme.text_muted).child(text))
             .child(retry("Reconnect")),
         Overlay::Reconnecting { .. } => content,
-    };
-    let root = div()
-        .absolute()
-        .bottom_0()
-        .left_0()
-        .right_0()
-        .occlude()
-        .bg(background)
-        .font_family(ui_font())
-        .text_size(ui_px(12.))
-        .on_mouse_down(MouseButton::Left, move |_, window, _| window.focus(&focus));
-    if docked {
-        return root
-            .rounded_b(px(PANEL_INNER_RADIUS))
-            .border_t_1()
-            .border_color(theme.border)
-            .px(px(12.))
-            .py(px(10.))
-            .child(content)
-            .into_any_element();
     }
-    let card = div()
+}
+
+/// The card in the middle of an empty view: what is connecting, then the content.
+fn connect_card(
+    heading: Option<(String, String)>,
+    reconnecting: bool,
+    content: Div,
+    theme: &Theme,
+) -> Div {
+    div()
         .p(px(20.))
         .rounded(px(crate::theme::RADIUS_CARD))
         .map(|this| {
@@ -641,14 +670,5 @@ pub fn render(
                         .child(login),
                 )
         }))
-        .child(content);
-    // All of the card it covers, or all the cards of a tab: round at the top too.
-    root.top_0()
-        .rounded(px(PANEL_INNER_RADIUS))
-        .p(px(8.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(motion::enter(card, ("connect-card", owner.as_u64()), CARD))
-        .into_any_element()
+        .child(content)
 }

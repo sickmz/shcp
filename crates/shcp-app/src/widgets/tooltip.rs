@@ -4,7 +4,7 @@ use crate::theme::ActiveTheme as _;
 use gpui::prelude::*;
 use gpui::{AnyView, App, Context, SharedString, Window, div, px};
 
-pub struct Tooltip {
+struct Tooltip {
     text: SharedString,
     keys: Vec<SharedString>,
 }
@@ -83,7 +83,7 @@ impl Render for Tooltip {
     }
 }
 
-pub fn tooltip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> AnyView {
+pub(crate) fn tooltip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> AnyView {
     let text = text.into();
     move |_, cx| {
         let shown = crate::actions::with_current_keys(&text, cx);

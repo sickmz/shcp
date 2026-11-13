@@ -23,20 +23,22 @@ pub(crate) fn indexed(palette: &Palette, index: usize) -> Rgb {
 pub(crate) fn resolve(palette: &Palette, colors: &Colors, color: Color) -> Rgb {
     match color {
         Color::Spec(rgb) => Rgb(rgb.r, rgb.g, rgb.b),
-        Color::Indexed(i) => colors[i as usize]
-            .map(|c| Rgb(c.r, c.g, c.b))
-            .unwrap_or_else(|| indexed(palette, i as usize)),
-        Color::Named(n) => colors[n as usize]
-            .map(|c| Rgb(c.r, c.g, c.b))
-            .unwrap_or_else(|| {
-                let i = n as usize;
-                // Bright/dim foreground variants fall back to the palette foreground.
-                if i >= NamedColor::DimBlack as usize && i <= NamedColor::DimWhite as usize {
-                    let Rgb(r, g, b) = palette.ansi[i - NamedColor::DimBlack as usize];
-                    Rgb(r / 2, g / 2, b / 2)
-                } else {
-                    indexed(palette, i)
-                }
-            }),
+        Color::Indexed(i) => {
+            colors[i as usize].map_or_else(|| indexed(palette, i as usize), |c| Rgb(c.r, c.g, c.b))
+        }
+        Color::Named(n) => colors[n as usize].map_or_else(
+            || named_fallback(palette, n as usize),
+            |c| Rgb(c.r, c.g, c.b),
+        ),
+    }
+}
+
+fn named_fallback(palette: &Palette, i: usize) -> Rgb {
+    // Bright/dim foreground variants fall back to the palette foreground.
+    if i >= NamedColor::DimBlack as usize && i <= NamedColor::DimWhite as usize {
+        let Rgb(r, g, b) = palette.ansi[i - NamedColor::DimBlack as usize];
+        Rgb(r / 2, g / 2, b / 2)
+    } else {
+        indexed(palette, i)
     }
 }

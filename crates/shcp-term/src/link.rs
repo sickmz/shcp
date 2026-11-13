@@ -3,7 +3,10 @@
 //! Only web addresses open: a server decides what an OSC 8 link points to, and it must not be
 //! able to start a local program through `file:` or another scheme handler.
 use super::*;
-use alacritty_terminal::{index::Boundary, term::cell::Flags};
+use alacritty_terminal::{
+    index::Boundary,
+    term::cell::{Flags, Hyperlink},
+};
 use std::ops::Range;
 
 fn is_web(url: &str) -> bool {
@@ -72,12 +75,33 @@ fn logical_line(term: &Term<Listener>, first: Point, last: Point) -> Vec<(Point,
     }
 }
 
+/// The cells around `index` that carry the same hyperlink as it: same target, same id.
+fn hyperlink_run(
+    term: &Term<Listener>,
+    cells: &[(Point, char)],
+    index: usize,
+    link: &Hyperlink,
+) -> Range<usize> {
+    let same = |p: Point| {
+        term.grid()[p]
+            .hyperlink()
+            .is_some_and(|other| other.uri() == link.uri() && other.id() == link.id())
+    };
+    let mut start = index;
+    while start > 0 && same(cells[start - 1].0) {
+        start -= 1;
+    }
+    let mut end = index + 1;
+    while end < cells.len() && same(cells[end].0) {
+        end += 1;
+    }
+    start..end
+}
+
 /// Where the web links on screen are, to mark them.
 pub(crate) fn visible_links(term: &Term<Listener>) -> Vec<(GridPoint, GridPoint)> {
-    let offset = term.grid().display_offset() as i32;
-    let rows = term.screen_lines() as i32;
-    let cols = term.columns() as u16;
-    let (top, bottom) = (Line(-offset), Line(rows - 1 - offset));
+    let screen = Screen::of(term);
+    let (top, bottom) = screen.lines();
     let mut links = Vec::new();
     let mut line = top;
     while line <= bottom {
@@ -92,27 +116,18 @@ pub(crate) fn visible_links(term: &Term<Listener>) -> Vec<(GridPoint, GridPoint)
                 index += 1;
                 continue;
             };
-            let mut end = index + 1;
-            while end < cells.len()
-                && term.grid()[cells[end].0]
-                    .hyperlink()
-                    .is_some_and(|other| other.uri() == link.uri() && other.id() == link.id())
-            {
-                end += 1;
-            }
+            // The cell before is not part of it: a run ends where another link starts.
+            let run = hyperlink_run(term, &cells, index, &link);
+            index = run.end;
             if is_web(link.uri()) {
-                ranges.push(index..end);
+                ranges.push(run);
             }
-            index = end;
         }
         for range in ranges {
             let (start, end) = (cells[range.start].0, cells[range.end - 1].0);
             // The rest of a wrapped line can be off screen.
             if end.line >= top && start.line <= bottom {
-                links.push((
-                    search::visible_point(start, offset, rows, cols),
-                    search::visible_point(end, offset, rows, cols),
-                ));
+                links.push((screen.point(start), screen.point(end)));
             }
         }
         line = last.line + 1;
@@ -149,20 +164,10 @@ impl TerminalHandle {
         let index = cells.iter().rposition(|(p, _)| *p <= at)?;
         let hyperlink = term.grid()[cells[index].0].hyperlink();
         let (range, url) = if let Some(link) = hyperlink {
-            let same = |p: Point| {
-                term.grid()[p]
-                    .hyperlink()
-                    .is_some_and(|other| other.uri() == link.uri() && other.id() == link.id())
-            };
-            let mut start = index;
-            while start > 0 && same(cells[start - 1].0) {
-                start -= 1;
-            }
-            let mut end = index + 1;
-            while end < cells.len() && same(cells[end].0) {
-                end += 1;
-            }
-            (start..end, link.uri().to_string())
+            (
+                hyperlink_run(term, &cells, index, &link),
+                link.uri().to_string(),
+            )
         } else {
             let text: Vec<char> = cells.iter().map(|(_, c)| *c).collect();
             let range = find_url(&text, index)?;
@@ -172,13 +177,11 @@ impl TerminalHandle {
         if !is_web(&url) {
             return None;
         }
-        let offset = term.grid().display_offset() as i32;
-        let rows = term.screen_lines() as i32;
-        let cols = term.columns() as u16;
+        let screen = Screen::of(term);
         Some(TerminalLink {
             url,
-            start: search::visible_point(cells[range.start].0, offset, rows, cols),
-            end: search::visible_point(cells[range.end - 1].0, offset, rows, cols),
+            start: screen.point(cells[range.start].0),
+            end: screen.point(cells[range.end - 1].0),
         })
     }
 }
@@ -193,10 +196,7 @@ mod tests {
     }
 
     fn terminal(cols: u16) -> TerminalHandle {
-        let notify = Arc::new(|_| {});
-        let (terminal, _input) =
-            TerminalHandle::new(TerminalId(1), cols, 5, 100, Palette::default(), notify);
-        terminal
+        test_terminal(cols, 5)
     }
 
     #[test]

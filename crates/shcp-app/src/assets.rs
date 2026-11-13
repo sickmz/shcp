@@ -4,7 +4,7 @@ use anyhow::Result;
 use gpui::{AssetSource, SharedString};
 use std::borrow::Cow;
 
-pub struct Assets;
+pub(crate) struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {

@@ -69,8 +69,10 @@ impl TerminalHandle {
             .search
             .as_ref()
             .and_then(|search| search.current.as_ref())
-            .map(|found| *found.end())
-            .unwrap_or_else(|| Point::new(state.term.bottommost_line(), state.term.last_column()));
+            .map_or_else(
+                || Point::new(state.term.bottommost_line(), state.term.last_column()),
+                |found| *found.end(),
+            );
         state.search = Some(Search {
             regex,
             current: None,
@@ -119,38 +121,19 @@ pub(crate) fn visible_hits(state: &mut State) -> Vec<SearchHit> {
     let Some(search) = search else {
         return Vec::new();
     };
-    let offset = term.grid().display_offset() as i32;
-    let rows = term.screen_lines() as i32;
-    let cols = term.columns() as u16;
-    let start = Point::new(Line(-offset), Column(0));
-    let end = Point::new(Line(rows - 1 - offset), term.last_column());
+    let screen = Screen::of(term);
+    let (top, bottom) = screen.lines();
+    let start = Point::new(top, Column(0));
+    let end = Point::new(bottom, term.last_column());
     let current = search.current.clone();
     let hits: Vec<_> = RegexIter::new(start, end, Direction::Right, term, &mut search.regex)
         .map(|found| SearchHit {
-            start: visible_point(*found.start(), offset, rows, cols),
-            end: visible_point(*found.end(), offset, rows, cols),
+            start: screen.point(*found.start()),
+            end: screen.point(*found.end()),
             current: current.as_ref() == Some(&found),
         })
         .collect();
     hits
-}
-
-/// Clamped to the screen, for what starts or ends off it.
-pub(crate) fn visible_point(point: Point, offset: i32, rows: i32, cols: u16) -> GridPoint {
-    let row = point.line.0 + offset;
-    if row < 0 {
-        GridPoint { row: 0, col: 0 }
-    } else if row >= rows {
-        GridPoint {
-            row: (rows - 1) as u16,
-            col: cols - 1,
-        }
-    } else {
-        GridPoint {
-            row: row as u16,
-            col: (point.column.0 as u16).min(cols - 1),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -158,10 +141,7 @@ mod tests {
     use super::*;
 
     fn terminal() -> TerminalHandle {
-        let notify = Arc::new(|_| {});
-        let (terminal, _input) =
-            TerminalHandle::new(TerminalId(1), 40, 5, 100, Palette::default(), notify);
-        terminal
+        test_terminal(40, 5)
     }
 
     fn lines(terminal: &TerminalHandle, count: usize) {
@@ -175,8 +155,8 @@ mod tests {
         let terminal = terminal();
         lines(&terminal, 50);
         assert!(terminal.search("line 3\u{20}"));
+        assert!(terminal.scroll_position().0 > 0);
         let snapshot = terminal.snapshot();
-        assert!(snapshot.display_offset > 0);
         let hit = snapshot.search_hits.iter().find(|h| h.current).unwrap();
         assert_eq!(hit.end.col - hit.start.col, 6);
     }

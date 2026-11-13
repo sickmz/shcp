@@ -1,12 +1,13 @@
-mod agent;
+pub(crate) mod agent;
 mod pem;
 use crate::{
     Event, HostConfig, NoticeLevel, SessionState, config,
     host_key::Handler,
     secrets,
-    session::{Context as SessionContext, SecretAnswer},
+    session::{Context as SessionContext, PromptKind, SecretAnswer},
 };
 use anyhow::{Context, Result, bail};
+use async_channel::Receiver;
 use russh::{
     MethodKind, MethodSet,
     client::{self, AuthResult, KeyboardInteractiveAuthResponse},
@@ -21,24 +22,24 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+/// The text of a key file, read once for every passphrase tried on it.
+async fn read_key(path: &Path) -> Result<Zeroizing<String>, keys::Error> {
+    Ok(Zeroizing::new(tokio::fs::read_to_string(path).await?))
+}
 async fn load(
-    path: &Path,
+    text: &Zeroizing<String>,
     passphrase: Option<Zeroizing<String>>,
 ) -> Result<PrivateKey, keys::Error> {
-    let path = path.to_owned();
+    let text = text.clone();
     tokio::task::spawn_blocking(move || {
-        let password = passphrase.as_deref().map(|s| s.as_str());
-        match keys::load_secret_key(&path, password) {
-            Ok(key) => Ok(key),
-            Err(error) => {
-                let text = Zeroizing::new(std::fs::read_to_string(&path)?);
-                if pem::encrypted(&text) {
-                    pem::load(&text, password)
-                } else {
-                    Err(error)
-                }
+        let password = passphrase.as_deref().map(String::as_str);
+        keys::decode_secret_key(&text, password).or_else(|error| {
+            if pem::encrypted(&text) {
+                pem::load(&text, password)
+            } else {
+                Err(error)
             }
-        }
+        })
     })
     .await
     .map_err(|_| keys::Error::CouldNotReadKey)?
@@ -67,11 +68,10 @@ async fn save_secret(account: String, secret: Zeroizing<String>, ctx: &SessionCo
     );
     false
 }
-pub(crate) use agent::stream as agent_stream;
 
 /// What an attempt came to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Outcome {
+enum Outcome {
     Success,
     /// Accepted, but the server wants another method as well.
     Partial,
@@ -108,16 +108,25 @@ impl Methods {
         }
     }
 }
-/// Asks the user something that is answered through the password channel.
-async fn ask(ctx: &SessionContext, state: SessionState) -> Result<Option<SecretAnswer>> {
-    ctx.prompts.kind.store(3, Ordering::SeqCst);
+/// Asks the user for a secret, which comes through `answers`.
+async fn ask(
+    ctx: &SessionContext,
+    kind: PromptKind,
+    answers: &Receiver<Option<SecretAnswer>>,
+    state: SessionState,
+) -> Result<Option<SecretAnswer>> {
+    ctx.prompts.begin(kind);
     ctx.state(state);
     let answer = tokio::select! {
         _ = ctx.cancel.cancelled() => bail!("Connection cancelled"),
-        answer = ctx.prompts.password_rx.recv() => answer?,
+        answer = answers.recv() => answer?,
     };
-    ctx.prompts.kind.store(0, Ordering::SeqCst);
+    ctx.prompts.end();
     Ok(answer)
+}
+/// Asks the user something that is answered through the password channel.
+async fn ask_password(ctx: &SessionContext, state: SessionState) -> Result<Option<SecretAnswer>> {
+    ask(ctx, PromptKind::Password, &ctx.prompts.password_rx, state).await
 }
 /// Who a password is for, as the prompt says it. The user alone when it is the host asked for.
 fn login_name(ctx: &SessionContext, host: &HostConfig) -> String {
@@ -192,7 +201,7 @@ async fn public_key(
     let mut paths = host.identity_files.clone();
     if paths.is_empty() {
         let ssh = config::home()?.join(".ssh");
-        for name in ["id_ed25519", "id_ecdsa", "id_rsa"] {
+        for name in crate::ssh_keys::USUAL_KEYS {
             let path = ssh.join(name);
             if path.exists() {
                 paths.push(path);
@@ -219,13 +228,15 @@ async fn public_key(
         if !methods.allows(MethodKind::PublicKey) {
             break;
         }
-        let mut key = load(&path, None).await;
+        let (text, mut key) = match read_key(&path).await {
+            Ok(text) => {
+                let key = load(&text, None).await;
+                (text, key)
+            }
+            Err(error) => (Zeroizing::default(), Err(error)),
+        };
         // PEM and OpenSSH formats report encryption through either error variant.
-        let pem_encrypted = key.is_err()
-            && tokio::fs::read_to_string(&path)
-                .await
-                .is_ok_and(|text| pem::encrypted(&text));
-        let encrypted = pem_encrypted
+        let encrypted = (key.is_err() && pem::encrypted(&text))
             || matches!(
                 &key,
                 Err(keys::Error::KeyIsEncrypted)
@@ -233,7 +244,7 @@ async fn public_key(
             );
         let account = secrets::passphrase_account(&path);
         if encrypted && let Some(saved) = saved_secret(account.clone()).await {
-            key = load(&path, Some(saved)).await;
+            key = load(&text, Some(saved)).await;
             if key.is_err() {
                 // The key's passphrase changed: the old one is of no use any more.
                 forget_secret(account.clone()).await;
@@ -252,17 +263,21 @@ async fn public_key(
         }
         if encrypted && key.is_err() {
             loop {
-                ctx.prompts.kind.store(2, Ordering::SeqCst);
-                ctx.state(SessionState::AwaitingPassphrase {
+                let state = SessionState::AwaitingPassphrase {
                     key_path: path.clone(),
-                });
-                let answer = tokio::select! { _ = ctx.cancel.cancelled() => bail!("Connection cancelled"), answer = ctx.prompts.pass_rx.recv() => answer? };
-                ctx.prompts.kind.store(0, Ordering::SeqCst);
+                };
+                let answer = ask(
+                    ctx,
+                    PromptKind::Passphrase,
+                    &ctx.prompts.passphrase_rx,
+                    state,
+                )
+                .await?;
                 let Some(answer) = answer else {
                     break;
                 };
                 let remembered = answer.remember.then(|| answer.secret.clone());
-                key = load(&path, Some(answer.secret)).await;
+                key = load(&text, Some(answer.secret)).await;
                 if key.is_ok() {
                     if let Some(passphrase) = remembered
                         && save_secret(account.clone(), passphrase, ctx).await
@@ -293,15 +308,7 @@ async fn public_key(
             crate::ConnectStep::Authenticating,
             Some(format!("key {name}")),
         );
-        let hash = if key.algorithm().is_rsa() {
-            handle
-                .best_supported_rsa_hash()
-                .await?
-                .flatten()
-                .or(Some(keys::HashAlg::Sha512))
-        } else {
-            None
-        };
+        let hash = rsa_hash(handle, key.algorithm()).await?;
         let key = PrivateKeyWithHashAlg::new(Arc::new(key), hash);
         let outcome = methods.note(handle.authenticate_publickey(&host.user, key).await?);
         if outcome != Outcome::Rejected {
@@ -309,6 +316,21 @@ async fn public_key(
         }
     }
     Ok(Outcome::Rejected)
+}
+/// The hash an RSA key signs with: the best the server takes, SHA-512 when it does not say.
+/// Other keys need none.
+async fn rsa_hash(
+    handle: &client::Handle<Handler>,
+    algorithm: keys::Algorithm,
+) -> Result<Option<keys::HashAlg>> {
+    if !algorithm.is_rsa() {
+        return Ok(None);
+    }
+    Ok(handle
+        .best_supported_rsa_hash()
+        .await?
+        .flatten()
+        .or(Some(keys::HashAlg::Sha512)))
 }
 /// The methods that ask the user, and the password they may share.
 struct Logins<'a> {
@@ -363,7 +385,7 @@ impl Logins<'_> {
                     let state = SessionState::AwaitingPassword {
                         login: login_name(self.ctx, self.host),
                     };
-                    ask(self.ctx, state)
+                    ask_password(self.ctx, state)
                         .await?
                         .context("Password authentication cancelled")?
                 }
@@ -402,29 +424,15 @@ impl Logins<'_> {
             .authenticate_keyboard_interactive_start(self.host.user.as_str(), None)
             .await?;
         loop {
-            match reply {
-                KeyboardInteractiveAuthResponse::Success => {
-                    if let Some(secret) = remember {
-                        self.remember_password(secret).await;
-                    }
-                    return Ok(Outcome::Success);
-                }
+            let outcome = match reply {
+                KeyboardInteractiveAuthResponse::Success => Outcome::Success,
                 KeyboardInteractiveAuthResponse::Failure {
                     remaining_methods,
                     partial_success,
-                } => {
-                    methods.0 = remaining_methods;
-                    if partial_success {
-                        if let Some(secret) = remember {
-                            self.remember_password(secret).await;
-                        }
-                        return Ok(Outcome::Partial);
-                    }
-                    if used_saved {
-                        self.forget_password(saved).await;
-                    }
-                    return Ok(Outcome::Rejected);
-                }
+                } => methods.note(AuthResult::Failure {
+                    remaining_methods,
+                    partial_success,
+                }),
                 KeyboardInteractiveAuthResponse::InfoRequest {
                     instructions,
                     prompts,
@@ -452,7 +460,7 @@ impl Logins<'_> {
                             echo: prompt.echo,
                             can_remember: is_password,
                         };
-                        let answer = ask(self.ctx, state)
+                        let answer = ask_password(self.ctx, state)
                             .await?
                             .context("Keyboard-interactive authentication cancelled")?;
                         if answer.remember && is_password {
@@ -468,8 +476,17 @@ impl Logins<'_> {
                     reply = handle
                         .authenticate_keyboard_interactive_respond(responses)
                         .await?;
+                    continue;
                 }
+            };
+            if outcome == Outcome::Rejected {
+                if used_saved {
+                    self.forget_password(saved).await;
+                }
+            } else if let Some(secret) = remember {
+                self.remember_password(secret).await;
             }
+            return Ok(outcome);
         }
     }
 }

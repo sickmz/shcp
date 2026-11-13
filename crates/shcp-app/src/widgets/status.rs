@@ -6,7 +6,7 @@ use gpui::{AnyElement, Div, Hsla, SharedString, div, px};
 use shcp_core::SessionState;
 
 /// Filled when something is up, a ring when nothing is, a spinner while connecting.
-pub fn status_dot(theme: &Theme, state: Option<&SessionState>) -> AnyElement {
+pub(crate) fn status_dot(theme: &Theme, state: Option<&SessionState>) -> AnyElement {
     let dot = div().size(px(7.)).flex_none().rounded_full();
     match state {
         // Green in any accent: it says the connection is up, not what the user picked.
@@ -25,7 +25,7 @@ pub fn status_dot(theme: &Theme, state: Option<&SessionState>) -> AnyElement {
     }
 }
 
-pub fn badge(text: impl Into<SharedString>, color: Hsla) -> Div {
+pub(crate) fn badge(text: impl Into<SharedString>, color: Hsla) -> Div {
     div()
         .h(px(18.))
         .px(px(6.))

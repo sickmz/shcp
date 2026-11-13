@@ -1,10 +1,8 @@
 //! Settings dialog: categories on the left, every change applied and saved immediately.
-#[path = "settings_hosts.rs"]
 mod hosts;
 use super::theme_browser::{ThemeBrowser, ThemeBrowserEvent};
 use super::{
-    ModalLayer, ModalView,
-    confirm::ConfirmModal,
+    Dirty, ModalLayer, ModalView, card_frame, dirty_since_now, discard_confirm,
     host_commands::HostCommandsModal,
     host_editor::HostEditor,
     host_settings::{HostPage, HostSettingsModal},
@@ -15,10 +13,11 @@ use crate::state::AppState;
 use crate::theme::icon_theme::{IconTheme, IconThemeCatalog};
 use crate::theme::open_vsx::ThemeKind;
 use crate::theme::{ActiveTheme as _, Theme, ThemeCatalog, ui_px};
-use crate::updater::{UpdateStatus, current_version, open_releases_page};
+use crate::updater::{self, UpdateStatus, open_releases_page};
 use crate::widgets::button::{Button, ButtonStyle};
+use crate::widgets::context_menu::list_panel;
 use crate::widgets::icon::{Icon, IconName};
-use crate::widgets::text_input::{TextInput, TextInputEvent};
+use crate::widgets::text_input::{TextInput, TextInputEvent, after_typing};
 use crate::widgets::tooltip::tooltip;
 use gpui::prelude::*;
 use gpui::{
@@ -27,7 +26,10 @@ use gpui::{
     anchored, deferred, div, img, px, relative,
 };
 use shcp_core::{Accent, CursorStyle, Density, HostId, KnownHost, NoticeLevel, Settings};
-use std::{path::PathBuf, rc::Rc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    rc::Rc,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -93,7 +95,7 @@ struct HostDetail {
     view: AnyView,
     focus: FocusHandle,
     key_setup: Option<Entity<KeySetupModal>>,
-    dirty: Box<dyn Fn(&App) -> bool>,
+    dirty: Dirty,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -103,7 +105,7 @@ enum Destination {
     Category(Page),
 }
 
-pub struct SettingsModal {
+pub(crate) struct SettingsModal {
     state: Entity<AppState>,
     modals: Entity<ModalLayer>,
     host_detail: Option<HostDetail>,
@@ -153,30 +155,24 @@ impl Focusable for SettingsModal {
 }
 
 impl SettingsModal {
-    pub fn new(
+    pub(crate) fn new(
         state: Entity<AppState>,
         modals: Entity<ModalLayer>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let search = cx.new(|cx| TextInput::new("Search settings", false, cx));
+        let search = cx.new(|cx| TextInput::new("Search settings", cx));
         let installed_fonts = cx.text_system().all_font_names();
         let editor_path = state.read(cx).settings.editor.clone();
-        let editor = cx.new(|cx| {
-            let mut input = TextInput::new("VS Code or Notepad", false, cx);
-            input.set_text(&editor_path, cx);
-            input
-        });
+        let editor = cx.new(|cx| TextInput::new("VS Code or Notepad", cx).with_text(&editor_path));
         let skip_names = state.read(cx).settings.search_skip_folders.join(", ");
-        let skip_folders = cx.new(|cx| {
-            let mut input = TextInput::new("node_modules, .git", false, cx);
-            input.set_text(&skip_names, cx);
-            input
-        });
-        let themes_dir = state.read(cx).engine.paths().config_dir.join("themes");
+        let skip_folders =
+            cx.new(|cx| TextInput::new("node_modules, .git", cx).with_text(&skip_names));
+        let config_dir = state.read(cx).engine.paths().config_dir;
+        let themes_dir = crate::theme::themes_dir(&config_dir);
         let theme_browser =
             cx.new(|cx| ThemeBrowser::new(ThemeKind::Color, themes_dir, window, cx));
-        let icon_themes_dir = state.read(cx).engine.paths().config_dir.join("icon-themes");
+        let icon_themes_dir = crate::theme::icon_themes_dir(&config_dir);
         let icon_theme_browser =
             cx.new(|cx| ThemeBrowser::new(ThemeKind::Icon, icon_themes_dir, window, cx));
         let mut subscriptions =
@@ -479,12 +475,7 @@ impl SettingsModal {
     }
 
     fn schedule_editor_commit(&mut self, cx: &mut Context<Self>) {
-        self.editor_commit = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(500))
-                .await;
-            this.update(cx, |this, cx| this.commit_editor(cx)).ok();
-        }));
+        self.editor_commit = Some(after_typing(cx, Self::commit_editor));
     }
 
     fn commit_editor(&mut self, cx: &mut Context<Self>) {
@@ -496,13 +487,7 @@ impl SettingsModal {
     }
 
     fn schedule_skip_folders_commit(&mut self, cx: &mut Context<Self>) {
-        self.skip_folders_commit = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(500))
-                .await;
-            this.update(cx, |this, cx| this.commit_skip_folders(cx))
-                .ok();
-        }));
+        self.skip_folders_commit = Some(after_typing(cx, Self::commit_skip_folders));
     }
 
     fn commit_skip_folders(&mut self, cx: &mut Context<Self>) {
@@ -553,27 +538,11 @@ impl SettingsModal {
             let items = items(cx);
             deferred(
                 anchored().snap_to_window_with_margin(px(8.)).child(
-                    div()
-                        .id(SharedString::from(format!("{id}-list")))
-                        .occlude()
+                    list_panel(SharedString::from(format!("{id}-list")), &theme)
                         .w(px(260.))
                         .max_h(px(280.))
                         .overflow_y_scroll()
                         .mt(px(4.))
-                        .p(px(4.))
-                        .flex()
-                        .flex_col()
-                        .rounded(px(crate::theme::RADIUS_CARD))
-                        .map(|this| {
-                            crate::panel::floating(
-                                this,
-                                &theme,
-                                crate::theme::RADIUS_CARD,
-                                theme.border,
-                            )
-                        })
-                        .shadow(crate::theme::float_shadow())
-                        .text_size(ui_px(13.))
                         .text_color(theme.text)
                         // The trigger closes it by itself: closing here too would reopen it.
                         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -674,14 +643,6 @@ impl SettingsModal {
             },
             cx,
         )
-    }
-
-    fn open_path(&self, path: PathBuf, cx: &mut Context<Self>) {
-        if path.exists() {
-            cx.open_with_system(&path);
-        } else if let Some(parent) = path.parent() {
-            cx.open_with_system(parent);
-        }
     }
 
     fn open_known_hosts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -794,7 +755,7 @@ impl SettingsModal {
     }
 
     fn themes_dir(&self, cx: &App) -> PathBuf {
-        self.state.read(cx).engine.paths().config_dir.join("themes")
+        crate::theme::themes_dir(&self.state.read(cx).engine.paths().config_dir)
     }
 
     fn on_browser_event(
@@ -817,18 +778,8 @@ impl SettingsModal {
     }
 
     fn reload_themes(&mut self, cx: &mut Context<Self>) {
-        let (catalog, mut errors) = ThemeCatalog::load(&self.themes_dir(cx));
-        cx.set_global(catalog);
-        let icon_themes_dir = self
-            .state
-            .read(cx)
-            .engine
-            .paths()
-            .config_dir
-            .join("icon-themes");
-        let (icons, icon_errors) = IconThemeCatalog::load(&icon_themes_dir);
-        cx.set_global(icons);
-        errors.extend(icon_errors);
+        let config_dir = self.state.read(cx).engine.paths().config_dir;
+        let errors = crate::theme::load_catalogs(&config_dir, cx);
         let (settings, engine) = {
             let state = self.state.read(cx);
             (state.settings.clone(), state.engine.clone())
@@ -869,19 +820,15 @@ impl SettingsModal {
         );
     }
 
-    fn open_theme_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.page = Page::ThemeBrowser;
+    fn open_theme_browser(&mut self, kind: ThemeKind, window: &mut Window, cx: &mut Context<Self>) {
+        let (page, browser) = match kind {
+            ThemeKind::Color => (Page::ThemeBrowser, &self.theme_browser),
+            ThemeKind::Icon => (Page::IconThemeBrowser, &self.icon_theme_browser),
+        };
+        let browser = browser.clone();
+        self.page = page;
         self.search.update(cx, |input, cx| input.set_text("", cx));
-        self.theme_browser
-            .update(cx, |browser, cx| browser.open(window, cx));
-        cx.notify();
-    }
-
-    fn open_icon_theme_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.page = Page::IconThemeBrowser;
-        self.search.update(cx, |input, cx| input.set_text("", cx));
-        self.icon_theme_browser
-            .update(cx, |browser, cx| browser.open(window, cx));
+        browser.update(cx, |browser, cx| browser.open(window, cx));
         cx.notify();
     }
 }
@@ -895,7 +842,7 @@ fn monospace_fonts(installed: &[String], cx: &App) -> Vec<SharedString> {
         // Names of the UI font, and of the sideways variants of East Asian fonts.
         .filter(|name| !name.starts_with(['.', '@']))
         .filter(|name| {
-            let font_id = text_system.resolve_font(&gpui::font(name.to_string()));
+            let font_id = text_system.resolve_font(&gpui::font((*name).clone()));
             let width = |c| {
                 text_system
                     .advance(font_id, px(100.), c)
@@ -969,13 +916,21 @@ pub(super) fn switch(theme: &Theme, id: &'static str, on: bool, set: Setter<bool
         .h(px(18.))
         .p(px(2.))
         .flex()
-        .when(on, |s| s.justify_end())
+        .when(on, Styled::justify_end)
         .rounded_full()
         .bg(track)
         .cursor_pointer()
         .on_click(move |_, window, cx| set(!on, window, cx))
         .child(div().size(px(14.)).rounded_full().bg(knob))
         .into_any_element()
+}
+
+fn open_path(path: &Path, cx: &mut App) {
+    if path.exists() {
+        cx.open_with_system(path);
+    } else if let Some(parent) = path.parent() {
+        cx.open_with_system(parent);
+    }
 }
 
 fn segmented<T: Copy + PartialEq + 'static>(
@@ -1072,12 +1027,8 @@ fn stepper<T: Copy + 'static>(
         .into_any_element()
 }
 
-/// A choice in a dropdown, with a check when it is the current one.
-fn dropdown_item(
-    ui: &Theme,
-    id: impl Into<gpui::ElementId>,
-    current: bool,
-) -> gpui::Stateful<gpui::Div> {
+/// A row of a dropdown, which the pointer lights up.
+fn dropdown_row(ui: &Theme, id: impl Into<gpui::ElementId>) -> gpui::Stateful<gpui::Div> {
     let (hover, press) = (ui.hover, ui.active);
     div()
         .id(id)
@@ -1091,9 +1042,17 @@ fn dropdown_item(
         .cursor_pointer()
         .hover(move |style| style.bg(hover))
         .active(move |style| style.bg(press))
-        .child(div().w(px(14.)).flex_none().when(current, |this| {
-            this.child(Icon::new(IconName::Check).size(px(13.)))
-        }))
+}
+
+/// A choice in a dropdown, with a check when it is the current one.
+fn dropdown_item(
+    ui: &Theme,
+    id: impl Into<gpui::ElementId>,
+    current: bool,
+) -> gpui::Stateful<gpui::Div> {
+    dropdown_row(ui, id).child(div().w(px(14.)).flex_none().when(current, |this| {
+        this.child(Icon::new(IconName::Check).size(px(13.)))
+    }))
 }
 
 /// Something to do from a dropdown, below its choices.
@@ -1103,20 +1062,8 @@ fn dropdown_action(
     icon: IconName,
     label: &'static str,
 ) -> gpui::Stateful<gpui::Div> {
-    let (hover, press) = (ui.hover, ui.active);
-    div()
-        .id(id)
-        .flex_none()
-        .h(px(28.))
-        .px(px(8.))
-        .flex()
-        .items_center()
-        .gap(px(8.))
-        .rounded(px(crate::theme::RADIUS_CONTROL))
+    dropdown_row(ui, id)
         .text_color(ui.text_muted)
-        .cursor_pointer()
-        .hover(move |style| style.bg(hover))
-        .active(move |style| style.bg(press))
         .child(
             div()
                 .w(px(14.))
@@ -1262,365 +1209,12 @@ impl SettingsModal {
             }
         };
         match page {
-            Page::Appearance => {
-                add(
-                    "Interface font size",
-                    "",
-                    stepper(
-                        &theme,
-                        "ui-font",
-                        settings.ui_font_size.to_string(),
-                        (settings.ui_font_size - 1.).max(9.),
-                        (settings.ui_font_size + 1.).min(24.),
-                        self.setter(|s, v| s.ui_font_size = v, cx),
-                    ),
-                );
-                add(
-                    "Density",
-                    "Height of lists and bars",
-                    segmented(
-                        &theme,
-                        "density",
-                        &[
-                            (Density::Compact, "Compact"),
-                            (Density::Default, "Default"),
-                            (Density::Comfortable, "Comfortable"),
-                        ],
-                        settings.density,
-                        self.setter(|s, v| s.density = v, cx),
-                    ),
-                );
-                add(
-                    "Translucent window",
-                    "Lets the desktop show through, blurred",
-                    switch(
-                        &theme,
-                        "translucent-window",
-                        settings.translucent_window,
-                        self.setter(|s, v| s.translucent_window = v, cx),
-                    ),
-                );
-                add(
-                    "Glass effects",
-                    "Shaded surfaces and light along the edges, in the themes that have them",
-                    switch(
-                        &theme,
-                        "glass-effects",
-                        settings.glass_effects,
-                        self.setter(|s, v| s.glass_effects = v, cx),
-                    ),
-                );
-                add(
-                    "Animations",
-                    "Panels, views and the highlight glide when you use the mouse, instead of jumping",
-                    switch(
-                        &theme,
-                        "animated-selection",
-                        settings.animated_selection,
-                        self.setter(|s, v| s.animated_selection = v, cx),
-                    ),
-                );
-                add(
-                    "Sync with Windows",
-                    &format!(
-                        "{} when dark, {} when light. Picking a theme above sets the one for its mode",
-                        settings.dark_theme, settings.light_theme
-                    ),
-                    switch(
-                        &theme,
-                        "sync-theme",
-                        settings.sync_theme,
-                        self.setter(|s, v| s.sync_theme = v, cx),
-                    ),
-                );
-            }
-            Page::Terminal => {
-                let family = &settings.terminal_font_family;
-                let installed = self
-                    .installed_fonts
-                    .iter()
-                    .any(|name| name.eq_ignore_ascii_case(family));
-                let font_help = if installed {
-                    "The monospace fonts installed on this PC".to_string()
-                } else {
-                    format!("{family} is not installed, so Consolas is used instead")
-                };
-                let picker = self.font_picker(family, cx);
-                add("Font", &font_help, picker);
-                add(
-                    "Font size",
-                    "Also Ctrl+= / Ctrl+- / Ctrl+0",
-                    stepper(
-                        &theme,
-                        "term-font",
-                        settings.terminal_font_size.to_string(),
-                        (settings.terminal_font_size - 1.).max(8.),
-                        (settings.terminal_font_size + 1.).min(32.),
-                        self.setter(|s, v| s.terminal_font_size = v, cx),
-                    ),
-                );
-                add(
-                    "Cursor shape",
-                    "Auto lets the program in the terminal choose, as vim does between its modes",
-                    segmented(
-                        &theme,
-                        "cursor-style",
-                        &[
-                            (CursorStyle::Program, "Auto"),
-                            (CursorStyle::Block, "Block"),
-                            (CursorStyle::Bar, "Bar"),
-                            (CursorStyle::Underline, "Underline"),
-                        ],
-                        settings.cursor_style,
-                        self.setter(|s, v| s.cursor_style = v, cx),
-                    ),
-                );
-                add(
-                    "Cursor blink",
-                    "",
-                    switch(
-                        &theme,
-                        "cursor-blink",
-                        settings.cursor_blink,
-                        self.setter(|s, v| s.cursor_blink = v, cx),
-                    ),
-                );
-                add(
-                    "Scrollback lines",
-                    "Applies to new terminals",
-                    stepper(
-                        &theme,
-                        "scrollback",
-                        settings.scrollback_lines.to_string(),
-                        settings.scrollback_lines.saturating_sub(1000).max(1000),
-                        (settings.scrollback_lines + 1000).min(1_000_000),
-                        self.setter(|s, v| s.scrollback_lines = v, cx),
-                    ),
-                );
-                add(
-                    "Ctrl+V pastes",
-                    "Off: Ctrl+V reaches the program, as vim's visual block needs. Ctrl+Shift+V always pastes",
-                    switch(
-                        &theme,
-                        "ctrl-v-pastes",
-                        settings.ctrl_v_pastes,
-                        self.setter(|s, v| s.ctrl_v_pastes = v, cx),
-                    ),
-                );
-            }
-            Page::Connections => {
-                add(
-                    "Use SSH agent",
-                    "Keys loaded in the Windows OpenSSH agent or Pageant are tried first, so no passphrase is asked",
-                    switch(
-                        &theme,
-                        "use-agent",
-                        settings.use_ssh_agent,
-                        self.setter(|s, v| s.use_ssh_agent = v, cx),
-                    ),
-                );
-                let (keys, passwords) = (
-                    settings.saved_passphrases.len(),
-                    settings.saved_passwords.len(),
-                );
-                let state = self.state.clone();
-                add(
-                    "Saved passwords and passphrases",
-                    &if keys + passwords == 0 {
-                        "None. Tick Remember when a host or a key asks for one".to_string()
-                    } else {
-                        format!(
-                            "{passwords} passwords and {keys} passphrases, in the Windows Credential Manager"
-                        )
-                    },
-                    Button::new("forget-secrets")
-                        .label("Forget all")
-                        .disabled(keys + passwords == 0)
-                        .on_click(move |_, _, cx| {
-                            state.update(cx, |state, cx| state.forget_secrets(cx))
-                        })
-                        .into_any_element(),
-                );
-                let ssh_config = self.state.read(cx).engine.paths().ssh_config;
-                let state = self.state.clone();
-                add(
-                    "SSH config",
-                    "Hosts also come from ~/.ssh/config. Reload reads it again after you change it",
-                    div()
-                        .flex()
-                        .flex_none()
-                        .gap(px(6.))
-                        .child(
-                            Button::new("open-ssh-config")
-                                .label("Open")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_path(ssh_config.clone(), cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("reload-ssh-config")
-                                .label("Reload")
-                                .on_click(move |_, _, cx| state.read(cx).engine.reload_hosts()),
-                        )
-                        .into_any_element(),
-                );
-                add(
-                    "Trusted servers",
-                    "The server keys saved in known_hosts. Remove one whose key changed",
-                    Button::new("manage-known-hosts")
-                        .label("Manage…")
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.open_known_hosts(window, cx)),
-                        )
-                        .into_any_element(),
-                );
-                add(
-                    "Reconnect automatically",
-                    "When a connection with open tabs is lost. Terminals keep what they show and get a new shell",
-                    switch(
-                        &theme,
-                        "auto-reconnect",
-                        settings.auto_reconnect,
-                        self.setter(|s, v| s.auto_reconnect = v, cx),
-                    ),
-                );
-                add(
-                    "Reopen tabs at startup",
-                    "The tabs and split terminals of the last run connect again when shcp starts",
-                    switch(
-                        &theme,
-                        "restore-tabs",
-                        settings.restore_tabs,
-                        self.setter(|s, v| s.restore_tabs = v, cx),
-                    ),
-                );
-            }
-            Page::Forwarding => {
-                add(
-                    "Open tunnels when connecting",
-                    "Off: click a port in the sidebar to open it. Leave off if another SSH client uses the same ports. Applies from the next connection",
-                    switch(
-                        &theme,
-                        "auto-open-forwards",
-                        settings.auto_open_forwards,
-                        self.setter(|s, v| s.auto_open_forwards = v, cx),
-                    ),
-                );
-            }
-            Page::Files => {
-                add(
-                    "Show hidden files",
-                    "Names starting with a dot. Ctrl+H in the Files tab toggles it",
-                    switch(
-                        &theme,
-                        "show-hidden",
-                        settings.show_hidden_files,
-                        self.setter(|s, v| s.show_hidden_files = v, cx),
-                    ),
-                );
-                add(
-                    "Folders a search skips",
-                    "Names separated by commas. Pressing Enter in the filter does not look inside them",
-                    div()
-                        .w(px(220.))
-                        .child(self.skip_folders.clone())
-                        .into_any_element(),
-                );
-                add(
-                    "Editor for remote files",
-                    "Full path of the program. Empty: VS Code if installed, otherwise Notepad",
-                    div()
-                        .w(px(220.))
-                        .child(self.editor.clone())
-                        .into_any_element(),
-                );
-                let folder = settings.download_folder.clone();
-                add(
-                    "Download folder",
-                    &if folder.is_empty() {
-                        "Asks each time".to_string()
-                    } else {
-                        folder.clone()
-                    },
-                    div()
-                        .flex()
-                        .gap(px(4.))
-                        .when(!folder.is_empty(), |this| {
-                            this.child(
-                                Button::new("download-ask")
-                                    .label("Ask each time")
-                                    .style(ButtonStyle::Ghost)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.change(|s| s.download_folder.clear(), cx);
-                                    })),
-                            )
-                        })
-                        .child(
-                            Button::new("download-choose")
-                                .icon(IconName::Folder)
-                                .label("Choose…")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.choose_download_folder(cx);
-                                })),
-                        )
-                        .into_any_element(),
-                );
-                add(
-                    "Open transfers panel on new transfer",
-                    "Ctrl+Shift+J or the button above the terminal toggle it anytime",
-                    switch(
-                        &theme,
-                        "auto-transfers",
-                        settings.auto_open_transfers,
-                        self.setter(|s, v| s.auto_open_transfers = v, cx),
-                    ),
-                );
-                add(
-                    "Parallel transfers",
-                    "Applies from the next connection",
-                    stepper(
-                        &theme,
-                        "concurrency",
-                        settings.transfer_concurrency.to_string(),
-                        settings.transfer_concurrency.saturating_sub(1).max(1),
-                        (settings.transfer_concurrency + 1).min(16),
-                        self.setter(|s, v| s.transfer_concurrency = v, cx),
-                    ),
-                );
-                add(
-                    "Confirm before deleting",
-                    "",
-                    switch(
-                        &theme,
-                        "confirm-delete",
-                        settings.confirm_on_delete,
-                        self.setter(|s, v| s.confirm_on_delete = v, cx),
-                    ),
-                );
-            }
-            Page::Keyboard => {
-                add(
-                    "Change a shortcut",
-                    "Click its keys and press new ones. Backspace leaves it without, Esc keeps it as it is",
-                    div().into_any_element(),
-                );
-                for shortcut in SHORTCUTS {
-                    let control = self.shortcut_control(shortcut, &settings, cx);
-                    add(shortcut.label, "", control);
-                }
-                for (label, keys) in FIXED_SHORTCUTS {
-                    add(
-                        label,
-                        "",
-                        div()
-                            .font_family(crate::theme::mono_font())
-                            .text_size(ui_px(12.))
-                            .text_color(theme.text_muted)
-                            .child(keys)
-                            .into_any_element(),
-                    );
-                }
-            }
+            Page::Appearance => self.appearance_rows(&theme, &settings, &mut add, cx),
+            Page::Terminal => self.terminal_rows(&theme, &settings, &mut add, cx),
+            Page::Connections => self.connections_rows(&theme, &settings, &mut add, cx),
+            Page::Forwarding => self.forwarding_rows(&theme, &settings, &mut add, cx),
+            Page::Files => self.files_rows(&theme, &settings, &mut add, cx),
+            Page::Keyboard => self.keyboard_rows(&theme, &settings, &mut add, cx),
             Page::Hosts
             | Page::ThemeBrowser
             | Page::IconThemeBrowser
@@ -1628,6 +1222,407 @@ impl SettingsModal {
             | Page::About => {}
         }
         rows
+    }
+
+    /// Interface size and density, the window and the theme mode.
+    fn appearance_rows(
+        &self,
+        theme: &Theme,
+        settings: &Settings,
+        add: &mut dyn FnMut(&'static str, &str, AnyElement),
+        cx: &mut Context<Self>,
+    ) {
+        add(
+            "Interface font size",
+            "",
+            stepper(
+                theme,
+                "ui-font",
+                settings.ui_font_size.to_string(),
+                (settings.ui_font_size - 1.).max(9.),
+                (settings.ui_font_size + 1.).min(24.),
+                self.setter(|s, v| s.ui_font_size = v, cx),
+            ),
+        );
+        add(
+            "Density",
+            "Height of lists and bars",
+            segmented(
+                theme,
+                "density",
+                &[
+                    (Density::Compact, "Compact"),
+                    (Density::Default, "Default"),
+                    (Density::Comfortable, "Comfortable"),
+                ],
+                settings.density,
+                self.setter(|s, v| s.density = v, cx),
+            ),
+        );
+        add(
+            "Translucent window",
+            "Lets the desktop show through, blurred",
+            switch(
+                theme,
+                "translucent-window",
+                settings.translucent_window,
+                self.setter(|s, v| s.translucent_window = v, cx),
+            ),
+        );
+        add(
+            "Glass effects",
+            "Shaded surfaces and light along the edges, in the themes that have them",
+            switch(
+                theme,
+                "glass-effects",
+                settings.glass_effects,
+                self.setter(|s, v| s.glass_effects = v, cx),
+            ),
+        );
+        add(
+            "Animations",
+            "Panels, views and the highlight glide when you use the mouse, instead of jumping",
+            switch(
+                theme,
+                "animated-selection",
+                settings.animated_selection,
+                self.setter(|s, v| s.animated_selection = v, cx),
+            ),
+        );
+        add(
+            "Sync with Windows",
+            &format!(
+                "{} when dark, {} when light. Picking a theme above sets the one for its mode",
+                settings.dark_theme, settings.light_theme
+            ),
+            switch(
+                theme,
+                "sync-theme",
+                settings.sync_theme,
+                self.setter(|s, v| s.sync_theme = v, cx),
+            ),
+        );
+    }
+
+    /// Font, cursor and scrollback of the terminals.
+    fn terminal_rows(
+        &self,
+        theme: &Theme,
+        settings: &Settings,
+        add: &mut dyn FnMut(&'static str, &str, AnyElement),
+        cx: &mut Context<Self>,
+    ) {
+        let family = &settings.terminal_font_family;
+        let installed = self
+            .installed_fonts
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(family));
+        let font_help = if installed {
+            "The monospace fonts installed on this PC".to_string()
+        } else {
+            format!("{family} is not installed, so Consolas is used instead")
+        };
+        let picker = self.font_picker(family, cx);
+        add("Font", &font_help, picker);
+        add(
+            "Font size",
+            "Also Ctrl+= / Ctrl+- / Ctrl+0",
+            stepper(
+                theme,
+                "term-font",
+                settings.terminal_font_size.to_string(),
+                (settings.terminal_font_size - 1.).max(8.),
+                (settings.terminal_font_size + 1.).min(32.),
+                self.setter(|s, v| s.terminal_font_size = v, cx),
+            ),
+        );
+        add(
+            "Cursor shape",
+            "Auto lets the program in the terminal choose, as vim does between its modes",
+            segmented(
+                theme,
+                "cursor-style",
+                &[
+                    (CursorStyle::Program, "Auto"),
+                    (CursorStyle::Block, "Block"),
+                    (CursorStyle::Bar, "Bar"),
+                    (CursorStyle::Underline, "Underline"),
+                ],
+                settings.cursor_style,
+                self.setter(|s, v| s.cursor_style = v, cx),
+            ),
+        );
+        add(
+            "Cursor blink",
+            "",
+            switch(
+                theme,
+                "cursor-blink",
+                settings.cursor_blink,
+                self.setter(|s, v| s.cursor_blink = v, cx),
+            ),
+        );
+        add(
+            "Scrollback lines",
+            "Applies to new terminals",
+            stepper(
+                theme,
+                "scrollback",
+                settings.scrollback_lines.to_string(),
+                settings.scrollback_lines.saturating_sub(1000).max(1000),
+                (settings.scrollback_lines + 1000).min(1_000_000),
+                self.setter(|s, v| s.scrollback_lines = v, cx),
+            ),
+        );
+        add(
+            "Ctrl+V pastes",
+            "Off: Ctrl+V reaches the program, as vim's visual block needs. Ctrl+Shift+V always pastes",
+            switch(
+                theme,
+                "ctrl-v-pastes",
+                settings.ctrl_v_pastes,
+                self.setter(|s, v| s.ctrl_v_pastes = v, cx),
+            ),
+        );
+    }
+
+    /// SSH agent, saved secrets, SSH config, trusted servers and reconnecting.
+    fn connections_rows(
+        &self,
+        theme: &Theme,
+        settings: &Settings,
+        add: &mut dyn FnMut(&'static str, &str, AnyElement),
+        cx: &mut Context<Self>,
+    ) {
+        add(
+            "Use SSH agent",
+            "Keys loaded in the Windows OpenSSH agent or Pageant are tried first, so no passphrase is asked",
+            switch(
+                theme,
+                "use-agent",
+                settings.use_ssh_agent,
+                self.setter(|s, v| s.use_ssh_agent = v, cx),
+            ),
+        );
+        let (keys, passwords) = (
+            settings.saved_passphrases.len(),
+            settings.saved_passwords.len(),
+        );
+        let state = self.state.clone();
+        add(
+            "Saved passwords and passphrases",
+            &if keys + passwords == 0 {
+                "None. Tick Remember when a host or a key asks for one".to_string()
+            } else {
+                format!(
+                    "{passwords} passwords and {keys} passphrases, in the Windows Credential Manager"
+                )
+            },
+            Button::new("forget-secrets")
+                .label("Forget all")
+                .disabled(keys + passwords == 0)
+                .on_click(move |_, _, cx| state.update(cx, AppState::forget_secrets))
+                .into_any_element(),
+        );
+        let ssh_config = self.state.read(cx).engine.paths().ssh_config;
+        let state = self.state.clone();
+        add(
+            "SSH config",
+            "Hosts also come from ~/.ssh/config. Reload reads it again after you change it",
+            div()
+                .flex()
+                .flex_none()
+                .gap(px(6.))
+                .child(
+                    Button::new("open-ssh-config")
+                        .label("Open")
+                        .on_click(cx.listener(move |_, _, _, cx| open_path(&ssh_config, cx))),
+                )
+                .child(
+                    Button::new("reload-ssh-config")
+                        .label("Reload")
+                        .on_click(move |_, _, cx| state.read(cx).engine.reload_hosts()),
+                )
+                .into_any_element(),
+        );
+        add(
+            "Trusted servers",
+            "The server keys saved in known_hosts. Remove one whose key changed",
+            Button::new("manage-known-hosts")
+                .label("Manage…")
+                .on_click(cx.listener(|this, _, window, cx| this.open_known_hosts(window, cx)))
+                .into_any_element(),
+        );
+        add(
+            "Reconnect automatically",
+            "When a connection with open tabs is lost. Terminals keep what they show and get a new shell",
+            switch(
+                theme,
+                "auto-reconnect",
+                settings.auto_reconnect,
+                self.setter(|s, v| s.auto_reconnect = v, cx),
+            ),
+        );
+        add(
+            "Reopen tabs at startup",
+            "The tabs and split terminals of the last run connect again when shcp starts",
+            switch(
+                theme,
+                "restore-tabs",
+                settings.restore_tabs,
+                self.setter(|s, v| s.restore_tabs = v, cx),
+            ),
+        );
+    }
+
+    /// When tunnels open.
+    fn forwarding_rows(
+        &self,
+        theme: &Theme,
+        settings: &Settings,
+        add: &mut dyn FnMut(&'static str, &str, AnyElement),
+        cx: &mut Context<Self>,
+    ) {
+        add(
+            "Open tunnels when connecting",
+            "Off: click a port in the sidebar to open it. Leave off if another SSH client uses the same ports. Applies from the next connection",
+            switch(
+                theme,
+                "auto-open-forwards",
+                settings.auto_open_forwards,
+                self.setter(|s, v| s.auto_open_forwards = v, cx),
+            ),
+        );
+    }
+
+    /// The Files tab and transfers.
+    fn files_rows(
+        &self,
+        theme: &Theme,
+        settings: &Settings,
+        add: &mut dyn FnMut(&'static str, &str, AnyElement),
+        cx: &mut Context<Self>,
+    ) {
+        add(
+            "Show hidden files",
+            "Names starting with a dot. Ctrl+H in the Files tab toggles it",
+            switch(
+                theme,
+                "show-hidden",
+                settings.show_hidden_files,
+                self.setter(|s, v| s.show_hidden_files = v, cx),
+            ),
+        );
+        add(
+            "Folders a search skips",
+            "Names separated by commas. Pressing Enter in the filter does not look inside them",
+            div()
+                .w(px(220.))
+                .child(self.skip_folders.clone())
+                .into_any_element(),
+        );
+        add(
+            "Editor for remote files",
+            "Full path of the program. Empty: VS Code if installed, otherwise Notepad",
+            div()
+                .w(px(220.))
+                .child(self.editor.clone())
+                .into_any_element(),
+        );
+        let folder = settings.download_folder.clone();
+        add(
+            "Download folder",
+            &if folder.is_empty() {
+                "Asks each time".to_string()
+            } else {
+                folder.clone()
+            },
+            div()
+                .flex()
+                .gap(px(4.))
+                .when(!folder.is_empty(), |this| {
+                    this.child(
+                        Button::new("download-ask")
+                            .label("Ask each time")
+                            .style(ButtonStyle::Ghost)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.change(|s| s.download_folder.clear(), cx);
+                            })),
+                    )
+                })
+                .child(
+                    Button::new("download-choose")
+                        .icon(IconName::Folder)
+                        .label("Choose…")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.choose_download_folder(cx);
+                        })),
+                )
+                .into_any_element(),
+        );
+        add(
+            "Open transfers panel on new transfer",
+            "Ctrl+Shift+J or the button above the terminal toggle it anytime",
+            switch(
+                theme,
+                "auto-transfers",
+                settings.auto_open_transfers,
+                self.setter(|s, v| s.auto_open_transfers = v, cx),
+            ),
+        );
+        add(
+            "Parallel transfers",
+            "Applies from the next connection",
+            stepper(
+                theme,
+                "concurrency",
+                settings.transfer_concurrency.to_string(),
+                settings.transfer_concurrency.saturating_sub(1).max(1),
+                (settings.transfer_concurrency + 1).min(16),
+                self.setter(|s, v| s.transfer_concurrency = v, cx),
+            ),
+        );
+        add(
+            "Confirm before deleting",
+            "",
+            switch(
+                theme,
+                "confirm-delete",
+                settings.confirm_on_delete,
+                self.setter(|s, v| s.confirm_on_delete = v, cx),
+            ),
+        );
+    }
+
+    /// The shortcuts, the changeable ones then the fixed ones.
+    fn keyboard_rows(
+        &self,
+        theme: &Theme,
+        settings: &Settings,
+        add: &mut dyn FnMut(&'static str, &str, AnyElement),
+        cx: &mut Context<Self>,
+    ) {
+        add(
+            "Change a shortcut",
+            "Click its keys and press new ones. Backspace leaves it without, Esc keeps it as it is",
+            div().into_any_element(),
+        );
+        for shortcut in SHORTCUTS {
+            let control = self.shortcut_control(shortcut, settings, cx);
+            add(shortcut.label, "", control);
+        }
+        for (label, keys) in FIXED_SHORTCUTS {
+            add(
+                label,
+                "",
+                div()
+                    .font_family(crate::theme::mono_font())
+                    .text_size(ui_px(12.))
+                    .text_color(theme.text_muted)
+                    .child(keys)
+                    .into_any_element(),
+            );
+        }
     }
 
     fn theme_row(&self, query: &str, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1661,7 +1656,7 @@ impl SettingsModal {
                                 let name = name.clone();
                                 this.change(
                                     |s| {
-                                        s.theme = name.clone();
+                                        s.theme.clone_from(&name);
                                         if is_light {
                                             s.light_theme = name;
                                         } else {
@@ -1681,7 +1676,7 @@ impl SettingsModal {
                     dropdown_action(&ui, "browse-themes", IconName::Search, "Browse themes…")
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.open_dropdown = None;
-                            this.open_theme_browser(window, cx);
+                            this.open_theme_browser(ThemeKind::Color, window, cx);
                         }))
                         .into_any_element(),
                 );
@@ -1692,8 +1687,14 @@ impl SettingsModal {
                         ))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.open_dropdown = None;
-                            let _ = std::fs::create_dir_all(&themes_dir);
-                            cx.open_with_system(&themes_dir);
+                            match std::fs::create_dir_all(&themes_dir) {
+                                Ok(()) => cx.open_with_system(&themes_dir),
+                                Err(error) => {
+                                    this.error = Some(format!(
+                                        "Could not create the themes folder: {error}"
+                                    ));
+                                }
+                            }
                             cx.notify();
                         }))
                         .into_any_element(),
@@ -1800,7 +1801,7 @@ impl SettingsModal {
                     )
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_dropdown = None;
-                        this.open_icon_theme_browser(window, cx);
+                        this.open_theme_browser(ThemeKind::Icon, window, cx);
                     }))
                     .into_any_element(),
                 );
@@ -1819,13 +1820,13 @@ impl SettingsModal {
         let set_check_daily = self.setter(|s, v| s.check_for_updates = v, cx);
         let (text, color, spinning) = match &status {
             UpdateStatus::Idle => (
-                format!("shcp {} is installed", current_version()),
+                format!("shcp {} is installed", updater::CURRENT),
                 theme.text_muted,
                 false,
             ),
             UpdateStatus::Checking => ("Checking for updates…".to_string(), theme.text_muted, true),
             UpdateStatus::UpToDate => (
-                format!("shcp {} is the latest version", current_version()),
+                format!("shcp {} is the latest version", updater::CURRENT),
                 theme.text_muted,
                 false,
             ),
@@ -1859,17 +1860,17 @@ impl SettingsModal {
                 button("install-update", "Update")
                     .style(ButtonStyle::Primary)
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.state.update(cx, |s, cx| s.install_update(cx));
+                        this.state.update(cx, AppState::install_update);
                     })),
             ),
             UpdateStatus::Ready { .. } => Some(button("restart-update", "Restart now").on_click(
                 cx.listener(|this, _, _, cx| {
-                    this.state.update(cx, |s, cx| s.restart_into_update(cx));
+                    this.state.update(cx, AppState::restart_into_update);
                 }),
             )),
             UpdateStatus::DownloadFailed { .. } => Some(button("retry-update", "Retry").on_click(
                 cx.listener(|this, _, _, cx| {
-                    this.state.update(cx, |s, cx| s.install_update(cx));
+                    this.state.update(cx, AppState::install_update);
                 }),
             )),
             UpdateStatus::Idle | UpdateStatus::UpToDate | UpdateStatus::Failed(_) => Some(
@@ -1925,7 +1926,7 @@ impl SettingsModal {
                 .keyboard_focus()
                 .icon(icon)
                 .label(label)
-                .on_click(cx.listener(move |this, _, _, cx| this.open_path(path.clone(), cx)))
+                .on_click(cx.listener(move |_, _, _, cx| open_path(&path, cx)))
         };
         div()
             .flex()
@@ -1934,7 +1935,7 @@ impl SettingsModal {
             .child(
                 div()
                     .text_color(theme.text_muted)
-                    .child(format!("shcp {}", env!("CARGO_PKG_VERSION"))),
+                    .child(format!("shcp {}", updater::CURRENT)),
             )
             .children(updates)
             .child(section(&theme, "FOLDERS"))
@@ -1953,7 +1954,7 @@ impl SettingsModal {
                         "open-logs",
                         IconName::File,
                         "Logs",
-                        paths.log_dir.clone(),
+                        paths.log_dir,
                     ))
                     .child(open(
                         "open-session-logs",
@@ -2073,11 +2074,186 @@ impl SettingsModal {
     }
 }
 
-impl Render for SettingsModal {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let query = self.search.read(cx).text().trim().to_lowercase();
-        let searching = !query.is_empty();
+impl SettingsModal {
+    /// The heading and the rows of what the dialog shows: a host's detail, the search results
+    /// or the page picked in the menu.
+    fn title_and_content(
+        &self,
+        query: &str,
+        host_alias: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> (SharedString, Vec<AnyElement>) {
+        if let Some(detail) = &self.host_detail {
+            let title = match detail.section {
+                HostSection::Overview => host_alias.unwrap_or_else(|| "Host".into()),
+                HostSection::Editor(HostPage::Connection) => "Connection".into(),
+                HostSection::Editor(HostPage::Commands) => "Commands".into(),
+                HostSection::Editor(HostPage::KeyLogin) => "Key login".into(),
+            };
+            return (title, vec![detail.view.clone().into_any_element()]);
+        }
+        if !query.is_empty() {
+            return ("Search results".into(), self.search_results(query, cx));
+        }
+        match self.page {
+            Page::About => ("About".into(), vec![self.about(cx)]),
+            Page::ThemeBrowser => (
+                "Browse themes".into(),
+                vec![self.theme_browser.clone().into_any_element()],
+            ),
+            Page::IconThemeBrowser => (
+                "Browse file icon themes".into(),
+                vec![self.icon_theme_browser.clone().into_any_element()],
+            ),
+            Page::KnownHosts => ("Trusted servers".into(), self.known_hosts_rows(cx)),
+            _ => {
+                let title = PAGES
+                    .iter()
+                    .find(|(page, ..)| *page == self.page)
+                    .map_or("Settings", |(_, label, _)| *label)
+                    .into();
+                let mut content: Vec<AnyElement> = Vec::new();
+                if self.page == Page::Appearance {
+                    content.extend(self.theme_row("", cx));
+                    content.extend(self.accent_row("", cx));
+                    content.extend(self.icon_theme_row("", cx));
+                }
+                content.extend(self.page_rows(self.page, "", cx));
+                (title, content)
+            }
+        }
+    }
+
+    /// The menu on the left: the search field, the pages and About at the bottom.
+    fn nav_column(
+        &self,
+        theme: &Theme,
+        searching: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let nav: Vec<_> = PAGES
+            .iter()
+            .map(|(page, label, icon)| self.nav_item(*page, label, *icon, searching, cx))
+            .collect();
+        let about = self.nav_item(Page::About, "About", IconName::Info, searching, cx);
+        div()
+            .w(px(204.))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .p(px(8.))
+            .rounded_l(px(crate::theme::PANEL_INNER_RADIUS))
+            // Over a material, a shade of it and not a color of its own.
+            .bg(if theme.material().is_some() {
+                gpui::black().opacity(0.14)
+            } else {
+                theme.surface
+            })
+            .border_r_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .pb(px(10.))
+                    .when(self.host_detail.is_none(), |this| {
+                        this.child(self.search.clone())
+                    })
+                    .when(self.host_detail.is_some(), |this| this.h(px(38.))),
+            )
+            .children(nav)
+            .child(div().flex_1())
+            .child(about)
+    }
+
+    /// The title with the close button, or the way back from a host's detail.
+    fn header(
+        &self,
+        title: SharedString,
+        back_label: SharedString,
+        in_editor: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .gap(px(8.))
+            .w_full()
+            .min_w_0()
+            .pt(px(14.))
+            .pb(px(if self.host_detail.is_some() { 12. } else { 6. }))
+            .pl(px(24.))
+            .pr(px(12.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .when(self.host_detail.is_some(), |this| {
+                        this.child(
+                            div().min_w_0().ml(px(-10.)).child(
+                                Button::new("settings-host-back")
+                                    .keyboard_focus()
+                                    .icon(IconName::ArrowLeft)
+                                    .label(back_label)
+                                    .style(ButtonStyle::Ghost)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.navigate(Destination::Back, window, cx)
+                                    })),
+                            ),
+                        )
+                    })
+                    .when(self.host_detail.is_none(), |this| {
+                        this.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_size(ui_px(17.))
+                                .child(title.clone()),
+                        )
+                    })
+                    .child(
+                        Button::new("settings-close")
+                            .keyboard_focus()
+                            .icon(IconName::Close)
+                            .tooltip("Close (Esc)")
+                            .style(ButtonStyle::Ghost)
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(super::CancelEvent))),
+                    ),
+            )
+            .when(in_editor, |this| {
+                this.child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .pr(px(12.))
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .flex_none()
+                                .whitespace_normal()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_size(ui_px(17.))
+                                .child(title),
+                        ),
+                )
+            })
+    }
+
+    /// Whether changes are saved, or the last error, and the settings file.
+    fn footer(
+        &self,
+        theme: &Theme,
+        in_editor: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let settings_file = self
             .state
             .read(cx)
@@ -2085,13 +2261,67 @@ impl Render for SettingsModal {
             .paths()
             .config_dir
             .join("settings.toml");
-        let host_alias: Option<SharedString> = self.host_detail.as_ref().map(|detail| {
-            self.state
-                .read(cx)
-                .host(&detail.host)
-                .map_or(detail.host.0.clone(), |host| host.alias.clone())
-                .into()
-        });
+        div()
+            .h(px(44.))
+            .flex_none()
+            .pl(px(24.))
+            .pr(px(12.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .border_t_1()
+            .border_color(theme.border)
+            .text_size(ui_px(12.))
+            .when_some(self.error.clone(), |this, error| {
+                this.child(Icon::new(IconName::Warning).color(theme.error))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(theme.error)
+                            .child(error),
+                    )
+            })
+            .when(self.error.is_none() && !in_editor, |this| {
+                this.child(Icon::new(IconName::Check).color(theme.success))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(theme.text_muted)
+                            .child("Changes are saved automatically"),
+                    )
+            })
+            .when(in_editor, |this| {
+                this.child(
+                    div()
+                        .flex_1()
+                        .text_color(theme.text_muted)
+                        .child("Save to apply changes"),
+                )
+            })
+            .child(
+                Button::new("open-settings-file")
+                    .label("Open settings.toml")
+                    .style(ButtonStyle::Ghost)
+                    .on_click(cx.listener(move |_, _, _, cx| open_path(&settings_file, cx))),
+            )
+    }
+}
+
+impl Render for SettingsModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let query = self.search.read(cx).text().trim().to_lowercase();
+        let searching = !query.is_empty();
+        let in_editor = self
+            .host_detail
+            .as_ref()
+            .is_some_and(|detail| matches!(detail.section, HostSection::Editor(_)));
+        let host_alias: Option<SharedString> = self
+            .host_detail
+            .as_ref()
+            .map(|detail| self.state.read(cx).alias(&detail.host).into());
         let back_label: SharedString = if self
             .host_detail
             .as_ref()
@@ -2101,204 +2331,23 @@ impl Render for SettingsModal {
         } else {
             host_alias.clone().unwrap_or_else(|| "Hosts".into())
         };
-        let title: SharedString = if let Some(detail) = &self.host_detail {
-            match detail.section {
-                HostSection::Overview => host_alias.clone().unwrap_or_else(|| "Host".into()),
-                HostSection::Editor(HostPage::Connection) => "Connection".into(),
-                HostSection::Editor(HostPage::Commands) => "Commands".into(),
-                HostSection::Editor(HostPage::KeyLogin) => "Key login".into(),
-            }
-        } else if searching {
-            "Search results".into()
-        } else if self.page == Page::About {
-            "About".into()
-        } else if self.page == Page::ThemeBrowser {
-            "Browse themes".into()
-        } else if self.page == Page::IconThemeBrowser {
-            "Browse file icon themes".into()
-        } else if self.page == Page::KnownHosts {
-            "Trusted servers".into()
-        } else {
-            PAGES
-                .iter()
-                .find(|(page, ..)| *page == self.page)
-                .map_or("Settings", |(_, label, _)| *label)
-                .into()
-        };
-        let content: Vec<AnyElement> = if let Some(detail) = &self.host_detail {
-            vec![detail.view.clone().into_any_element()]
-        } else if searching {
-            self.search_results(&query, cx)
-        } else if self.page == Page::About {
-            vec![self.about(cx)]
-        } else if self.page == Page::ThemeBrowser {
-            vec![self.theme_browser.clone().into_any_element()]
-        } else if self.page == Page::IconThemeBrowser {
-            vec![self.icon_theme_browser.clone().into_any_element()]
-        } else if self.page == Page::KnownHosts {
-            self.known_hosts_rows(cx)
-        } else {
-            let mut content: Vec<AnyElement> = Vec::new();
-            if self.page == Page::Appearance {
-                content.extend(self.theme_row("", cx));
-                content.extend(self.accent_row("", cx));
-                content.extend(self.icon_theme_row("", cx));
-            }
-            content.extend(self.page_rows(self.page, "", cx));
-            content
-        };
-        let nav: Vec<_> = PAGES
-            .iter()
-            .map(|(page, label, icon)| self.nav_item(*page, label, *icon, searching, cx))
-            .collect();
-        let about = self.nav_item(Page::About, "About", IconName::Info, searching, cx);
-        div()
+        let (title, content) = self.title_and_content(&query, host_alias, cx);
+        let nav = self.nav_column(&theme, searching, cx);
+        card_frame(&theme, theme.strong_border)
             .w(px(820.))
-            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .h(px(580.))
             .max_w(relative(0.96))
             .max_h(relative(0.96))
             .flex()
-            .rounded(px(crate::theme::RADIUS_CARD))
-            // In a theme with a material the dialog is a card of it, lit: the same field as
-            // the cards behind, where it floats.
-            .map(|this| match theme.material() {
-                Some(material) => this.relative().child(crate::terminal_material::layers(
-                    material.opaque(),
-                    true,
-                    true,
-                )),
-                None => this
-                    .border_1()
-                    .border_color(theme.strong_border)
-                    .bg(theme.elevated),
-            })
-            .shadow(crate::theme::float_shadow())
-            .text_size(ui_px(13.))
-            .text_color(theme.text)
             .capture_key_down(cx.listener(Self::on_capture_key))
-            .child(
-                div()
-                    .w(px(204.))
-                    .flex_none()
-                    .flex()
-                    .flex_col()
-                    .gap(px(1.))
-                    .p(px(8.))
-                    .rounded_l(px(crate::theme::PANEL_INNER_RADIUS))
-                    // Over a material, a shade of it and not a color of its own.
-                    .bg(if theme.material().is_some() {
-                        gpui::black().opacity(0.14)
-                    } else {
-                        theme.surface
-                    })
-                    .border_r_1()
-                    .border_color(theme.border)
-                    .child(
-                        div()
-                            .pb(px(10.))
-                            .when(self.host_detail.is_none(), |this| {
-                                this.child(self.search.clone())
-                            })
-                            .when(self.host_detail.is_some(), |this| this.h(px(38.))),
-                    )
-                    .children(nav)
-                    .child(div().flex_1())
-                    .child(about),
-            )
+            .child(nav)
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_none()
-                            .gap(px(8.))
-                            .w_full()
-                            .min_w_0()
-                            .pt(px(14.))
-                            .pb(px(if self.host_detail.is_some() { 12. } else { 6. }))
-                            .pl(px(24.))
-                            .pr(px(12.))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap(px(12.))
-                                    .when(self.host_detail.is_some(), |this| {
-                                        this.child(
-                                            div().min_w_0().ml(px(-10.)).child(
-                                                Button::new("settings-host-back")
-                                                    .keyboard_focus()
-                                                    .icon(IconName::ArrowLeft)
-                                                    .label(back_label)
-                                                    .style(ButtonStyle::Ghost)
-                                                    .on_click(cx.listener(
-                                                        |this, _, window, cx| {
-                                                            this.navigate(
-                                                                Destination::Back,
-                                                                window,
-                                                                cx,
-                                                            )
-                                                        },
-                                                    )),
-                                            ),
-                                        )
-                                    })
-                                    .when(self.host_detail.is_none(), |this| {
-                                        this.child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .truncate()
-                                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                .text_size(ui_px(17.))
-                                                .child(title.clone()),
-                                        )
-                                    })
-                                    .child(
-                                        Button::new("settings-close")
-                                            .keyboard_focus()
-                                            .icon(IconName::Close)
-                                            .tooltip("Close (Esc)")
-                                            .style(ButtonStyle::Ghost)
-                                            .on_click(cx.listener(|_, _, _, cx| {
-                                                cx.emit(super::CancelEvent)
-                                            })),
-                                    ),
-                            )
-                            .when(
-                                self.host_detail.as_ref().is_some_and(|detail| {
-                                    matches!(detail.section, HostSection::Editor(_))
-                                }),
-                                |this| {
-                                    this.child(
-                                        div()
-                                            .w_full()
-                                            .min_w_0()
-                                            .flex()
-                                            .flex_col()
-                                            .gap(px(4.))
-                                            .pr(px(12.))
-                                            .child(
-                                                div()
-                                                    .w_full()
-                                                    .min_w_0()
-                                                    .flex_none()
-                                                    .whitespace_normal()
-                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                    .text_size(ui_px(17.))
-                                                    .child(title),
-                                            ),
-                                    )
-                                },
-                            ),
-                    )
+                    .child(self.header(title, back_label, in_editor, cx))
                     .child(
                         // Not a flex column: that would squeeze the rows instead of scrolling.
                         div()
@@ -2315,66 +2364,7 @@ impl Render for SettingsModal {
                             .pb(px(16.))
                             .children(content),
                     )
-                    .child(
-                        div()
-                            .h(px(44.))
-                            .flex_none()
-                            .pl(px(24.))
-                            .pr(px(12.))
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .border_t_1()
-                            .border_color(theme.border)
-                            .text_size(ui_px(12.))
-                            .when_some(self.error.clone(), |this, error| {
-                                this.child(Icon::new(IconName::Warning).color(theme.error))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_color(theme.error)
-                                            .child(error),
-                                    )
-                            })
-                            .when(
-                                self.error.is_none()
-                                    && !self.host_detail.as_ref().is_some_and(|detail| {
-                                        matches!(detail.section, HostSection::Editor(_))
-                                    }),
-                                |this| {
-                                    this.child(Icon::new(IconName::Check).color(theme.success))
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .text_color(theme.text_muted)
-                                                .child("Changes are saved automatically"),
-                                        )
-                                },
-                            )
-                            .when(
-                                self.host_detail.as_ref().is_some_and(|detail| {
-                                    matches!(detail.section, HostSection::Editor(_))
-                                }),
-                                |this| {
-                                    this.child(
-                                        div()
-                                            .flex_1()
-                                            .text_color(theme.text_muted)
-                                            .child("Save to apply changes"),
-                                    )
-                                },
-                            )
-                            .child(
-                                Button::new("open-settings-file")
-                                    .label("Open settings.toml")
-                                    .style(ButtonStyle::Ghost)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.open_path(settings_file.clone(), cx)
-                                    })),
-                            ),
-                    ),
+                    .child(self.footer(&theme, in_editor, cx)),
             )
     }
 }

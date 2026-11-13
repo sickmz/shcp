@@ -6,7 +6,7 @@ use russh_sftp::{
     client::{SftpSession, fs::Metadata},
     protocol::FileType,
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 const MAX_SIZE: u64 = 50 * 1024 * 1024;
@@ -36,10 +36,8 @@ pub(crate) async fn upload(sftp: &SftpSession, file: PasteFile, unique: u64) -> 
         bail!("{name} is larger than 50 MB");
     }
     let dir = private_dir(sftp).await?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
-    let path = files::join(&dir, &format!("{now}-{unique}-{}", safe_name(&name)));
+    let now = crate::unix_seconds();
+    let path = files::join(&dir, &format!("{now}-{unique}-{}", sanitized_name(&name)));
     let mut output = sftp.create(&path).await?;
     output.write_all(&data).await?;
     output.shutdown().await?;
@@ -69,7 +67,7 @@ async fn private_dir(sftp: &SftpSession) -> Result<String> {
 }
 
 /// Names reach the command line, so only characters that mean nothing to a shell stay.
-fn safe_name(name: &str) -> String {
+fn sanitized_name(name: &str) -> String {
     let safe: String = name
         .chars()
         .map(|c| {

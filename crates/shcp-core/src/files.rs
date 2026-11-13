@@ -1,4 +1,7 @@
-use crate::{EntryKind, Event, RemoteEntry, RequestId, SearchEnd, SearchScope, session::Ssh};
+use crate::{
+    EntryKind, Event, RemoteEntry, RequestId, SearchEnd, SearchScope,
+    session::{self, Ssh},
+};
 use anyhow::{Context, Result, bail};
 use russh_sftp::{
     client::{SftpSession, fs::Metadata},
@@ -6,6 +9,7 @@ use russh_sftp::{
 };
 use std::{
     collections::{BTreeSet, HashSet, VecDeque},
+    fmt::Write as _,
     sync::Arc,
     time::{Duration, UNIX_EPOCH},
 };
@@ -17,29 +21,21 @@ pub(crate) struct Files {
     sftp: OnceCell<Arc<SftpSession>>,
 }
 impl Files {
-    pub fn new(ssh: Arc<Ssh>) -> Self {
+    pub(crate) fn new(ssh: Arc<Ssh>) -> Self {
         Self {
             ssh,
             sftp: OnceCell::new(),
         }
     }
-    pub fn ssh(&self) -> &Ssh {
+    pub(crate) fn ssh(&self) -> &Ssh {
         &self.ssh
     }
-    pub async fn get(&self) -> Result<Arc<SftpSession>> {
+    pub(crate) async fn get(&self) -> Result<Arc<SftpSession>> {
         self.sftp
             .get_or_try_init(|| async {
                 let mut channel = self.ssh.channel_open_session().await?;
                 channel.request_subsystem(true, "sftp").await?;
-                loop {
-                    match channel.wait().await {
-                        Some(russh::ChannelMsg::Success) => break,
-                        Some(russh::ChannelMsg::Failure | russh::ChannelMsg::Close) | None => {
-                            bail!("The server rejected the SFTP subsystem")
-                        }
-                        _ => {}
-                    }
-                }
+                session::accepted(&mut channel, "The server rejected the SFTP subsystem").await?;
                 let sftp = SftpSession::new(channel.into_stream())
                     .await
                     .context("Initialize SFTP")?;
@@ -98,18 +94,25 @@ fn preview_text(bytes: &[u8]) -> Option<String> {
     (broken <= 4).then(|| text.into_owned())
 }
 
-pub(crate) async fn execute(files: &Files, req: RequestId, op: FileOp) -> Event {
-    let result = files.get().await;
+/// Runs one file operation. `files` is the session's, or why it has none: each operation reports
+/// that the same way as its own failure.
+pub(crate) async fn execute(files: Result<Arc<Files>>, req: RequestId, op: FileOp) -> Event {
+    let result = async {
+        let files = files?;
+        let sftp = files.get().await?;
+        Ok::<_, anyhow::Error>((files, sftp))
+    }
+    .await;
     match op {
         FileOp::Home => Event::RemotePath {
             req,
-            path: async { Ok(result?.canonicalize(".").await?) }
+            path: async { Ok(result?.1.canonicalize(".").await?) }
                 .await
                 .map_err(display),
         },
         FileOp::List(path) => {
             let listing = async {
-                let sftp = result?;
+                let (_, sftp) = result?;
                 let canonical = sftp.canonicalize(&path).await?;
                 let entries = list(&sftp, &canonical).await?;
                 Ok::<_, anyhow::Error>((canonical, entries))
@@ -130,7 +133,7 @@ pub(crate) async fn execute(files: &Files, req: RequestId, op: FileOp) -> Event 
         }
         FileOp::Kind(path) => {
             let kind = async {
-                let metadata = result?.metadata(path.as_str()).await?;
+                let metadata = result?.1.metadata(path.as_str()).await?;
                 Ok::<_, anyhow::Error>(match metadata.file_type() {
                     FileType::Dir => EntryKind::Dir,
                     FileType::File => EntryKind::File,
@@ -142,7 +145,7 @@ pub(crate) async fn execute(files: &Files, req: RequestId, op: FileOp) -> Event 
             Event::RemoteKind { req, path, kind }
         }
         FileOp::FreeSpace(path) => {
-            let info = async { Ok::<_, anyhow::Error>(result?.fs_info(path).await?) }.await;
+            let info = async { Ok::<_, anyhow::Error>(result?.1.fs_info(path).await?) }.await;
             let sizes = info.ok().flatten().map(|info| {
                 let unit = match info.fragment_size {
                     0 => info.block_size,
@@ -162,7 +165,7 @@ pub(crate) async fn execute(files: &Files, req: RequestId, op: FileOp) -> Event 
         FileOp::ReadHead(path) => {
             let text = async {
                 use tokio::io::AsyncReadExt as _;
-                let file = result?.open(path.as_str()).await?;
+                let file = result?.1.open(path.as_str()).await?;
                 let mut bytes = Vec::with_capacity(PREVIEW_BYTES as usize);
                 file.take(PREVIEW_BYTES).read_to_end(&mut bytes).await?;
                 Ok::<_, anyhow::Error>(preview_text(&bytes))
@@ -173,7 +176,7 @@ pub(crate) async fn execute(files: &Files, req: RequestId, op: FileOp) -> Event 
         }
         op => {
             let result = async {
-                let sftp = result?;
+                let (files, sftp) = result?;
                 match op {
                     FileOp::Mkdir(path) => sftp.create_dir(path).await?,
                     FileOp::CreateFile(path) => create_file(&sftp, path).await?,
@@ -186,18 +189,18 @@ pub(crate) async fn execute(files: &Files, req: RequestId, op: FileOp) -> Event 
                             sftp.set_metadata(path, metadata).await?;
                         }
                     }
-                    FileOp::Copy(from, to) => copy_on_server(&files.ssh, &from, &to).await?,
+                    FileOp::Copy(from, to) => copy_on_server(files.ssh(), &from, &to).await?,
                     FileOp::Compress {
                         folder,
                         names,
                         archive,
                     } => {
                         let command = compress_command(&folder, &names, &archive)?;
-                        run_on_server(&files.ssh, command, "compress").await?;
+                        run_on_server(files.ssh(), command, "compress").await?;
                     }
                     FileOp::Extract { archive, folder } => {
                         let command = extract_command(&archive, &folder)?;
-                        run_on_server(&files.ssh, command, "extract").await?;
+                        run_on_server(files.ssh(), command, "extract").await?;
                     }
                     _ => {}
                 }
@@ -346,6 +349,24 @@ pub(crate) async fn run_on_server(ssh: &Ssh, command: String, what: &str) -> Res
         None => bail!("The server did not say whether it managed to {what}"),
     }
 }
+/// Runs a command on the server and collects what it writes; empty when it cannot run.
+pub(crate) async fn read_all(ssh: &Ssh, command: String) -> Vec<u8> {
+    let mut output = Vec::new();
+    let Ok(mut channel) = ssh.channel_open_session().await else {
+        return output;
+    };
+    if channel.exec(true, command).await.is_err() {
+        return output;
+    }
+    while let Some(message) = channel.wait().await {
+        match message {
+            russh::ChannelMsg::Data { data } => output.extend_from_slice(&data),
+            russh::ChannelMsg::Failure | russh::ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+    output
+}
 pub(crate) async fn list(sftp: &SftpSession, path: &str) -> Result<Vec<RemoteEntry>> {
     let mut entries = vec![];
     for entry in sftp.read_dir(path).await? {
@@ -444,10 +465,11 @@ fn find_command(root: &str, query: &str, scope: &SearchScope) -> String {
             .iter()
             .map(|name| format!("-name {}", shell_quote(&find_literal(name))))
             .collect();
-        leave_out.push_str(&format!(
+        let _ = write!(
+            leave_out,
             "-type d '(' {} ')' -prune -printf 's{ROW}' -o ",
             names.join(" -o ")
-        ));
+        );
     }
     let check = format!(r"find -H {root} -maxdepth 0 -printf 'shcp-find\0'");
     let search = format!("find -H {root} -mindepth 1 {leave_out}-iname {pattern} -printf 'm{ROW}'");
@@ -669,6 +691,10 @@ async fn search_over_sftp(
         }
     }
 }
+/// The last name of a remote path, a trailing `/` aside.
+pub(crate) fn file_name(path: &str) -> Option<&str> {
+    path.trim_end_matches('/').rsplit('/').next()
+}
 pub(crate) fn join(parent: &str, child: &str) -> String {
     if parent.ends_with('/') {
         format!("{parent}{child}")
@@ -712,22 +738,19 @@ pub(crate) fn safe_name(name: &str) -> Result<()> {
     if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', ':', '\0']) {
         bail!("Unsafe remote file name: {name:?}");
     }
-    #[cfg(windows)]
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if name.ends_with(['.', ' '])
+        || name.contains(['<', '>', '"', '|', '?', '*'])
+        || matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit())
     {
-        let stem = name
-            .split('.')
-            .next()
-            .unwrap_or_default()
-            .to_ascii_uppercase();
-        if name.ends_with(['.', ' '])
-            || name.contains(['<', '>', '"', '|', '?', '*'])
-            || matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-            || (stem.len() == 4
-                && (stem.starts_with("COM") || stem.starts_with("LPT"))
-                && stem.as_bytes()[3].is_ascii_digit())
-        {
-            bail!("File name is not supported on Windows: {name:?}");
-        }
+        bail!("File name is not supported on Windows: {name:?}");
     }
     Ok(())
 }

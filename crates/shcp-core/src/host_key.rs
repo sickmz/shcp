@@ -1,5 +1,6 @@
 use crate::{
-    ConnectStep, HostConfig, HostKeyKind, SessionState, config, session::Context as SessionContext,
+    ConnectStep, HostConfig, HostKeyKind, SessionState, config,
+    session::{Context as SessionContext, PromptKind},
 };
 use anyhow::{Context, Result, bail};
 use russh::{
@@ -7,7 +8,7 @@ use russh::{
     client::{self, ChannelOpenHandle, Msg, Session},
     keys::{self, HashAlg, PublicKey, PublicKeyOrCertificate},
 };
-use std::{fs, path::Path, sync::Arc};
+use std::{fmt::Write as _, fs, path::Path, sync::Arc};
 
 pub(crate) struct Handler {
     pub context: Arc<SessionContext>,
@@ -29,11 +30,7 @@ impl client::Handler for Handler {
         );
         let path = &ctx.paths.known_hosts;
         // Fail closed on unreadable files (russh's helper alone treats open failures as unknown).
-        match fs::read_to_string(path) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).context("Read known_hosts"),
-        }
+        config::read_if_exists(path).context("Read known_hosts")?;
         let records = keys::known_hosts::known_host_keys_path(&host.hostname, host.port, path)?;
         if records.iter().any(|(_, k)| k.key_data() == key.key_data()) {
             return Ok(true);
@@ -43,9 +40,7 @@ impl client::Handler for Handler {
         } else {
             HostKeyKind::Changed
         };
-        ctx.prompts
-            .kind
-            .store(1, std::sync::atomic::Ordering::SeqCst);
+        ctx.prompts.begin(PromptKind::HostKey);
         ctx.state(SessionState::AwaitingHostKey {
             host: host.hostname.clone(),
             key_type: key.algorithm().to_string(),
@@ -53,9 +48,7 @@ impl client::Handler for Handler {
             kind,
         });
         let accepted = tokio::select! { _ = ctx.cancel.cancelled() => false, result = ctx.prompts.host_rx.recv() => result.unwrap_or(false) };
-        ctx.prompts
-            .kind
-            .store(0, std::sync::atomic::Ordering::SeqCst);
+        ctx.prompts.end();
         if !accepted {
             bail!("Host key was not accepted");
         }
@@ -98,7 +91,7 @@ impl client::Handler for Handler {
             tracing::warn!(host = %self.host.alias, "Refused a request for the SSH agent");
             return Ok(());
         }
-        let Some(mut agent) = crate::auth::agent_stream().await else {
+        let Some(mut agent) = crate::auth::agent::stream().await else {
             tracing::warn!("The server asked for the SSH agent, but none is running");
             return Ok(());
         };
@@ -148,7 +141,7 @@ fn save(
             output.push('\n');
         }
     }
-    output.push_str(&format!("{name} {}\n", key.to_openssh()?));
+    writeln!(output, "{name} {}", key.to_openssh()?)?;
     // OpenSSH reads this file too: a crash here must not leave half of it.
     config::write_atomic(path, output.as_bytes()).context("Replace host key in known_hosts")
 }
@@ -156,6 +149,7 @@ fn save(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Scratch;
 
     const OLD: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
     const NEW: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIA6rWI3G1sz07DnfFlrouTcysQlj2P+jpNSOEWD9OJ3X";
@@ -166,9 +160,8 @@ mod tests {
 
     #[test]
     fn replacing_a_key_keeps_the_rest_of_the_file_and_leaves_no_temporary() {
-        let dir = std::env::temp_dir().join(format!("shcp-known-hosts-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("known_hosts");
+        let dir = Scratch::new("known-hosts");
+        let path = dir.0.join("known_hosts");
         fs::write(
             &path,
             format!(
@@ -184,7 +177,6 @@ mod tests {
             .collect();
         assert_eq!(names, ["other", "alias", "last", "target"]);
         assert!(text.lines().last().unwrap().ends_with(NEW));
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
-        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 1);
     }
 }

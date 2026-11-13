@@ -6,18 +6,18 @@ macro_rules! colors {
     ($($variant:ident => $slug:literal, $hue:literal, $saturation:literal, $oklch:literal),* $(,)?) => {
         /// A fixed palette.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub enum HostColor { $($variant),* }
+        pub(crate) enum HostColor { $($variant),* }
         impl HostColor {
-            pub const ALL: &'static [HostColor] = &[$(HostColor::$variant),*];
+            pub(crate) const ALL: &'static [HostColor] = &[$(HostColor::$variant),*];
             /// The name saved in the settings: keep it stable.
-            pub fn slug(self) -> &'static str {
+            pub(crate) fn slug(self) -> &'static str {
                 match self { $(HostColor::$variant => $slug),* }
             }
-            pub fn hsla(self) -> Hsla {
+            pub(crate) fn hsla(self) -> Hsla {
                 match self { $(HostColor::$variant => hsla($hue / 360., $saturation, 0.45, 1.)),* }
             }
             /// Its hue in OKLCH: the light of the window while on this host.
-            pub fn hue(self) -> f32 {
+            pub(crate) fn hue(self) -> f32 {
                 match self { $(HostColor::$variant => $oklch),* }
             }
         }
@@ -38,13 +38,13 @@ colors! {
 }
 
 impl HostColor {
-    pub fn from_slug(slug: &str) -> Option<Self> {
+    pub(crate) fn from_slug(slug: &str) -> Option<Self> {
         Self::ALL.iter().copied().find(|color| color.slug() == slug)
     }
 }
 
 /// Filled when the host is connected, an outline at rest.
-pub fn color_dot(color: Hsla, filled: bool) -> Div {
+pub(crate) fn color_dot(color: Hsla, filled: bool) -> Div {
     let dot = div().size(px(7.)).flex_none().rounded_full();
     if filled {
         dot.bg(color)

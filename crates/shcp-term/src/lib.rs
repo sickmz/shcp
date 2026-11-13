@@ -82,6 +82,16 @@ struct State {
     /// other side decides, which another PC may keep smaller.
     requested: Option<(u16, u16)>,
 }
+impl State {
+    /// Gives the grid this size. Whether it had another.
+    fn set_size(&mut self, cols: u16, rows: u16) -> bool {
+        if self.term.columns() == cols as usize && self.term.screen_lines() == rows as usize {
+            return false;
+        }
+        self.term.resize(Size(cols, rows));
+        true
+    }
+}
 struct Inner {
     id: TerminalId,
     state: Mutex<State>,
@@ -210,10 +220,9 @@ impl TerminalHandle {
             }
             return;
         }
-        if state.term.columns() == cols as usize && state.term.screen_lines() == rows as usize {
+        if !state.set_size(cols, rows) {
             return;
         }
-        state.term.resize(Size(cols, rows));
         drop(state);
         self.send(TerminalCommand::Resize(cols, rows));
         self.changed();
@@ -223,10 +232,9 @@ impl TerminalHandle {
     pub fn fit(&self, cols: u16, rows: u16) {
         let (cols, rows) = (cols.max(2), rows.max(1));
         let mut state = self.0.state.lock();
-        if state.term.columns() == cols as usize && state.term.screen_lines() == rows as usize {
+        if !state.set_size(cols, rows) {
             return;
         }
-        state.term.resize(Size(cols, rows));
         drop(state);
         self.changed();
     }
@@ -450,7 +458,7 @@ impl TerminalHandle {
     }
     #[doc(hidden)]
     pub fn feed(&self, bytes: &[u8]) {
-        {
+        let managed = {
             let mut s = self.0.state.lock();
             if let Some(path) = s.osc7.feed(bytes) {
                 s.cwd = Some(path);
@@ -458,9 +466,9 @@ impl TerminalHandle {
             }
             let State { term, parser, .. } = &mut *s;
             parser.advance(term, bytes);
-        }
+            s.managed
+        };
         let events = std::mem::take(&mut *self.0.events.0.lock());
-        let managed = self.0.state.lock().managed;
         for event in events {
             match event {
                 AlEvent::PtyWrite(_) | AlEvent::TextAreaSizeRequest(_) if managed => {}
@@ -522,6 +530,51 @@ fn grid_point(s: &State, p: GridPoint) -> Point {
         ),
         Column((p.col as usize).min(s.term.columns() - 1)),
     )
+}
+/// Where the screen is on the grid: how far it is scrolled back, and its size.
+#[derive(Clone, Copy)]
+struct Screen {
+    offset: i32,
+    rows: i32,
+    cols: u16,
+}
+impl Screen {
+    fn of(term: &Term<Listener>) -> Self {
+        Self {
+            offset: term.grid().display_offset() as i32,
+            rows: term.screen_lines() as i32,
+            cols: term.columns() as u16,
+        }
+    }
+    /// The first and last lines on screen.
+    fn lines(self) -> (Line, Line) {
+        (Line(-self.offset), Line(self.rows - 1 - self.offset))
+    }
+    /// Clamped to the screen, for what starts or ends off it.
+    fn point(self, point: Point) -> GridPoint {
+        let row = point.line.0 + self.offset;
+        if row < 0 {
+            GridPoint { row: 0, col: 0 }
+        } else if row >= self.rows {
+            GridPoint {
+                row: (self.rows - 1) as u16,
+                col: self.cols - 1,
+            }
+        } else {
+            GridPoint {
+                row: row as u16,
+                col: (point.column.0 as u16).min(self.cols - 1),
+            }
+        }
+    }
+}
+/// A terminal of that size whose events go nowhere.
+#[cfg(test)]
+fn test_terminal(cols: u16, rows: u16) -> TerminalHandle {
+    let notify = Arc::new(|_| {});
+    let (terminal, _input) =
+        TerminalHandle::new(TerminalId(1), cols, rows, 100, Palette::default(), notify);
+    terminal
 }
 
 #[cfg(test)]

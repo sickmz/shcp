@@ -164,9 +164,7 @@ pub(super) async fn upload_file(
             same_tail(&mut remote, &mut input, item.size).await
         };
         if same.await.unwrap_or(false) {
-            p.skip(item.size);
-            p.info.files_done += 1;
-            p.emit(false);
+            p.file_skipped(item.size);
             return Ok(());
         }
     }
@@ -186,16 +184,7 @@ pub(super) async fn upload_file(
     input.seek(SeekFrom::Start(offset)).await?;
     p.skip(offset);
     let result = async {
-        let mut buffer = vec![0; 256 * 1024];
-        loop {
-            let n = cancellable(cancel, async { Ok(input.read(&mut buffer).await?) }).await?;
-            if n == 0 {
-                break;
-            }
-            cancellable(cancel, async { Ok(output.write_all(&buffer[..n]).await?) }).await?;
-            p.info.bytes_done += n as u64;
-            p.emit(false);
-        }
+        pump(&mut input, &mut output, cancel, p).await?;
         cancellable(cancel, async { Ok(output.shutdown().await?) }).await?;
         Ok::<(), anyhow::Error>(())
     }
@@ -213,7 +202,6 @@ pub(super) async fn upload_file(
         return Err(error);
     }
     commit(sftp, &part, &item.remote, existing.is_some()).await?;
-    p.info.files_done += 1;
-    p.emit(false);
+    p.file_done();
     Ok(())
 }

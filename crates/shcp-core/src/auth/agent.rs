@@ -1,6 +1,5 @@
 //! Public-key authentication through a running SSH agent.
-//! Windows: the OpenSSH agent service (`\\.\pipe\openssh-ssh-agent`, or `SSH_AUTH_SOCK`),
-//! then Pageant. Unix: `SSH_AUTH_SOCK`.
+//! The OpenSSH agent service (`\\.\pipe\openssh-ssh-agent`, or `SSH_AUTH_SOCK`), then Pageant.
 use super::Outcome;
 use crate::host_key::Handler;
 use russh::{
@@ -14,7 +13,6 @@ type Agent = AgentClient<Box<dyn keys::agent::client::AgentStream + Send + Unpin
 /// Most servers allow 6 attempts (`MaxAuthTries`); leave room for the identity files.
 const MAX_AGENT_KEYS: usize = 4;
 
-#[cfg(windows)]
 async fn connect() -> Option<Agent> {
     let mut pipes = Vec::new();
     if let Ok(sock) = std::env::var("SSH_AUTH_SOCK")
@@ -50,17 +48,6 @@ async fn connect() -> Option<Agent> {
     }
 }
 
-#[cfg(not(windows))]
-async fn connect() -> Option<Agent> {
-    match AgentClient::connect_env().await {
-        Ok(agent) => Some(agent.dynamic()),
-        Err(error) => {
-            tracing::debug!("ssh-agent unavailable: {error}");
-            None
-        }
-    }
-}
-
 /// A connection to the running agent, to hand over to a server that was allowed to use it.
 pub(crate) async fn stream() -> Option<Box<dyn keys::agent::client::AgentStream + Send + Unpin>> {
     Some(connect().await?.into_inner())
@@ -69,9 +56,7 @@ pub(crate) async fn stream() -> Option<Box<dyn keys::agent::client::AgentStream 
 /// Public key of an identity file: `<file>.pub`, else the (possibly encrypted) OpenSSH file,
 /// whose public half is stored in clear.
 fn identity_public_key(path: &Path) -> Option<PublicKey> {
-    let mut pub_path = path.as_os_str().to_owned();
-    pub_path.push(".pub");
-    if let Ok(text) = std::fs::read_to_string(PathBuf::from(pub_path))
+    if let Ok(text) = std::fs::read_to_string(crate::ssh_keys::public_path(path))
         && let Ok(key) = PublicKey::from_openssh(text.trim())
     {
         return Some(key);
@@ -118,17 +103,10 @@ pub(super) async fn authenticate(
 
     for identity in ordered {
         let key = identity.public_key().into_owned();
-        let hash = if key.algorithm().is_rsa() {
-            handle
-                .best_supported_rsa_hash()
-                .await
-                .ok()
-                .flatten()
-                .flatten()
-                .or(Some(keys::HashAlg::Sha512))
-        } else {
-            None
-        };
+        // A server that cannot say gets the hash it would get by saying nothing.
+        let hash = super::rsa_hash(handle, key.algorithm())
+            .await
+            .unwrap_or(Some(keys::HashAlg::Sha512));
         let comment = identity.comment().to_owned();
         match handle
             .authenticate_publickey_with(user, key, hash, &mut agent)

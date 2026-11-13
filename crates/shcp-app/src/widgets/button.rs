@@ -1,10 +1,12 @@
 use super::icon::{Icon, IconName};
 use crate::theme::ActiveTheme as _;
 use gpui::prelude::*;
-use gpui::{App, ClickEvent, ElementId, SharedString, Window, div, px, transparent_black};
+use gpui::{
+    App, ClickEvent, ElementId, KeyDownEvent, SharedString, Window, div, px, transparent_black,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ButtonStyle {
+pub(crate) enum ButtonStyle {
     Ghost,
     /// Ghost, for the one action that destroys something.
     GhostDanger,
@@ -17,7 +19,7 @@ type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
 /// Compact button: optional icon and label.
 #[derive(IntoElement)]
-pub struct Button {
+pub(crate) struct Button {
     id: ElementId,
     icon: Option<IconName>,
     label: Option<SharedString>,
@@ -31,7 +33,7 @@ pub struct Button {
 }
 
 impl Button {
-    pub fn new(id: impl Into<ElementId>) -> Self {
+    pub(crate) fn new(id: impl Into<ElementId>) -> Self {
         Self {
             id: id.into(),
             icon: None,
@@ -45,43 +47,43 @@ impl Button {
             on_click: None,
         }
     }
-    pub fn keyboard_focus(mut self) -> Self {
+    pub(crate) fn keyboard_focus(mut self) -> Self {
         self.keyboard_focus = true;
         self
     }
 
-    pub fn tooltip(mut self, text: impl Into<SharedString>) -> Self {
+    pub(crate) fn tooltip(mut self, text: impl Into<SharedString>) -> Self {
         self.tooltip = Some(text.into());
         self
     }
 
-    pub fn icon(mut self, icon: IconName) -> Self {
+    pub(crate) fn icon(mut self, icon: IconName) -> Self {
         self.icon = Some(icon);
         self
     }
-    pub fn label(mut self, label: impl Into<SharedString>) -> Self {
+    pub(crate) fn label(mut self, label: impl Into<SharedString>) -> Self {
         self.label = Some(label.into());
         self
     }
-    pub fn style(mut self, style: ButtonStyle) -> Self {
+    pub(crate) fn style(mut self, style: ButtonStyle) -> Self {
         self.style = style;
         self
     }
-    pub fn disabled(mut self, disabled: bool) -> Self {
+    pub(crate) fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
         self
     }
     /// Ghost button that shows something currently open.
-    pub fn active(mut self, active: bool) -> Self {
+    pub(crate) fn active(mut self, active: bool) -> Self {
         self.active = active;
         self
     }
     /// Smaller, for tight headers.
-    pub fn compact(mut self) -> Self {
+    pub(crate) fn compact(mut self) -> Self {
         self.compact = true;
         self
     }
-    pub fn on_click(
+    pub(crate) fn on_click(
         mut self,
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
@@ -131,7 +133,7 @@ impl RenderOnce for Button {
                 gpui::FontWeight::MEDIUM
             })
             .text_color(fg)
-            .when_some(bg, |this, bg| this.bg(bg))
+            .when_some(bg, Styled::bg)
             .when(self.style == ButtonStyle::Filled, |this| {
                 this.border_1().border_color(theme.strong_border)
             })
@@ -156,12 +158,7 @@ impl RenderOnce for Button {
                     .tab_stop(true)
                     .focus(move |style| style.border_color(ring))
             })
-            .on_key_down(|event, _, cx| {
-                // Enter/Space belong to the focused button, whose click fires on key-up.
-                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                    cx.stop_propagation();
-                }
-            })
+            .on_key_down(keep_activation_keys)
             .cursor_pointer()
             // A translucent fill would wash out the label of a solid button.
             .when(solid, |b| {
@@ -178,5 +175,12 @@ impl RenderOnce for Button {
             Some(handler) => button.on_click(handler),
             None => button,
         }
+    }
+}
+
+/// Enter and Space belong to the focused control, whose click fires on key-up.
+pub(crate) fn keep_activation_keys(event: &KeyDownEvent, _: &mut Window, cx: &mut App) {
+    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+        cx.stop_propagation();
     }
 }

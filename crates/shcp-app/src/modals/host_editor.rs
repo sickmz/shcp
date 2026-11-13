@@ -1,12 +1,12 @@
 //! Create / edit an app host (SSH config hosts are read-only and never reach this modal). The
 //! address comes first and is often all it takes: the rest has a default and appears when asked for.
-use super::key_setup::{expand, ssh_folder};
 use super::{ModalLayer, button_row, editor_frame, title};
+use super::{expand, ssh_folder};
 use crate::modals::confirm::ConfirmModal;
 use crate::modals::host_appearance::AppearancePicker;
 use crate::state::AppState;
 use crate::theme::{ActiveTheme as _, Theme, mono_font, ui_px};
-use crate::widgets::button::{Button, ButtonStyle};
+use crate::widgets::button::{Button, ButtonStyle, keep_activation_keys};
 use crate::widgets::context_menu::{ContextMenu, MenuAnchor, MenuEntry, OpenMenu, handler};
 use crate::widgets::forward_fields::ForwardFields;
 use crate::widgets::host_color::color_dot;
@@ -16,7 +16,7 @@ use crate::widgets::tooltip::tooltip;
 use anyhow::{Context as _, Result, bail};
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    AnyElement, App, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable,
     PathPromptOptions, SharedString, Subscription, Task, Window, div, px, relative,
     transparent_black,
 };
@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 /// Opens a host that was just saved.
-pub type ConnectHandler = Rc<dyn Fn(HostId, &mut Window, &mut App)>;
+pub(crate) type ConnectHandler = Rc<dyn Fn(HostId, &mut Window, &mut App)>;
 
 const NAME_PLACEHOLDER: &str = "filled in from the address";
 const AUTOMATIC_KEY: &str =
@@ -64,7 +64,7 @@ enum RowState {
     Failed,
 }
 
-pub struct HostEditor {
+pub(crate) struct HostEditor {
     embedded: bool,
     state: Entity<AppState>,
     modals: Entity<ModalLayer>,
@@ -115,13 +115,13 @@ impl Focusable for HostEditor {
 }
 
 impl HostEditor {
-    pub fn embedded(mut self) -> Self {
+    pub(crate) fn embedded(mut self) -> Self {
         self.embedded = true;
         self
     }
 
     /// A new app host starting as a copy of another, which `~/.ssh/config` hosts can be too.
-    pub fn duplicate(
+    pub(crate) fn duplicate(
         state: Entity<AppState>,
         modals: Entity<ModalLayer>,
         source: HostConfig,
@@ -136,7 +136,7 @@ impl HostEditor {
         this
     }
 
-    pub fn new(
+    pub(crate) fn new(
         state: Entity<AppState>,
         modals: Entity<ModalLayer>,
         original: Option<HostConfig>,
@@ -144,24 +144,17 @@ impl HostEditor {
         cx: &mut Context<Self>,
     ) -> Self {
         let host = original.clone().unwrap_or_default();
-        let field = |placeholder: &str, value: &str, cx: &mut Context<Self>| {
-            let value = value.to_string();
-            let placeholder = placeholder.to_string();
-            cx.new(|cx| {
-                let mut input = TextInput::new(&placeholder, false, cx);
-                input.set_text(&value, cx);
-                input
-            })
+        let field = |placeholder: &str, text: &str, cx: &mut Context<Self>| {
+            cx.new(|cx| TextInput::new(placeholder, cx).with_text(text))
         };
         let start = original.as_ref().map_or_else(String::new, |host| {
             address_text(Some(&host.user), &host.hostname, Some(host.port))
         });
         let address_len = start.len();
         let address = cx.new(|cx| {
-            let mut input = TextInput::new("user@server:port, or paste a whole command", false, cx)
-                .command("ssh");
-            input.set_text(&start, cx);
-            input
+            TextInput::new("user@server:port, or paste a whole command", cx)
+                .command("ssh")
+                .with_text(&start)
         });
         let alias = field(NAME_PLACEHOLDER, &host.alias, cx);
         let group_input = field("Name of the new group", "", cx);
@@ -198,7 +191,7 @@ impl HostEditor {
             .as_ref()
             .and_then(|host| state.read(cx).host_group(&host.id))
             .map(str::to_string);
-        let default_count = HostConfig::default().server_alive_count_max;
+        let default_count = shcp_core::DEFAULT_SERVER_ALIVE_COUNT_MAX;
         let mut subscriptions = vec![cx.observe(&appearance, |_, _, cx| cx.notify())];
         for input in [
             &address,
@@ -276,7 +269,7 @@ impl HostEditor {
     }
 
     /// Offers to connect once saved. Without it the dialog only saves.
-    pub fn on_connect(mut self, handler: ConnectHandler) -> Self {
+    pub(crate) fn on_connect(mut self, handler: ConnectHandler) -> Self {
         self.on_connect = Some(handler);
         self
     }
@@ -492,7 +485,7 @@ impl HostEditor {
         }
         host.hostname = target.host;
         host.port = target.port.unwrap_or(22);
-        host.user = target.user.unwrap_or_else(|| HostConfig::default().user);
+        host.user = target.user.unwrap_or_else(shcp_core::local_user);
         if host.user.is_empty() {
             bail!("Say who to log in as: user@server");
         }
@@ -579,9 +572,13 @@ impl HostEditor {
             CheckUpdate::Step { step, hop, detail } => {
                 let stage = match (&hop, step) {
                     // The jump hosts are all part of getting there.
-                    (Some(_), _) => 0,
-                    (None, ConnectStep::Resolving | ConnectStep::Connecting)
-                    | (None, ConnectStep::StartingProxy) => 0,
+                    (Some(_), _)
+                    | (
+                        None,
+                        ConnectStep::Resolving
+                        | ConnectStep::Connecting
+                        | ConnectStep::StartingProxy,
+                    ) => 0,
                     (None, ConnectStep::Handshake | ConnectStep::VerifyingHostKey) => 1,
                     (None, ConnectStep::Authenticating | ConnectStep::OpeningForwards) => 2,
                 };
@@ -681,7 +678,7 @@ impl HostEditor {
         let this = cx.entity().downgrade();
         let pick = |group: Option<String>| {
             handler(this.clone(), move |view: &mut Self, _, cx| {
-                view.group = group.clone();
+                view.group.clone_from(&group);
                 cx.notify();
             })
         };
@@ -915,12 +912,7 @@ impl HostEditor {
             .tab_stop(true)
             .focus(move |style| style.border_color(ring))
             .tooltip(tooltip("Color"))
-            .on_key_down(|event, _, cx| {
-                // Enter/Space belong to the focused button, whose click fires on key-up.
-                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                    cx.stop_propagation();
-                }
-            })
+            .on_key_down(keep_activation_keys)
             .on_click(cx.listener(|this, _, _, cx| {
                 this.show_appearance = !this.show_appearance;
                 cx.notify();
@@ -952,7 +944,7 @@ impl HostEditor {
             .into_any_element();
         }
         let user = command.user.clone().filter(|user| !user.is_empty());
-        let user = user.unwrap_or_else(|| HostConfig::default().user);
+        let user = user.unwrap_or_else(shcp_core::local_user);
         let jump = self.jump.read(cx).text().trim().to_string();
         let jump = (!jump.is_empty()).then_some(jump).or(command.jump.clone());
         let plain = |text: String| div().text_color(theme.text_muted).child(text);
@@ -1122,7 +1114,7 @@ impl HostEditor {
                         .child(small(&theme, "missed replies").flex_none()),
                     remove_button("rm-keepalive", "Use the default").on_click(cx.listener(
                         |this, _, _, cx| {
-                            let count = HostConfig::default().server_alive_count_max.to_string();
+                            let count = shcp_core::DEFAULT_SERVER_ALIVE_COUNT_MAX.to_string();
                             this.keepalive
                                 .update(cx, |input, cx| input.set_text("", cx));
                             this.keepalive_count
@@ -1286,12 +1278,7 @@ impl HostEditor {
                     .focusable()
                     .tab_stop(true)
                     .focus(move |style| style.border_color(ring))
-                    .on_key_down(|event, _, cx| {
-                        // Enter/Space belong to the focused field, whose click fires on key-up.
-                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                            cx.stop_propagation();
-                        }
-                    })
+                    .on_key_down(keep_activation_keys)
                     .on_click(cx.listener(|this, _, _, cx| this.open_group_menu(cx)))
                     .child(div().min_w_0().truncate().child(label))
                     .child(Icon::new(IconName::ChevronDown).color(theme.text_muted)),
@@ -1307,18 +1294,16 @@ impl HostEditor {
             Some(CheckOutcome::SignedIn) => RowState::Done,
             Some(CheckOutcome::WillAsk(_)) if index < 2 => RowState::Done,
             Some(CheckOutcome::WillAsk(_)) => RowState::Asks,
-            Some(CheckOutcome::Failed(_)) if index < check.stage => RowState::Done,
+            Some(CheckOutcome::Failed(_)) | None if index < check.stage => RowState::Done,
             Some(CheckOutcome::Failed(_)) if index == check.stage => RowState::Failed,
-            Some(CheckOutcome::Failed(_)) => RowState::Pending,
-            None if index < check.stage => RowState::Done,
             None if index == check.stage && check.new_server.is_none() => RowState::Working,
             None if index == check.stage => RowState::Asks,
-            None => RowState::Pending,
+            Some(CheckOutcome::Failed(_)) | None => RowState::Pending,
         };
         let user = SshCommand::parse(self.address.read(cx).text())
             .ok()
             .and_then(|command| command.user)
-            .unwrap_or_else(|| HostConfig::default().user);
+            .unwrap_or_else(shcp_core::local_user);
         let labels = [
             "Reach the server".to_string(),
             "Verify the server".to_string(),
@@ -1399,6 +1384,147 @@ impl HostEditor {
     }
 }
 
+impl HostEditor {
+    /// Checks the connection, or stops the check under way.
+    fn check_button(&self, check_running: bool, can_save: bool, cx: &mut Context<Self>) -> Button {
+        Button::new("check-connection")
+            .keyboard_focus()
+            .icon(if check_running {
+                IconName::Close
+            } else {
+                IconName::Plug
+            })
+            .label(if check_running {
+                "Stop"
+            } else if self.check.is_some() {
+                "Check again"
+            } else {
+                "Check connection"
+            })
+            .style(ButtonStyle::Ghost)
+            .disabled(!check_running && !can_save)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if check_running {
+                    this.stop_check(cx);
+                } else {
+                    this.start_check(window, cx);
+                }
+            }))
+    }
+
+    /// The address, what it was read as, and what of it was left out.
+    fn address_block(&self, theme: &Theme, read_back: AnyElement) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .gap(px(5.))
+            .child(field(theme, "Address", self.address.clone()))
+            .child(read_back)
+            .when(!self.ignored.is_empty(), |this| {
+                this.child(
+                    small(theme, format!("Left out: {}", self.ignored.join(", "))).flex_none(),
+                )
+            })
+    }
+
+    /// The name and the group, with what is wrong with the name.
+    fn name_block(
+        &self,
+        theme: &Theme,
+        group_field: AnyElement,
+        name_error: Option<&'static str>,
+        name_warning: Option<String>,
+    ) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .gap(px(4.))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .gap(px(8.))
+                    .child(
+                        field(theme, "Name", self.alias.clone())
+                            .flex_grow()
+                            .flex_basis(px(0.)),
+                    )
+                    .child(field(theme, "Group", group_field).w(px(180.))),
+            )
+            .children(name_error.map(|error| {
+                div()
+                    .flex_none()
+                    .text_size(ui_px(12.))
+                    .text_color(theme.error)
+                    .child(error)
+            }))
+            .children(name_warning.map(|warning| {
+                div()
+                    .flex_none()
+                    .text_size(ui_px(12.))
+                    .text_color(theme.warning)
+                    .child(warning)
+            }))
+    }
+
+    /// Delete, check, cancel and the save buttons.
+    fn footer(
+        &self,
+        editing: bool,
+        check_button: Button,
+        check_failed: bool,
+        connects: bool,
+        can_save: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        button_row()
+            .flex_none()
+            .items_center()
+            .when(editing, |this| {
+                this.child(
+                    Button::new("delete")
+                        .keyboard_focus()
+                        .label("Delete")
+                        .style(ButtonStyle::GhostDanger)
+                        .on_click(cx.listener(|this, _, window, cx| this.delete(window, cx))),
+                )
+            })
+            .child(check_button)
+            .child(div().flex_1())
+            .child(
+                Button::new("cancel")
+                    .keyboard_focus()
+                    .label("Cancel")
+                    .style(ButtonStyle::Ghost)
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(super::CancelEvent))),
+            )
+            .child(
+                Button::new("save")
+                    .keyboard_focus()
+                    .label(if check_failed { "Save anyway" } else { "Save" })
+                    .style(if connects {
+                        ButtonStyle::Filled
+                    } else {
+                        ButtonStyle::Primary
+                    })
+                    .disabled(!can_save)
+                    .on_click(cx.listener(|this, _, window, cx| this.save(false, window, cx))),
+            )
+            .when(connects, |this| {
+                this.child(
+                    Button::new("save-connect")
+                        .keyboard_focus()
+                        .label("Save & connect")
+                        .style(ButtonStyle::Primary)
+                        .disabled(!can_save)
+                        .on_click(cx.listener(|this, _, window, cx| this.save(true, window, cx))),
+                )
+            })
+    }
+}
+
 impl Render for HostEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
@@ -1425,41 +1551,13 @@ impl Render for HostEditor {
         let check_panel = self.check_panel(cx);
         let read_back = self.read_back(cx);
         let connects = self.connects();
-        let check_button = Button::new("check-connection")
-            .keyboard_focus()
-            .icon(if check_running {
-                IconName::Close
-            } else {
-                IconName::Plug
-            })
-            .label(if check_running {
-                "Stop"
-            } else if self.check.is_some() {
-                "Check again"
-            } else {
-                "Check connection"
-            })
-            .style(ButtonStyle::Ghost)
-            .disabled(!check_running && !can_save)
-            .on_click(cx.listener(move |this, _, window, cx| {
-                if check_running {
-                    this.stop_check(cx);
-                } else {
-                    this.start_check(window, cx);
-                }
-            }));
+        let check_button = self.check_button(check_running, can_save, cx);
         let menu = self.menu.clone().map(|menu| {
             let this = cx.entity().downgrade();
             ContextMenu::new(
                 "host-group-menu",
                 menu,
-                Rc::new(move |_, cx| {
-                    this.update(cx, |this, cx| {
-                        this.menu = None;
-                        cx.notify();
-                    })
-                    .ok();
-                }),
+                crate::widgets::context_menu::dismiss(this, |view| &mut view.menu),
             )
         });
         editor_frame(&theme, 640., self.embedded)
@@ -1486,54 +1584,8 @@ impl Render for HostEditor {
                     .min_h_0()
                     .gap(px(12.))
                     .overflow_y_scroll()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_none()
-                            .gap(px(5.))
-                            .child(field(&theme, "Address", self.address.clone()))
-                            .child(read_back)
-                            .when(!self.ignored.is_empty(), |this| {
-                                this.child(
-                                    small(&theme, format!("Left out: {}", self.ignored.join(", ")))
-                                        .flex_none(),
-                                )
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_none()
-                            .gap(px(4.))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_none()
-                                    .gap(px(8.))
-                                    .child(
-                                        field(&theme, "Name", self.alias.clone())
-                                            .flex_grow()
-                                            .flex_basis(px(0.)),
-                                    )
-                                    .child(field(&theme, "Group", group_field).w(px(180.))),
-                            )
-                            .children(name_error.map(|error| {
-                                div()
-                                    .flex_none()
-                                    .text_size(ui_px(12.))
-                                    .text_color(theme.error)
-                                    .child(error)
-                            }))
-                            .children(name_warning.map(|warning| {
-                                div()
-                                    .flex_none()
-                                    .text_size(ui_px(12.))
-                                    .text_color(theme.warning)
-                                    .child(warning)
-                            })),
-                    )
+                    .child(self.address_block(&theme, read_back))
+                    .child(self.name_block(&theme, group_field, name_error, name_warning))
                     .child(sign_in)
                     .when(!rows.is_empty(), |this| {
                         this.child(
@@ -1564,57 +1616,7 @@ impl Render for HostEditor {
                     .clone()
                     .map(|e| div().flex_none().text_color(theme.error).child(e)),
             )
-            .child(
-                button_row()
-                    .flex_none()
-                    .items_center()
-                    .when(editing, |this| {
-                        this.child(
-                            Button::new("delete")
-                                .keyboard_focus()
-                                .label("Delete")
-                                .style(ButtonStyle::GhostDanger)
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.delete(window, cx)),
-                                ),
-                        )
-                    })
-                    .child(check_button)
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("cancel")
-                            .keyboard_focus()
-                            .label("Cancel")
-                            .style(ButtonStyle::Ghost)
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(super::CancelEvent))),
-                    )
-                    .child(
-                        Button::new("save")
-                            .keyboard_focus()
-                            .label(if check_failed { "Save anyway" } else { "Save" })
-                            .style(if connects {
-                                ButtonStyle::Filled
-                            } else {
-                                ButtonStyle::Primary
-                            })
-                            .disabled(!can_save)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.save(false, window, cx)),
-                            ),
-                    )
-                    .when(connects, |this| {
-                        this.child(
-                            Button::new("save-connect")
-                                .keyboard_focus()
-                                .label("Save & connect")
-                                .style(ButtonStyle::Primary)
-                                .disabled(!can_save)
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.save(true, window, cx)),
-                                ),
-                        )
-                    }),
-            )
+            .child(self.footer(editing, check_button, check_failed, connects, can_save, cx))
             .children(menu)
     }
 }

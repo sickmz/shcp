@@ -10,19 +10,16 @@ pub(crate) fn encode(input: MouseInput, mode: TermMode) -> Option<Vec<u8>> {
     }
     let base = match (input.action, input.button) {
         (MouseAction::Move, None) if mode.contains(TermMode::MOUSE_MOTION) => 3 + 32,
-        (MouseAction::Move, None) => return None,
-        (MouseAction::Move, Some(MouseButton::WheelUp | MouseButton::WheelDown)) => return None,
+        (MouseAction::Move, None | Some(MouseButton::WheelUp | MouseButton::WheelDown))
+        | (MouseAction::Release, Some(MouseButton::WheelUp | MouseButton::WheelDown))
+        | (_, None) => return None,
         (MouseAction::Move, Some(button)) => {
             if !mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION) {
                 return None;
             }
             button_code(button) + 32
         }
-        (MouseAction::Release, Some(MouseButton::WheelUp | MouseButton::WheelDown)) => {
-            return None;
-        }
         (_, Some(button)) => button_code(button),
-        (_, None) => return None,
     };
     let modifiers = 4 * u8::from(input.shift) + 8 * u8::from(input.alt) + 16 * u8::from(input.ctrl);
     let code = base + modifiers;

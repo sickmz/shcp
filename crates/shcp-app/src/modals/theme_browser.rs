@@ -7,13 +7,14 @@ use crate::theme::{ActiveTheme as _, Theme, ThemeCatalog, ThemeOrigin, ui_px};
 use crate::widgets::button::{Button, ButtonStyle};
 use crate::widgets::icon::{Icon, IconName};
 use crate::widgets::status::badge;
-use crate::widgets::text_input::{TextInput, TextInputEvent};
+use crate::widgets::text_input::{TYPING_PAUSE, TextInput, TextInputEvent};
 use gpui::prelude::*;
 use gpui::{AnyElement, Context, Entity, EventEmitter, SharedString, Subscription, Task, Window};
 use gpui::{div, px};
-use std::{path::PathBuf, time::Duration};
+use std::fmt::Write as _;
+use std::path::PathBuf;
 
-pub enum ThemeBrowserEvent {
+pub(crate) enum ThemeBrowserEvent {
     Back,
     /// The themes folder changed. `removed` names the themes that are gone.
     Changed {
@@ -35,7 +36,7 @@ struct InstalledExtension {
     themes: usize,
 }
 
-pub struct ThemeBrowser {
+pub(crate) struct ThemeBrowser {
     kind: ThemeKind,
     themes_dir: PathBuf,
     input: Entity<TextInput>,
@@ -85,7 +86,7 @@ fn installed_extensions<'a>(
 }
 
 impl ThemeBrowser {
-    pub fn new(
+    pub(crate) fn new(
         kind: ThemeKind,
         themes_dir: PathBuf,
         window: &mut Window,
@@ -95,7 +96,7 @@ impl ThemeBrowser {
             ThemeKind::Color => "Search themes on Open VSX",
             ThemeKind::Icon => "Search file icon themes on Open VSX",
         };
-        let input = cx.new(|cx| TextInput::new(placeholder, false, cx));
+        let input = cx.new(|cx| TextInput::new(placeholder, cx));
         let subscription = cx.subscribe_in(
             &input,
             window,
@@ -123,7 +124,7 @@ impl ThemeBrowser {
     }
 
     /// Called when the page is shown: the first time it lists the most popular themes.
-    pub fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.input.read(cx).focus(window);
         if matches!(self.results, Results::NotLoaded) {
             self.start_search(false, cx);
@@ -136,9 +137,7 @@ impl ThemeBrowser {
         self.results = Results::Loading;
         self.search = Some(cx.spawn(async move |this, cx| {
             if after_typing {
-                cx.background_executor()
-                    .timer(Duration::from_millis(500))
-                    .await;
+                cx.background_executor().timer(TYPING_PAUSE).await;
             }
             let found = cx
                 .background_executor()
@@ -176,10 +175,11 @@ impl ThemeBrowser {
                             plural(installed.written)
                         );
                         if installed.skipped > 0 {
-                            notice.push_str(&format!(
+                            let _ = write!(
+                                notice,
                                 ". Skipped {} shcp cannot use",
                                 plural(installed.skipped)
-                            ));
+                            );
                         }
                         this.notice = Some((notice, false));
                         cx.emit(ThemeBrowserEvent::Changed {
@@ -233,7 +233,6 @@ impl ThemeBrowser {
     }
 
     fn row(
-        &self,
         theme: &Theme,
         title: SharedString,
         detail: String,
@@ -313,7 +312,7 @@ impl ThemeBrowser {
                 )
                 .into_any_element()
         };
-        self.row(
+        Self::row(
             theme,
             extension.display_name.clone().into(),
             detail,
@@ -358,7 +357,7 @@ impl Render for ThemeBrowser {
             .enumerate()
             .map(|(index, extension)| {
                 let id = extension.id.clone();
-                self.row(
+                Self::row(
                     &theme,
                     extension.name.clone(),
                     format!("{} · {}", extension.id, plural(extension.themes)),

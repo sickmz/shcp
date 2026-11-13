@@ -1,15 +1,15 @@
 //! Picks a folder of the server by walking through it, or by typing where it is.
-use super::{button_row, card, title};
+use super::{cancel_and, card, title};
 use crate::state::AppState;
 use crate::theme::{ActiveTheme as _, row_px, ui_px};
 use crate::widgets::button::{Button, ButtonStyle};
 use crate::widgets::icon::{Icon, IconName};
-use crate::widgets::scrollbar::{ScrollDrag, ScrollMetrics, scrollbar};
+use crate::widgets::scrollbar::{ScrollDrag, list_scrollbar};
 use crate::widgets::text_input::{TextInput, TextInputEvent};
 use gpui::prelude::*;
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, ScrollStrategy,
-    Subscription, UniformListScrollHandle, Window, div, point, px, uniform_list,
+    Subscription, UniformListScrollHandle, Window, div, px, uniform_list,
 };
 use shcp_core::{EntryKind, Event, RemoteEntry, RequestId, SessionId};
 use std::ops::Range;
@@ -21,7 +21,7 @@ type Refusal = Box<dyn Fn(&str) -> Option<&'static str>>;
 const ROW_H: f32 = 28.;
 const LIST_H: f32 = 300.;
 
-pub struct FolderPicker {
+pub(crate) struct FolderPicker {
     state: Entity<AppState>,
     session: SessionId,
     title: String,
@@ -50,7 +50,7 @@ impl Focusable for FolderPicker {
 
 impl FolderPicker {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         state: Entity<AppState>,
         session: SessionId,
         title: String,
@@ -61,7 +61,7 @@ impl FolderPicker {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let input = cx.new(|cx| TextInput::new("Path on the server", false, cx));
+        let input = cx.new(|cx| TextInput::new("Path on the server", cx));
         let subscriptions = vec![
             cx.subscribe_in(
                 &input,
@@ -74,7 +74,7 @@ impl FolderPicker {
                             this.go_to(target, cx);
                         }
                     }
-                    TextInputEvent::Cancel => cx.emit(DismissEvent),
+                    TextInputEvent::Cancel => cx.emit(super::CancelEvent),
                     TextInputEvent::Changed => {}
                 },
             ),
@@ -143,7 +143,7 @@ impl FolderPicker {
                     .cloned()
                     .collect();
                 self.folders.sort_by_key(|entry| entry.name.to_lowercase());
-                self.path = path.clone();
+                self.path.clone_from(path);
                 self.input.update(cx, |input, cx| input.set_text(path, cx));
                 self.scroll.scroll_to_item(0, ScrollStrategy::Top);
             }
@@ -217,29 +217,12 @@ impl Render for FolderPicker {
             .flatten();
         let can_pick = !loading && !self.path.is_empty() && refused.is_none();
         let empty = self.folders.is_empty();
-        let bar = {
-            let (metrics, moved) = (self.scroll.clone(), self.scroll.clone());
-            let this = cx.entity().downgrade();
-            scrollbar(
-                self.scroll_drag.clone(),
-                theme.text_muted,
-                move |_| {
-                    let base = metrics.0.borrow().base_handle.clone();
-                    let max = f32::from(base.max_offset().height);
-                    let height = f32::from(base.bounds().size.height);
-                    (max > 0.).then(|| ScrollMetrics {
-                        position: -f32::from(base.offset().y) / max,
-                        visible: height / (height + max),
-                    })
-                },
-                move |position, _, cx| {
-                    let base = moved.0.borrow().base_handle.clone();
-                    let max = f32::from(base.max_offset().height);
-                    base.set_offset(point(px(0.), px(-position * max)));
-                    this.update(cx, |_, cx| cx.notify()).ok();
-                },
-            )
-        };
+        let bar = list_scrollbar(
+            &self.scroll,
+            self.scroll_drag.clone(),
+            theme.text_muted,
+            cx.entity().downgrade(),
+        );
         card(&theme, 560.)
             .child(title(&theme, self.title.clone()))
             .child(
@@ -308,23 +291,16 @@ impl Render for FolderPicker {
                     .text_color(theme.text_muted)
                     .child(reason)
             }))
-            .child(
-                button_row()
-                    .child(
-                        Button::new("picker-cancel")
-                            .keyboard_focus()
-                            .label("Cancel")
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
-                    )
-                    .child(
-                        Button::new("picker-confirm")
-                            .keyboard_focus()
-                            .label(self.confirm)
-                            .style(ButtonStyle::Primary)
-                            .disabled(!can_pick)
-                            .on_click(cx.listener(|this, _, window, cx| this.pick(window, cx))),
-                    ),
-            )
+            .child(cancel_and(
+                "picker-cancel",
+                |_, cx| cx.emit(super::CancelEvent),
+                Button::new("picker-confirm")
+                    .label(self.confirm)
+                    .style(ButtonStyle::Primary)
+                    .disabled(!can_pick)
+                    .on_click(cx.listener(|this, _, window, cx| this.pick(window, cx))),
+                cx,
+            ))
     }
 }
 

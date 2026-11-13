@@ -2,11 +2,6 @@
 use gpui::Keystroke;
 use shcp_core::term::{Key, KeyInput};
 
-pub enum Input {
-    Key(KeyInput),
-    Text,
-}
-
 fn named(key: &str) -> Option<Key> {
     Some(match key {
         "enter" => Key::Enter,
@@ -31,15 +26,16 @@ fn named(key: &str) -> Option<Key> {
     })
 }
 
-/// Returns `None` for keystrokes the terminal ignores (e.g. lone modifiers).
-pub fn from_keystroke(keystroke: &Keystroke) -> Option<Input> {
+/// Returns `None` for keystrokes the terminal ignores (e.g. lone modifiers) and for text, which
+/// platform text input delivers.
+pub(crate) fn from_keystroke(keystroke: &Keystroke) -> Option<KeyInput> {
     let m = keystroke.modifiers;
     let named = named(&keystroke.key);
     let is_char = matches!(named, Some(Key::Char(_)) | None);
     let text = keystroke.key_char.as_ref().filter(|t| !t.is_empty());
     // Plain typing, shifted symbols and AltGr (reported as ctrl+alt) arrive as text.
     if text.is_some() && is_char && (!m.control && !m.alt || m.control && m.alt) && !m.platform {
-        return Some(Input::Text);
+        return None;
     }
     let key = named.or_else(|| {
         let mut chars = keystroke.key.chars();
@@ -48,10 +44,10 @@ pub fn from_keystroke(keystroke: &Keystroke) -> Option<Input> {
             _ => None,
         }
     })?;
-    Some(Input::Key(KeyInput {
+    Some(KeyInput {
         key,
         ctrl: m.control,
         alt: m.alt,
         shift: m.shift,
-    }))
+    })
 }

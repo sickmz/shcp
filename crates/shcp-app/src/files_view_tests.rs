@@ -3,7 +3,7 @@ use super::{copy_name, first_starting_with, is_inside, moved_cursor, parse_mode,
 use std::collections::HashSet;
 
 fn names(list: &[&str]) -> HashSet<String> {
-    list.iter().map(|name| name.to_string()).collect()
+    list.iter().map(ToString::to_string).collect()
 }
 
 #[test]

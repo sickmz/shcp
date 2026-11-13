@@ -1,16 +1,16 @@
 //! Command palette: type to filter hosts, open tabs and commands, Enter runs the selected one.
-use crate::theme::{ActiveTheme as _, ui_px};
+use crate::theme::{ActiveTheme as _, Theme, ui_px};
 use crate::widgets::context_menu::Handler;
 use crate::widgets::host_color::{HostColor, color_dot};
 use crate::widgets::icon::{Icon, IconName};
 use crate::widgets::text_input::{TextInput, TextInputEvent};
 use gpui::prelude::*;
 use gpui::{
-    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, KeyDownEvent,
-    MouseButton, ScrollHandle, SharedString, Subscription, Window, div, px,
+    AnyElement, App, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable,
+    KeyDownEvent, MouseButton, ScrollHandle, SharedString, Subscription, Window, div, px,
 };
 
-pub struct PaletteItem {
+pub(crate) struct PaletteItem {
     /// The heading it goes under.
     pub section: SharedString,
     pub title: SharedString,
@@ -26,7 +26,7 @@ pub struct PaletteItem {
     pub alt: Option<Handler>,
 }
 
-pub struct CommandPalette {
+pub(crate) struct CommandPalette {
     items: Vec<PaletteItem>,
     /// Indexes into `items` matching the query.
     visible: Vec<usize>,
@@ -58,15 +58,19 @@ fn matches(item: &PaletteItem, query: &str) -> bool {
 }
 
 impl CommandPalette {
-    pub fn new(items: Vec<PaletteItem>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| TextInput::new("Hosts, tabs, commands, actions", false, cx).bare());
+    pub(crate) fn new(
+        items: Vec<PaletteItem>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let input = cx.new(|cx| TextInput::new("Hosts, tabs, commands, actions", cx).bare());
         let subscription = cx.subscribe_in(
             &input,
             window,
             |this, _, event: &TextInputEvent, window, cx| match event {
                 TextInputEvent::Changed => this.refilter(cx),
-                TextInputEvent::Submit => this.run_selected(this.selected, window, cx),
-                TextInputEvent::Cancel => cx.emit(DismissEvent),
+                TextInputEvent::Submit => this.run_row(this.selected, false, window, cx),
+                TextInputEvent::Cancel => cx.emit(super::CancelEvent),
             },
         );
         let visible = (0..items.len()).collect();
@@ -92,10 +96,6 @@ impl CommandPalette {
         self.selected = 0;
         self.scroll.scroll_to_item(0);
         cx.notify();
-    }
-
-    fn run_selected(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.run_row(row, false, window, cx);
     }
 
     fn run_row(&mut self, row: usize, alt: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -126,9 +126,7 @@ impl CommandPalette {
         cx.stop_propagation();
         cx.notify();
     }
-}
 
-impl CommandPalette {
     /// Where a row is among the children of the list, whose headings count too. The first heading
     /// goes with its row, so the list can scroll all the way back.
     fn child_of(&self, row: usize) -> usize {
@@ -145,119 +143,132 @@ impl CommandPalette {
     }
 }
 
-impl Render for CommandPalette {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+impl CommandPalette {
+    /// The visible items, under the heading of each section.
+    fn rows(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut rows: Vec<AnyElement> = Vec::new();
         let mut section: Option<SharedString> = None;
-        let any_alt = self
-            .visible
-            .get(self.selected)
-            .and_then(|index| self.items.get(*index))
-            .is_some_and(|item| item.alt.is_some());
         for (row, index) in self.visible.iter().enumerate() {
             let Some(item) = self.items.get(*index) else {
                 continue;
             };
             if section.as_ref() != Some(&item.section) {
                 section = Some(item.section.clone());
-                rows.push(
-                    div()
-                        .flex_none()
-                        .px(px(10.))
-                        .pt(px(10.))
-                        .pb(px(4.))
-                        .text_size(ui_px(12.))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme.text_disabled)
-                        .child(item.section.clone())
-                        .into_any_element(),
-                );
+                rows.push(section_heading(theme, item.section.clone()));
             }
-            let selected = row == self.selected;
-            let icon_color = match item.tint {
-                Some(color) => theme.host_color(color),
-                None if selected => theme.text,
-                None => theme.text_disabled,
-            };
-            rows.push(
-                div()
-                    .id(("palette-row", row))
-                    .h(px(36.))
-                    .flex_none()
-                    .px(px(10.))
-                    .flex()
-                    .items_center()
-                    .gap(px(10.))
-                    .rounded(px(crate::theme::RADIUS_CONTROL))
-                    .cursor_pointer()
-                    .when(selected, |this| this.bg(theme.active))
-                    .on_mouse_move(cx.listener(move |this, _, _, cx| {
-                        if this.selected != row {
-                            this.selected = row;
-                            cx.notify();
-                        }
-                    }))
-                    .on_click(
-                        cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                            this.run_row(row, event.modifiers().shift, window, cx)
-                        }),
-                    )
-                    .child(
-                        // As wide for all, so titles line up.
-                        div().w(px(22.)).flex().flex_none().justify_center().child(
-                            match item.dot {
-                                Some((color, connected)) => {
-                                    color_dot(theme.host_color(color), connected).into_any_element()
-                                }
-                                None => Icon::new(item.icon).color(icon_color).into_any_element(),
-                            },
-                        ),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .max_w(px(320.))
-                            .truncate()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .child(item.title.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(ui_px(12.))
-                            .text_color(theme.text_disabled)
-                            .children(item.detail.clone()),
-                    )
-                    .children(item.shortcut.map(|keys| {
-                        div()
-                            .flex_none()
-                            .font_family(crate::theme::mono_font())
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_size(ui_px(11.))
-                            .text_color(theme.text_disabled)
-                            .child(crate::actions::with_current_keys(keys, cx).replace('+', " "))
-                    }))
-                    .into_any_element(),
-            );
+            rows.push(self.item_row(row, item, theme, cx));
         }
-        let key = |keys: &'static str, what: &'static str| {
-            div()
-                .flex()
-                .items_center()
-                .gap(px(5.))
-                .child(
-                    div()
-                        .font_family(crate::theme::mono_font())
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_size(ui_px(11.))
-                        .child(keys),
-                )
-                .child(what)
+        rows
+    }
+
+    fn item_row(
+        &self,
+        row: usize,
+        item: &PaletteItem,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selected = row == self.selected;
+        let icon_color = match item.tint {
+            Some(color) => theme.host_color(color),
+            None if selected => theme.text,
+            None => theme.text_disabled,
         };
+        div()
+            .id(("palette-row", row))
+            .h(px(36.))
+            .flex_none()
+            .px(px(10.))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .rounded(px(crate::theme::RADIUS_CONTROL))
+            .cursor_pointer()
+            .when(selected, |this| this.bg(theme.active))
+            .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                if this.selected != row {
+                    this.selected = row;
+                    cx.notify();
+                }
+            }))
+            .on_click(
+                cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                    this.run_row(row, event.modifiers().shift, window, cx)
+                }),
+            )
+            .child(
+                // As wide for all, so titles line up.
+                div()
+                    .w(px(22.))
+                    .flex()
+                    .flex_none()
+                    .justify_center()
+                    .child(match item.dot {
+                        Some((color, connected)) => {
+                            color_dot(theme.host_color(color), connected).into_any_element()
+                        }
+                        None => Icon::new(item.icon).color(icon_color).into_any_element(),
+                    }),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .max_w(px(320.))
+                    .truncate()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text)
+                    .child(item.title.clone()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(ui_px(12.))
+                    .text_color(theme.text_disabled)
+                    .children(item.detail.clone()),
+            )
+            .children(item.shortcut.map(|keys| {
+                div()
+                    .flex_none()
+                    .font_family(crate::theme::mono_font())
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(ui_px(11.))
+                    .text_color(theme.text_disabled)
+                    .child(crate::actions::with_current_keys(keys, cx).replace('+', " "))
+            }))
+            .into_any_element()
+    }
+
+    /// The search field.
+    fn search_header(&self, theme: &Theme) -> Div {
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(10.))
+            .h(px(50.))
+            .px(px(16.))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                Icon::new(IconName::Search)
+                    .size(px(16.))
+                    .color(theme.text_disabled),
+            )
+            .child(div().flex_1().min_w_0().child(self.input.clone()))
+    }
+}
+
+impl Render for CommandPalette {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let any_alt = self
+            .visible
+            .get(self.selected)
+            .and_then(|index| self.items.get(*index))
+            .is_some_and(|item| item.alt.is_some());
+        let rows = self.rows(&theme, cx);
         let empty = rows.is_empty();
         // Fills the layer so the card sits near the top; clicking the backdrop closes it.
         div()
@@ -267,7 +278,7 @@ impl Render for CommandPalette {
             .pt(px(72.))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
+                cx.listener(|_, _, _, cx| cx.emit(super::CancelEvent)),
             )
             .child(
                 div()
@@ -275,16 +286,7 @@ impl Render for CommandPalette {
                     .max_h(px(560.))
                     .flex()
                     .flex_col()
-                    .rounded(px(crate::theme::RADIUS_CARD))
-                    .map(|this| {
-                        crate::panel::floating(
-                            this,
-                            &theme,
-                            crate::theme::RADIUS_CARD,
-                            theme.strong_border,
-                        )
-                    })
-                    .shadow(crate::theme::float_shadow())
+                    .map(|this| crate::panel::floating_card(this, &theme, theme.strong_border))
                     .overflow_hidden()
                     .text_size(ui_px(13.))
                     .text_color(theme.text)
@@ -297,23 +299,7 @@ impl Render for CommandPalette {
                         }
                     }))
                     .on_key_down(cx.listener(Self::on_key_down))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .gap(px(10.))
-                            .h(px(50.))
-                            .px(px(16.))
-                            .border_b_1()
-                            .border_color(theme.border)
-                            .child(
-                                Icon::new(IconName::Search)
-                                    .size(px(16.))
-                                    .color(theme.text_disabled),
-                            )
-                            .child(div().flex_1().min_w_0().child(self.input.clone())),
-                    )
+                    .child(self.search_header(&theme))
                     .child(
                         div()
                             .id("palette-list")
@@ -336,25 +322,56 @@ impl Render for CommandPalette {
                                 )
                             }),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .gap(px(16.))
-                            .px(px(16.))
-                            .py(px(8.))
-                            .border_t_1()
-                            .border_color(theme.border)
-                            .text_size(ui_px(12.))
-                            .text_color(theme.text_disabled)
-                            .child(key("Enter", if any_alt { "Terminal" } else { "Run" }))
-                            .when(any_alt, |this| this.child(key("Shift Enter", "Files")))
-                            .child(div().flex_1())
-                            .child(key("Esc", "Close")),
-                    ),
+                    .child(footer(&theme, any_alt)),
             )
     }
+}
+
+fn section_heading(theme: &Theme, section: SharedString) -> AnyElement {
+    div()
+        .flex_none()
+        .px(px(10.))
+        .pt(px(10.))
+        .pb(px(4.))
+        .text_size(ui_px(12.))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(theme.text_disabled)
+        .child(section)
+        .into_any_element()
+}
+
+/// Keys and what they do, under the list.
+fn key_hint(keys: &'static str, what: &'static str) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(5.))
+        .child(
+            div()
+                .font_family(crate::theme::mono_font())
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_size(ui_px(11.))
+                .child(keys),
+        )
+        .child(what)
+}
+
+fn footer(theme: &Theme, any_alt: bool) -> Div {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(16.))
+        .px(px(16.))
+        .py(px(8.))
+        .border_t_1()
+        .border_color(theme.border)
+        .text_size(ui_px(12.))
+        .text_color(theme.text_disabled)
+        .child(key_hint("Enter", if any_alt { "Terminal" } else { "Run" }))
+        .when(any_alt, |this| this.child(key_hint("Shift Enter", "Files")))
+        .child(div().flex_1())
+        .child(key_hint("Esc", "Close"))
 }
 
 impl super::ModalView for CommandPalette {

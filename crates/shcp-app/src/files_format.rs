@@ -3,42 +3,37 @@ use chrono::{DateTime, Local, Utc};
 use shcp_core::{EntryKind, RemoteEntry};
 use std::time::SystemTime;
 
-pub fn bytes(size: u64) -> String {
+/// A size as a number and its unit: bytes whole, larger units with one decimal.
+fn scaled(size: u64) -> (String, &'static str) {
     let mut value = size as f64;
-    for unit in ["B", "KB", "MB", "GB", "TB"] {
-        if value < 1024. || unit == "TB" {
+    for unit in ["B", "KB", "MB", "GB"] {
+        if value < 1024. {
             return if unit == "B" {
-                format!("{size} B")
-            } else {
-                format!("{value:.1} {unit}")
-            };
-        }
-        value /= 1024.;
-    }
-    String::new()
-}
-
-/// A size in two parts, the number and its unit, for columns that set them apart.
-pub fn size_parts(entry: &RemoteEntry) -> (String, &'static str) {
-    if entry.kind == EntryKind::Dir {
-        return (String::new(), "");
-    }
-    let mut value = entry.size as f64;
-    for unit in ["B", "KB", "MB", "GB", "TB"] {
-        if value < 1024. || unit == "TB" {
-            return if unit == "B" {
-                (entry.size.to_string(), unit)
+                (size.to_string(), unit)
             } else {
                 (format!("{value:.1}"), unit)
             };
         }
         value /= 1024.;
     }
-    (String::new(), "")
+    (format!("{value:.1}"), "TB")
+}
+
+pub(crate) fn bytes(size: u64) -> String {
+    let (number, unit) = scaled(size);
+    format!("{number} {unit}")
+}
+
+/// A size in two parts, the number and its unit, for columns that set them apart.
+pub(crate) fn size_parts(entry: &RemoteEntry) -> (String, &'static str) {
+    if entry.kind == EntryKind::Dir {
+        return (String::new(), "");
+    }
+    scaled(entry.size)
 }
 
 /// The short label a file wears in the list: its extension, or what a dot file is about.
-pub fn badge(name: &str) -> String {
+pub(crate) fn badge(name: &str) -> String {
     let short = |text: &str| text.chars().take(4).collect::<String>().to_lowercase();
     match name.strip_prefix('.') {
         Some(rest) if !rest.contains('.') => short(rest),
@@ -52,7 +47,7 @@ pub fn badge(name: &str) -> String {
 }
 
 /// How long ago, for a list: minutes, hours, days, then the date.
-pub fn relative(time: Option<SystemTime>, now: SystemTime) -> String {
+pub(crate) fn relative(time: Option<SystemTime>, now: SystemTime) -> String {
     let Some(time) = time else {
         return String::new();
     };
@@ -73,7 +68,7 @@ pub fn relative(time: Option<SystemTime>, now: SystemTime) -> String {
 }
 
 /// `YYYY-MM-DD HH:MM` in the time zone of this PC.
-pub fn modified(time: Option<SystemTime>) -> String {
+pub(crate) fn modified(time: Option<SystemTime>) -> String {
     time.map_or_else(String::new, |time| {
         DateTime::<Local>::from(time)
             .format("%Y-%m-%d %H:%M")
@@ -82,7 +77,7 @@ pub fn modified(time: Option<SystemTime>) -> String {
 }
 
 /// The same moment in UTC, for the tooltip.
-pub fn modified_utc(time: Option<SystemTime>) -> String {
+pub(crate) fn modified_utc(time: Option<SystemTime>) -> String {
     time.map_or_else(String::new, |time| {
         DateTime::<Utc>::from(time)
             .format("%Y-%m-%d %H:%M UTC")
@@ -90,7 +85,7 @@ pub fn modified_utc(time: Option<SystemTime>) -> String {
     })
 }
 
-pub fn permissions(entry: &RemoteEntry) -> String {
+pub(crate) fn permissions(entry: &RemoteEntry) -> String {
     let Some(mode) = entry.permissions else {
         return String::new();
     };
@@ -107,7 +102,7 @@ pub fn permissions(entry: &RemoteEntry) -> String {
     format!("{kind}{bits}")
 }
 
-pub fn join(dir: &str, name: &str) -> String {
+pub(crate) fn join(dir: &str, name: &str) -> String {
     if dir.ends_with('/') {
         format!("{dir}{name}")
     } else {
@@ -115,7 +110,7 @@ pub fn join(dir: &str, name: &str) -> String {
     }
 }
 
-pub fn parent(path: &str) -> String {
+pub(crate) fn parent(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
     match trimmed.rfind('/') {
         Some(0) | None => "/".to_string(),

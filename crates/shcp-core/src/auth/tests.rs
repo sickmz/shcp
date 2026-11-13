@@ -1,13 +1,12 @@
 //! Logs in to a real SSH server in memory, whose methods each test decides.
 use super::*;
-use crate::{AppPaths, HostId, SessionId, session::Prompts};
+use crate::{HostId, SessionId, test_support::Scratch};
 use parking_lot::Mutex;
 use russh::{
     keys::ssh_key::private::Ed25519Keypair,
     server::{self, Auth, PublicKeyOffer, Response, VerifiedPublicKey},
 };
-use std::{borrow::Cow, path::PathBuf, time::Duration};
-use tokio_util::sync::CancellationToken;
+use std::{borrow::Cow, time::Duration};
 
 /// What the test server accepts.
 #[derive(Clone, Default)]
@@ -126,19 +125,13 @@ struct Run {
     asked: Vec<SessionState>,
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("shcp-auth-{name}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 fn test_key(seed: u8) -> PrivateKey {
     PrivateKey::from(Ed25519Keypair::from_seed(&[seed; 32]))
 }
 
 async fn login(name: &str, rules: Rules, script: Script, with_key: bool) -> Run {
-    let dir = scratch(name);
-    let identity = dir.join("id");
+    let dir = Scratch::new(&format!("auth-{name}"));
+    let identity = dir.0.join("id");
     let identity_files = if with_key {
         let text = test_key(1)
             .to_openssh(russh::keys::ssh_key::LineEnding::LF)
@@ -160,27 +153,14 @@ async fn login(name: &str, rules: Rules, script: Script, with_key: bool) -> Run 
         ..Default::default()
     };
     let (events, receiver) = async_channel::unbounded();
-    let context = Arc::new(SessionContext {
-        id: SessionId(1),
-        host: host.clone(),
-        jumps: vec![],
-        remote_forwards: Mutex::default(),
-        paths: AppPaths {
-            config_dir: dir.clone(),
-            data_dir: dir.clone(),
-            log_dir: dir.clone(),
-            known_hosts: dir.join("known_hosts"),
-            ssh_config: dir.join("config"),
-        },
+    let context = Arc::new(SessionContext::new(
+        SessionId(1),
+        host.clone(),
+        vec![],
+        dir.paths(),
         events,
-        cancel: CancellationToken::new(),
-        prompts: Prompts::new(),
-        known_hosts_lock: Arc::new(Mutex::new(())),
-        use_agent: false,
-        open_forwards: false,
-        persist_terminals: false,
-        tmux: Default::default(),
-    });
+        Arc::new(Mutex::new(())),
+    ));
     let seen = Arc::new(Mutex::new(Seen::default()));
     let config = Arc::new(server::Config {
         keys: vec![test_key(2)],
@@ -248,7 +228,6 @@ async fn login(name: &str, rules: Rules, script: Script, with_key: bool) -> Run 
     // The client's task may keep its handler for a while, and with it the sender.
     context.events.close();
     let asked = user.await.unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
     Run {
         result,
         seen,

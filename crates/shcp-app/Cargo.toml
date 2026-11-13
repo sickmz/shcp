@@ -27,3 +27,6 @@ embed-resource = "3"
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+
+[lints]
+workspace = true

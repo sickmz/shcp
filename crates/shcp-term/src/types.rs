@@ -44,7 +44,6 @@ pub struct TermSnapshot {
     pub rows: u16,
     pub cells: Vec<Cell>,
     pub cursor: Option<CursorInfo>,
-    pub display_offset: usize,
     pub selection: Option<(GridPoint, GridPoint)>,
     pub search_hits: Vec<SearchHit>,
     /// The cells of each web link on screen.

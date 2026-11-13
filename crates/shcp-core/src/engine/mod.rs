@@ -4,7 +4,7 @@ use crate::{
     config::Store,
     edit::EditCommand,
     files::FileOp,
-    session::{self, Command, Control, OpenTerminal, Prompts},
+    session::{self, Command, Control, OpenTerminal},
     term::{Palette, TerminalEvent},
     transfer::{self, Job},
     *,
@@ -25,9 +25,10 @@ use tokio::runtime::{Handle, Runtime};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
+/// Dropping it lets the runtime thread wind down.
 struct RuntimeOwner {
     handle: Handle,
-    stop: Option<std::sync::mpsc::Sender<()>>,
+    _stop: std::sync::mpsc::Sender<()>,
 }
 impl RuntimeOwner {
     fn new() -> Result<Self> {
@@ -42,7 +43,7 @@ impl RuntimeOwner {
             .spawn(move || runtime_thread(runtime, wait))?;
         Ok(Self {
             handle,
-            stop: Some(stop),
+            _stop: stop,
         })
     }
 }
@@ -51,11 +52,6 @@ fn runtime_thread(runtime: Runtime, wait: std::sync::mpsc::Receiver<()>) {
     // Give cancellation cleanup time without blocking the UI thread that drops the handle.
     runtime.block_on(async { tokio::time::sleep(Duration::from_secs(2)).await });
     runtime.shutdown_timeout(Duration::from_secs(1));
-}
-impl Drop for RuntimeOwner {
-    fn drop(&mut self) {
-        self.stop.take();
-    }
 }
 /// The commands of each remote file open in a local editor.
 type EditRegistry = HashMap<(SessionId, String), Sender<EditCommand>>;
@@ -92,17 +88,13 @@ impl Drop for Inner {
 #[derive(Clone)]
 pub struct EngineHandle(Arc<Inner>);
 
-pub fn start(settings_override: Option<Settings>) -> Result<(EngineHandle, Receiver<Event>)> {
+pub fn start() -> Result<(EngineHandle, Receiver<Event>)> {
     let mut store = Store::new()?;
     logging::init(&store.paths.log_dir)?;
     let (events, receiver) = async_channel::unbounded();
     let mut warnings = store.load();
     if let Err(error) = store.load_settings() {
         warnings.push(format!("Could not read settings.toml: {error:#}"));
-    }
-    if let Some(settings) = settings_override {
-        crate::config::validate_settings(&settings)?;
-        store.settings = settings;
     }
     for message in warnings {
         let _ = events.try_send(Event::Notice {
@@ -170,6 +162,20 @@ impl EngineHandle {
             });
         }
     }
+    /// Reports a session that failed before it could start.
+    fn fail(&self, id: SessionId, host: &HostId, message: String) {
+        self.emit(Event::Session {
+            id,
+            host: host.clone(),
+            state: SessionState::Failed {
+                error: ConnectError {
+                    kind: ConnectErrorKind::Other,
+                    message,
+                    hint: None,
+                },
+            },
+        });
+    }
     pub fn connect(&self, host: &HostId) -> SessionId {
         let mut sessions = self.0.sessions.lock();
         if let Some(control) = sessions.values().find(|c| {
@@ -182,17 +188,7 @@ impl EngineHandle {
         let id = SessionId(self.next());
         let store = self.0.store.lock();
         let Some(mut config) = store.hosts.iter().find(|h| &h.id == host).cloned() else {
-            self.emit(Event::Session {
-                id,
-                host: host.clone(),
-                state: SessionState::Failed {
-                    error: ConnectError {
-                        kind: ConnectErrorKind::Other,
-                        message: format!("Host {} does not exist", host.0),
-                        hint: None,
-                    },
-                },
-            });
+            self.fail(id, host, format!("Host {} does not exist", host.0));
             return id;
         };
         for spec in store
@@ -213,34 +209,23 @@ impl EngineHandle {
         let jumps = match crate::config::ssh::jump_chain(&config, &store.hosts) {
             Ok(jumps) => jumps,
             Err(error) => {
-                self.emit(Event::Session {
-                    id,
-                    host: host.clone(),
-                    state: SessionState::Failed {
-                        error: ConnectError {
-                            kind: ConnectErrorKind::Other,
-                            message: format!("{error:#}"),
-                            hint: None,
-                        },
-                    },
-                });
+                self.fail(id, host, format!("{error:#}"));
                 return id;
             }
         };
+        let persist_terminals = store.settings.keeps_terminals(&config.id.0);
         let context = session::Context {
-            id,
-            persist_terminals: store.settings.keeps_terminals(&config.id.0),
-            host: config,
-            jumps,
-            remote_forwards: Mutex::new(HashMap::new()),
-            paths: store.paths.clone(),
-            events: self.0.events.clone(),
-            cancel: CancellationToken::new(),
-            prompts: Prompts::new(),
-            known_hosts_lock: self.0.known_hosts_lock.clone(),
             use_agent: store.settings.use_ssh_agent,
             open_forwards: store.settings.auto_open_forwards,
-            tmux: Default::default(),
+            persist_terminals,
+            ..session::Context::new(
+                id,
+                config,
+                jumps,
+                store.paths.clone(),
+                self.0.events.clone(),
+                self.0.known_hosts_lock.clone(),
+            )
         };
         let (control, commands) = Control::new(context, store.settings.transfer_concurrency);
         sessions.insert(id, control.clone());
@@ -254,19 +239,15 @@ impl EngineHandle {
         let jumps = crate::config::ssh::jump_chain(&host, &store.hosts)?;
         let (events, receiver) = async_channel::unbounded();
         let context = session::Context {
-            id: SessionId(self.next()),
-            host,
-            jumps,
-            remote_forwards: Mutex::new(HashMap::new()),
-            paths: store.paths.clone(),
-            events,
-            cancel: CancellationToken::new(),
-            prompts: Prompts::new(),
-            known_hosts_lock: self.0.known_hosts_lock.clone(),
             use_agent: store.settings.use_ssh_agent,
-            open_forwards: false,
-            persist_terminals: false,
-            tmux: Default::default(),
+            ..session::Context::new(
+                SessionId(self.next()),
+                host,
+                jumps,
+                store.paths.clone(),
+                events,
+                self.0.known_hosts_lock.clone(),
+            )
         };
         Ok(crate::check::start(
             &self.0.runtime.handle,
@@ -284,14 +265,8 @@ impl EngineHandle {
         }
     }
     pub fn answer_host_key(&self, s: SessionId, accept: bool) {
-        if let Some(c) = self.control(s)
-            && c.context
-                .prompts
-                .kind
-                .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-        {
-            let _ = c.context.prompts.host_tx.try_send(accept);
+        if let Some(c) = self.control(s) {
+            c.context.prompts.answer_host_key(accept);
         }
     }
     /// `remember` keeps the passphrase in the Credential Manager, once it proves right.
@@ -300,14 +275,8 @@ impl EngineHandle {
             secret: Zeroizing::new(passphrase),
             remember,
         });
-        if let Some(c) = self.control(s)
-            && c.context
-                .prompts
-                .kind
-                .compare_exchange(2, 0, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-        {
-            let _ = c.context.prompts.pass_tx.try_send(value);
+        if let Some(c) = self.control(s) {
+            c.context.prompts.answer_passphrase(value);
         }
     }
     /// `remember` keeps the password in the Credential Manager, once the server accepts it.
@@ -316,14 +285,8 @@ impl EngineHandle {
             secret: Zeroizing::new(password),
             remember,
         });
-        if let Some(c) = self.control(s)
-            && c.context
-                .prompts
-                .kind
-                .compare_exchange(3, 0, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-        {
-            let _ = c.context.prompts.password_tx.try_send(value);
+        if let Some(c) = self.control(s) {
+            c.context.prompts.answer_password(value);
         }
     }
     /// With `persist`, the shell lives on the server under that name, if the server has what it
@@ -344,11 +307,12 @@ impl EngineHandle {
                 TerminalEvent::Copy(text) => Event::TerminalCopy { text },
             });
         });
+        let history = self.0.store.lock().settings.scrollback_lines;
         let (terminal, input) = TerminalHandle::new(
             id,
             cols,
             rows,
-            self.settings().scrollback_lines,
+            history,
             self.0.palette.lock().clone(),
             notify,
         );
@@ -379,23 +343,15 @@ impl EngineHandle {
             .lock()
             .insert(terminal.id(), terminal.clone());
         let control = self.control(s);
-        let log_dir = control.as_ref().and_then(|control| {
+        let (log_dir, startup, history) = {
             let store = self.0.store.lock();
-            store
-                .settings
-                .session_logs
-                .contains(&control.context.host.id.0)
-                .then(|| crate::session_log::folder(&store.paths.data_dir))
-        });
-        let startup = control.as_ref().and_then(|control| {
-            let store = self.0.store.lock();
-            store
-                .settings
-                .startup_commands
-                .get(&control.context.host.id.0)
-                .cloned()
-        });
-        let history = self.settings().scrollback_lines;
+            let host = control.as_ref().map(|control| &control.context.host.id.0);
+            let log_dir = host
+                .filter(|host| store.settings.session_logs.contains(*host))
+                .map(|_| crate::session_log::folder(&store.paths.data_dir));
+            let startup = host.and_then(|host| store.settings.startup_commands.get(host).cloned());
+            (log_dir, startup, store.settings.scrollback_lines)
+        };
         let sent = control.as_ref().is_some_and(|control| {
             control.active.load(Ordering::SeqCst)
                 && control
@@ -419,7 +375,7 @@ impl EngineHandle {
         }
     }
     /// Recolors open terminals and sets the colors of future ones.
-    pub fn set_terminal_palette(&self, palette: Palette) {
+    pub fn set_terminal_palette(&self, palette: &Palette) {
         *self.0.palette.lock() = palette.clone();
         for terminal in self.0.terminals.lock().values() {
             terminal.set_palette(palette.clone());

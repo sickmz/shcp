@@ -1,5 +1,5 @@
 //! Guided move from a password to a key: creates the key if needed and installs it on the server.
-use super::{button_row, editor_frame, title};
+use super::{button_row, editor_frame, expand, ssh_folder, title};
 use crate::login_prompt::LoginPrompt;
 use crate::state::AppState;
 use crate::theme::{ActiveTheme as _, ui_px};
@@ -11,13 +11,10 @@ use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, PathPromptOptions,
     Subscription, Window, div, px,
 };
-use shcp_core::{Event, HostConfig, HostSource, RequestId, SessionId};
-use std::path::{Path, PathBuf};
+use shcp_core::{Event, HostConfig, HostSource, RequestId, SessionId, USUAL_KEYS};
+use std::path::PathBuf;
 
-/// The keys a host without identity files logs in with by itself.
-const DEFAULT_KEYS: [&str; 3] = ["id_ed25519", "id_ecdsa", "id_rsa"];
-
-pub struct KeySetupModal {
+pub(crate) struct KeySetupModal {
     embedded: bool,
     state: Entity<AppState>,
     host: HostConfig,
@@ -46,7 +43,7 @@ impl Focusable for KeySetupModal {
 }
 
 impl KeySetupModal {
-    pub fn show_login(
+    pub(crate) fn show_login(
         &mut self,
         prompt: Entity<LoginPrompt>,
         window: &mut Window,
@@ -66,19 +63,19 @@ impl KeySetupModal {
         cx.notify();
     }
 
-    pub fn cancel_login(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn cancel_login(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(prompt) = self.login.take() {
             prompt.update(cx, |prompt, cx| prompt.answer(false, window, cx));
         }
         self.login_subscription = None;
     }
 
-    pub fn embedded(mut self) -> Self {
+    pub(crate) fn embedded(mut self) -> Self {
         self.embedded = true;
         self
     }
 
-    pub fn new(
+    pub(crate) fn new(
         state: Entity<AppState>,
         host: HostConfig,
         session: SessionId,
@@ -90,13 +87,10 @@ impl KeySetupModal {
             .identity_files
             .first()
             .cloned()
-            .unwrap_or_else(|| ssh.join(DEFAULT_KEYS[0]));
-        let path = cx.new(|cx| {
-            let mut input = TextInput::new("Key file", false, cx);
-            input.set_text(&start.display().to_string(), cx);
-            input
-        });
-        let passphrase = cx.new(|cx| TextInput::new("Passphrase, optional", true, cx));
+            .unwrap_or_else(|| ssh.join(USUAL_KEYS[0]));
+        let path =
+            cx.new(|cx| TextInput::new("Key file", cx).with_text(&start.display().to_string()));
+        let passphrase = cx.new(|cx| TextInput::new("Passphrase, optional", cx).masked());
         let subscriptions = vec![
             cx.observe(&state, |_, _, cx| cx.notify()),
             cx.subscribe_in(&path, window, Self::on_input),
@@ -167,7 +161,7 @@ impl KeySetupModal {
         let ssh = ssh_folder(&self.state, cx);
         let identities = &self.host.identity_files;
         let used = identities.contains(&key)
-            || (identities.is_empty() && DEFAULT_KEYS.iter().any(|name| ssh.join(name) == key));
+            || (identities.is_empty() && USUAL_KEYS.iter().any(|name| ssh.join(name) == key));
         let alias = self.host.alias.clone();
         self.finished = Some(if used {
             format!("Done. {alias} logs in with this key from the next connection.")
@@ -192,12 +186,7 @@ impl KeySetupModal {
         if self.pending.is_some() || self.finished.is_some() {
             return;
         }
-        if !self
-            .state
-            .read(cx)
-            .session(self.session)
-            .is_some_and(|info| matches!(info.state, shcp_core::SessionState::Connected))
-        {
+        if !self.state.read(cx).session_connected(self.session) {
             return;
         }
         let typed = self.path.read(cx).text().trim().to_string();
@@ -241,21 +230,6 @@ impl KeySetupModal {
     }
 }
 
-pub(super) fn ssh_folder(state: &Entity<AppState>, cx: &App) -> PathBuf {
-    let config = state.read(cx).engine.paths().ssh_config;
-    config
-        .parent()
-        .map_or_else(|| PathBuf::from(".ssh"), Path::to_path_buf)
-}
-
-/// `~/` starts in the home folder, which holds `.ssh`.
-pub(super) fn expand(typed: &str, ssh: &Path) -> PathBuf {
-    match (typed.strip_prefix("~/"), ssh.parent()) {
-        (Some(rest), Some(home)) => home.join(rest),
-        _ => PathBuf::from(typed),
-    }
-}
-
 impl Render for KeySetupModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
@@ -271,13 +245,9 @@ impl Render for KeySetupModal {
         let key = expand(&typed, &ssh_folder(&self.state, cx));
         let exists = !typed.is_empty() && key.exists();
         let working = self.pending.is_some();
-        let connected = self
-            .state
-            .read(cx)
-            .session(self.session)
-            .is_some_and(|info| matches!(info.state, shcp_core::SessionState::Connected));
+        let connected = self.state.read(cx).session_connected(self.session);
         let finished = self.finished.clone();
-        let target = format!("{}@{}", self.host.user, self.host.hostname);
+        let target = self.host.target();
         let label = |text: &'static str| {
             div()
                 .w(px(90.))

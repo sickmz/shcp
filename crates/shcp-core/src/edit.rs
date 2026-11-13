@@ -94,10 +94,7 @@ pub(crate) async fn run(
 
 impl Edit {
     async fn open(control: Arc<Control>, remote: String, dir: PathBuf) -> Result<Self> {
-        let name = remote
-            .trim_end_matches('/')
-            .rsplit('/')
-            .next()
+        let name = files::file_name(&remote)
             .context("Remote path has no file name")?
             .to_string();
         files::safe_name(&name)?;
@@ -305,7 +302,6 @@ async fn local_stamp(path: &Path) -> std::io::Result<Stamp> {
     })
 }
 
-#[cfg(windows)]
 fn default_editor() -> PathBuf {
     const VS_CODE: &str = r"Microsoft VS Code\Code.exe";
     let user = std::env::var_os("LOCALAPPDATA")
@@ -316,11 +312,6 @@ fn default_editor() -> PathBuf {
         .flatten()
         .find(|path| path.exists())
         .unwrap_or_else(|| "notepad.exe".into())
-}
-
-#[cfg(not(windows))]
-fn default_editor() -> PathBuf {
-    "xdg-open".into()
 }
 
 pub(crate) fn root(data_dir: &Path) -> PathBuf {
