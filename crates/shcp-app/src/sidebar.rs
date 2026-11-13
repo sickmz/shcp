@@ -748,24 +748,30 @@ impl Sidebar {
         }
     }
 
-    /// How a host is: filled in its color while it has sessions, faint while they wait for the
-    /// connection, a plain ring when it has none. What needs the user takes the color of what
-    /// says so.
+    /// How a host is: filled in its color while it is connected, with tabs or without (closing
+    /// the last tab keeps the connection), faint while it connects, a plain ring when it is not
+    /// connected. What needs the user takes the color of what says so.
     fn host_dot(&self, id: &HostId, color: Hsla, cx: &App) -> Div {
         if let Some((_, alert)) = self.host_alert(id, cx) {
             return color_dot(alert, true);
         }
-        if !self.open.iter().any(|tab| tab.host == *id) {
+        let state = self.state.read(cx);
+        let session = state.host_session(id).map(|s| &s.state);
+        let connected = matches!(session, Some(SessionState::Connected));
+        let waiting = state.reconnect_attempt(id).is_some()
+            || matches!(
+                session,
+                Some(
+                    SessionState::Connecting { .. }
+                        | SessionState::AwaitingHostKey { .. }
+                        | SessionState::AwaitingPassphrase { .. }
+                        | SessionState::AwaitingPassword { .. }
+                        | SessionState::AwaitingAnswer { .. }
+                )
+            );
+        if !connected && !waiting {
             return color_dot(cx.theme().text_disabled, false);
         }
-        let state = self.state.read(cx);
-        let waiting = state.reconnect_attempt(id).is_some()
-            || state.host_session(id).is_some_and(|s| {
-                !matches!(
-                    s.state,
-                    SessionState::Connected | SessionState::Disconnected { .. }
-                )
-            });
         color_dot(
             if waiting {
                 Hsla { a: 0.45, ..color }
