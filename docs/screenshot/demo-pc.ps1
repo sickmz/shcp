@@ -82,6 +82,8 @@ foreach ($demo in @(
 
 # Keeping terminals is off on the real server: its running terminals would open by themselves.
 $settings = @'
+theme = "Slate"
+dark_theme = "Slate"
 plain_terminal_hosts = ["shop-web-1"]
 host_order = ["jump", "staging", "nas", "postgres-main", "redis", "gateway", "shop-web-1", "shop-web-2"]
 group_order = ["Data", "Production"]

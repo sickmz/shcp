@@ -21,7 +21,7 @@ themselves, and interrupted transfers resume where they stopped.
 It works with the SSH setup I already have. It reads `~/.ssh/config` (`Include`, `Match`,
 `ProxyJump`, `ProxyCommand`), uses my keys or the SSH agent, answers password and two-factor
 prompts, and runs every tab, port forward and SOCKS proxy over one connection per host. Hosts sit in
-groups in the sidebar, a command palette (Ctrl+Shift+K) takes me to any host, tab or command, and
+groups in the sidebar, a command palette (Ctrl+Shift+P) takes me to any host, tab or command, and
 themes come from [Open VSX](https://open-vsx.org) or VS Code. It is a single native `.exe`, drawn
 on the GPU with gpui, that updates itself.
 
