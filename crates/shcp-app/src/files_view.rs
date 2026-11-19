@@ -29,7 +29,6 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     collections::HashSet,
-    fmt::Write as _,
     ops::Range,
     path::PathBuf,
     rc::Rc,
@@ -2571,70 +2570,6 @@ impl FilesView {
             .when(width >= PERMS_FROM, |this| {
                 this.child(div().w(px(PERMS_W)).flex_none().child("Permissions"))
             })
-    }
-
-    /// The one file selected, which Space would preview.
-    fn previewable(&self) -> Option<&RemoteEntry> {
-        self.inspected()
-            .filter(|entry| entry.kind != EntryKind::Dir)
-    }
-
-    /// What the status bar says after the summary, dimmer: how to preview the file selected.
-    pub(crate) fn summary_hint(&self) -> Option<&'static str> {
-        (!self.path.is_empty() && self.previewable().is_some()).then_some("Space to preview")
-    }
-
-    /// For the status bar: the selection or what the folder holds, and the room left on the server.
-    /// Nothing until the folder has loaded.
-    pub(crate) fn summary(&self) -> Option<String> {
-        if self.path.is_empty() {
-            return None;
-        }
-        // One file: what it is, for the hint after it to open its preview.
-        if let Some(file) = self.previewable() {
-            return Some(format!(
-                "{} · {}",
-                file.name,
-                files_format::bytes(file.size)
-            ));
-        }
-        let mut text = if self.selected.is_empty() {
-            self.contents_summary()
-        } else {
-            let count = self.selected.len();
-            match self.selected_size() {
-                Some(size) => format!("{count} selected, {size}"),
-                None => format!("{count} selected"),
-            }
-        };
-        if let Some(free) = self.free_space {
-            let _ = write!(text, ", {} free", files_format::bytes(free));
-        }
-        Some(text)
-    }
-
-    fn contents_summary(&self) -> String {
-        if self.search.is_some() {
-            return format!("{} results", self.entries.len());
-        }
-        let folders = self
-            .entries
-            .iter()
-            .filter(|e| e.kind == EntryKind::Dir)
-            .count();
-        let files = self.entries.len() - folders;
-        let mut text = format!("{folders} folders, {files} files");
-        if !self.show_hidden {
-            let hidden = self
-                .all_entries
-                .iter()
-                .filter(|e| e.name.starts_with('.'))
-                .count();
-            if hidden > 0 {
-                let _ = write!(text, ", {hidden} hidden");
-            }
-        }
-        text
     }
 
     /// The name of the folder on screen, once there is one.

@@ -76,6 +76,8 @@ pub(crate) struct TerminalView {
     /// It has shown a shell, so it has output worth keeping in sight while disconnected.
     had_session: bool,
     pub(crate) shared_startup: bool,
+    /// Its card is being moved about: it keeps its size until it lands.
+    pub(crate) hold_size: bool,
     /// Where its shell is, as the server last said.
     folder: Option<String>,
     _subscriptions: Vec<Subscription>,
@@ -263,6 +265,7 @@ impl TerminalView {
             link_armed: false,
             had_session: false,
             shared_startup: true,
+            hold_size: false,
             folder,
             _subscriptions: subscriptions,
         }
@@ -966,6 +969,7 @@ impl Render for TerminalView {
             metrics: self.metrics.clone(),
             theme: theme.clone(),
             hovered_link: self.hovered_link.as_ref().map(|l| (l.start, l.end)),
+            hold_size: self.hold_size,
         };
         let link_url = self.hovered_link.as_ref().map(|link| link.url.clone());
         let terminal = self.terminal_area(element, link_url.is_some(), cx);

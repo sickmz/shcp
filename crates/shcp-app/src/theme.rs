@@ -3,13 +3,17 @@
 //! the ones installed from Open VSX end up too.
 pub(crate) mod builtin;
 pub(crate) mod icon_theme;
+mod oklab;
 pub(crate) mod open_vsx;
 mod vscode;
 
 use crate::widgets::host_color::HostColor;
-use gpui::{App, BoxShadow, Global, Hsla, Pixels, SharedString, WindowAppearance, hsla, point, px};
+use gpui::{
+    App, BoxShadow, Global, Hsla, Pixels, SharedString, WindowAppearance,
+    WindowBackgroundAppearance, hsla, point, px,
+};
 use shcp_core::{
-    Density, EngineHandle, Settings,
+    Accent, Density, EngineHandle, GlassLevel, Settings,
     term::{Palette, Rgb},
 };
 use std::{
@@ -146,9 +150,8 @@ impl ThemeCatalog {
     /// Reads the bundled themes and `dir`. A user theme replaces a bundled one of the same name.
     /// Returns the catalog and one message per file that could not be read.
     pub(crate) fn load(dir: &Path) -> (Self, Vec<String>) {
-        let mut themes: Vec<Theme> = [builtin::NOCTURNE, builtin::PRUNE]
-            .into_iter()
-            .map(|name| builtin::build(name, shcp_core::Accent::default(), true))
+        let mut themes: Vec<Theme> = builtin::names()
+            .map(|name| builtin::build(name, shcp_core::Accent::default()))
             .collect();
         let mut errors = Vec::new();
         let mut files: Vec<_> = std::fs::read_dir(dir)
@@ -223,20 +226,105 @@ pub(crate) fn missing_theme(settings: &Settings, cx: &App) -> Option<String> {
     (!themes.iter().any(|t| t.name == name)).then(|| name.to_string())
 }
 
-/// The app's own themes take the accent and the cards asked for; a theme from a file keeps what
-/// it has.
+/// The app's own themes take the accent asked for; a theme from a file keeps what it has.
 pub(crate) fn with_accent(theme: Theme, settings: &Settings) -> Theme {
+    in_accent(theme, settings.accent)
+}
+
+fn in_accent(theme: Theme, accent: Accent) -> Theme {
     if theme.file.is_none() {
-        builtin::build(&theme.name, settings.accent, settings.raised_cards)
+        builtin::build(&theme.name, accent)
     } else {
         theme
     }
 }
 
-/// Makes `settings` take effect: theme, terminal colors, font and row scale.
-pub(crate) fn apply(settings: &Settings, engine: &EngineHandle, cx: &mut App) {
+/// A theme or an accent the app shows for a moment in place of the chosen one, while the
+/// pointer is on it in the settings. Never saved: only choosing it changes the settings.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ThemePreview {
+    /// The name of a theme in the catalog.
+    pub theme: Option<SharedString>,
+    pub accent: Option<Accent>,
+}
+
+impl Global for ThemePreview {}
+
+impl ThemePreview {
+    /// Takes `next` in its place. Whether that changed anything, so that going over the same
+    /// choice again costs nothing.
+    fn replace(&mut self, next: ThemePreview) -> bool {
+        let changed = *self != next;
+        *self = next;
+        changed
+    }
+
+    /// The name of the theme and the accent to show, the chosen ones where nothing is shown in
+    /// their place.
+    fn shown<'a>(
+        &'a self,
+        settings: &'a Settings,
+        appearance: WindowAppearance,
+    ) -> (&'a str, Accent) {
+        (
+            self.theme
+                .as_ref()
+                .map_or_else(|| active_name(settings, appearance), |name| name.as_ref()),
+            self.accent.unwrap_or(settings.accent),
+        )
+    }
+}
+
+/// Shows `next` in place of the chosen theme or accent, all over the app and in the terminals,
+/// until an empty one ends it. The settings stay as they are.
+pub(crate) fn preview(
+    next: ThemePreview,
+    settings: &Settings,
+    engine: &EngineHandle,
+    cx: &mut App,
+) {
+    if cx.default_global::<ThemePreview>().replace(next) {
+        apply(settings, engine, cx);
+    }
+}
+
+/// How much of the window around the cards is still its own color, with glass on.
+fn glass_opacity(level: GlassLevel) -> f32 {
+    match level {
+        GlassLevel::Subtle => 0.86,
+        GlassLevel::Medium => 0.72,
+        GlassLevel::Clear => 0.56,
+    }
+}
+
+/// With glass on, the window around the cards, sidebar and header included, lets the blurred
+/// desktop through. Only its alpha changes: the cards and whatever floats stay opaque, and
+/// `surface` too, since it fills tooltips and the side column of the settings, not the sidebar.
+fn with_glass(mut theme: Theme, settings: &Settings) -> Theme {
+    if settings.glass {
+        theme.window_bg.a = glass_opacity(settings.glass_level);
+    }
+    theme
+}
+
+/// What the window shows behind what the app paints.
+pub(crate) fn window_background(settings: &Settings) -> WindowBackgroundAppearance {
+    if settings.glass {
+        WindowBackgroundAppearance::Blurred
+    } else {
+        WindowBackgroundAppearance::Opaque
+    }
+}
+
+/// The theme the settings choose, with what a preview shows in its place left out.
+pub(crate) fn chosen(settings: &Settings, cx: &App) -> Theme {
+    let name = active_name(settings, cx.window_appearance());
+    in_accent(resolve(settings, name, cx), settings.accent)
+}
+
+/// The theme `name` of the catalog, or what stands in for it when it is gone.
+fn resolve(settings: &Settings, name: &str, cx: &App) -> Theme {
     let appearance = cx.window_appearance();
-    let name = active_name(settings, appearance);
     let themes = &cx.global::<ThemeCatalog>().themes;
     // A saved theme may be gone: keep the light or dark mode the system asks for, if it asks.
     let wants_light = settings.sync_theme
@@ -244,15 +332,22 @@ pub(crate) fn apply(settings: &Settings, engine: &EngineHandle, cx: &mut App) {
             appearance,
             WindowAppearance::Light | WindowAppearance::VibrantLight
         );
-    let mut theme = themes
+    themes
         .iter()
         .find(|t| t.name == name)
         .or_else(|| themes.iter().find(|t| t.is_light == wants_light))
         .or(themes.first())
         .cloned()
         // `ThemeCatalog::load` always holds the bundled themes, so this is never reached.
-        .unwrap_or_else(|| builtin::build(builtin::NOCTURNE, shcp_core::Accent::default(), true));
-    theme = with_accent(theme, settings);
+        .unwrap_or_else(|| builtin::build(builtin::BLACK, Accent::default()))
+}
+
+/// Makes `settings` take effect: theme, terminal colors, font and row scale. A preview, if one
+/// is on, shows in place of the theme or accent they choose.
+pub(crate) fn apply(settings: &Settings, engine: &EngineHandle, cx: &mut App) {
+    let preview = cx.try_global::<ThemePreview>().cloned().unwrap_or_default();
+    let (name, accent) = preview.shown(settings, cx.window_appearance());
+    let theme = with_glass(in_accent(resolve(settings, name, cx), accent), settings);
     engine.set_terminal_palette(&theme.palette);
     cx.set_global(theme);
     // A theme that is gone leaves the app's own icons.
@@ -286,17 +381,21 @@ fn to_rgb(color: Hsla) -> Rgb {
     Rgb(byte(r), byte(g), byte(b))
 }
 
-// The scale of corner radii. Something inset by about 4 inside a surface takes the next step
-// down. What you go somewhere with, the rows of the sidebar and the command field, is a capsule
-// (`rounded_full`) instead.
+// One small radius for every corner: cards, modals, menus, controls, rows and tiles alike. Only
+// what is meant to be round, dots, knobs, progress bars, stays `rounded_full`. The names say what
+// each is for, should one of them ever part from the others.
+const RADIUS: f32 = 6.;
 /// Cards, modals, menus and whatever else floats.
-pub(crate) const RADIUS_CARD: f32 = 12.;
+pub(crate) const RADIUS_CARD: f32 = RADIUS;
 /// Buttons, inputs, menu items and the rows of a list inside a surface.
-pub(crate) const RADIUS_CONTROL: f32 = 8.;
+pub(crate) const RADIUS_CONTROL: f32 = RADIUS;
 /// Tiles, chips, key caps and tiny buttons.
-pub(crate) const RADIUS_SMALL: f32 = 6.;
-/// Radius for what fills a card up to its edge, so it stays inside the card's border.
-pub(crate) const PANEL_INNER_RADIUS: f32 = RADIUS_CARD - 1.;
+pub(crate) const RADIUS_SMALL: f32 = RADIUS;
+/// The width of the border of a card.
+const CARD_BORDER: f32 = 1.;
+/// Radius for what fills a card up to its edge, so it stays inside the card's border with its
+/// corners concentric to the card's.
+pub(crate) const PANEL_INNER_RADIUS: f32 = RADIUS_CARD - CARD_BORDER;
 
 /// The soft shadow of what floats over everything else: menus, modals, tooltips.
 pub(crate) fn float_shadow() -> Vec<BoxShadow> {
@@ -356,5 +455,116 @@ pub(crate) fn mono_font() -> &'static str {
         MONO_FAMILY
     } else {
         "Consolas"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_preview_shows_in_place_of_the_choice_and_leaves_it_alone() {
+        let settings = Settings {
+            theme: "Black".into(),
+            accent: Accent::Mono,
+            ..Settings::default()
+        };
+        let dark = WindowAppearance::Dark;
+        let mut preview = ThemePreview::default();
+        assert_eq!(preview.shown(&settings, dark), ("Black", Accent::Mono));
+
+        let hovered = |theme: &str| ThemePreview {
+            theme: Some(theme.to_string().into()),
+            accent: None,
+        };
+        assert!(preview.replace(hovered("Forest")));
+        assert_eq!(preview.shown(&settings, dark), ("Forest", Accent::Mono));
+        // The same row again: nothing to do.
+        assert!(!preview.replace(hovered("Forest")));
+        // Straight to the next row, without the choice in between.
+        assert!(preview.replace(hovered("Lagoon")));
+        assert_eq!(preview.shown(&settings, dark), ("Lagoon", Accent::Mono));
+
+        assert!(preview.replace(ThemePreview {
+            theme: None,
+            accent: Some(Accent::Green),
+        }));
+        assert_eq!(preview.shown(&settings, dark), ("Black", Accent::Green));
+
+        // Leaving goes back to the choice; leaving again is nothing.
+        assert!(preview.replace(ThemePreview::default()));
+        assert!(!preview.replace(ThemePreview::default()));
+        assert_eq!(preview.shown(&settings, dark), ("Black", Accent::Mono));
+        assert_eq!(settings.theme, "Black");
+        assert_eq!(settings.accent, Accent::Mono);
+    }
+
+    #[test]
+    fn a_preview_follows_the_mode_only_when_it_shows_nothing() {
+        let settings = Settings {
+            sync_theme: true,
+            light_theme: "Solarized Light".into(),
+            ..Settings::default()
+        };
+        let preview = ThemePreview::default();
+        assert_eq!(
+            preview.shown(&settings, WindowAppearance::Light).0,
+            "Solarized Light"
+        );
+        let preview = ThemePreview {
+            theme: Some("Plum".into()),
+            accent: None,
+        };
+        assert_eq!(preview.shown(&settings, WindowAppearance::Light).0, "Plum");
+    }
+
+    #[test]
+    fn glass_only_lets_the_window_around_the_cards_through() {
+        let imported = vscode::parse(
+            r##"{"colors": {"editor.background": "#202020", "sideBar.background": "#282828"}}"##,
+            "Imported",
+        )
+        .unwrap();
+        let themes = [builtin::build(builtin::BLACK, Accent::Theme), imported];
+        for level in [GlassLevel::Subtle, GlassLevel::Medium, GlassLevel::Clear] {
+            for theme in &themes {
+                let off = with_glass(theme.clone(), &Settings::default());
+                let settings = Settings {
+                    glass: true,
+                    glass_level: level,
+                    ..Settings::default()
+                };
+                let on = with_glass(theme.clone(), &settings);
+                assert_eq!(off.window_bg, theme.window_bg);
+                assert_eq!(off.window_bg.a, 1.);
+                assert!(on.window_bg.a > 0.5 && on.window_bg.a < 0.9, "{level:?}");
+                assert_eq!(
+                    Hsla {
+                        a: 1.,
+                        ..on.window_bg
+                    },
+                    off.window_bg
+                );
+                for (on, off) in [
+                    (on.bg, off.bg),
+                    (on.terminal_bg, off.terminal_bg),
+                    (on.surface, off.surface),
+                    (on.elevated, off.elevated),
+                    (on.input_bg, off.input_bg),
+                    (on.active, off.active),
+                    (on.text, off.text),
+                ] {
+                    assert_eq!(on, off);
+                }
+                assert_eq!(on.bg.a, 1.);
+                assert_eq!(on.terminal_bg.a, 1.);
+                assert_eq!(on.elevated.a, 1.);
+                assert_eq!(on.palette.bg, off.palette.bg);
+            }
+        }
+        assert_eq!(
+            window_background(&Settings::default()),
+            WindowBackgroundAppearance::Opaque
+        );
     }
 }

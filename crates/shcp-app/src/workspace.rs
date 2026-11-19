@@ -1,5 +1,7 @@
 //! Root view: the sidebar with the sessions and hosts, the cards of the open tab, the dock, the
 //! status row, notices and modals.
+mod chrome;
+
 use crate::actions::*;
 use crate::dock_panel::{DockEvent, DockPanel, DockTab};
 use crate::files_view::{FilesEvent, FilesView};
@@ -27,13 +29,13 @@ use crate::terminal_view::TerminalView;
 use crate::theme::{self, ActiveTheme as _};
 use crate::title_bar::{self, WindowControls};
 use crate::widgets::button::{Button, ButtonStyle};
-use crate::widgets::context_menu::{ContextMenu, OpenMenu, handler};
+use crate::widgets::context_menu::{ContextMenu, MenuAnchor, OpenMenu, handler};
 use crate::widgets::icon::Icon;
 use crate::widgets::icon::IconName;
 use crate::widgets::progress::ProgressRing;
-use crate::widgets::status::status_dot;
 use crate::widgets::tile::{Mark, tile};
 use crate::widgets::tooltip::tooltip;
+use chrome::ChromeMenu;
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Context, CursorStyle, DismissEvent, Div, Entity, FocusHandle, Focusable,
@@ -56,9 +58,10 @@ use std::{
 const RECONNECT_DELAYS: [u64; 5] = [2, 5, 10, 20, 30];
 /// Then it stops: about nine minutes without a connection.
 const RECONNECT_ATTEMPTS: u32 = 20;
-const STATUS_BAR_HEIGHT: f32 = 32.;
 /// With both views showing, neither gets less than this share.
 const MIN_BOTH_RATIO: f32 = 0.15;
+/// How far the handle that resizes the sidebar reaches over the sidebar's edge.
+const RESIZE_REACH: f32 = 4.;
 
 /// A share of the width for the files beside the terminal, kept within bounds. `None` when it is
 /// no number.
@@ -90,6 +93,21 @@ pub(crate) struct Workspace {
     dock_visible: bool,
     resizing_sidebar: bool,
     pub(crate) tab_menu: Option<OpenMenu>,
+    /// The app menu or the host selector, whichever is open.
+    chrome_menu: Option<(ChromeMenu, OpenMenu)>,
+    /// Which of them a press outside it closed last, and where: on its own button, the click that
+    /// follows must not open it again.
+    chrome_menu_closed: Option<(ChromeMenu, gpui::Point<gpui::Pixels>)>,
+    menu_anchor: MenuAnchor,
+    host_anchor: MenuAnchor,
+    /// A check for updates was asked for from the menu, and its outcome is still to be told.
+    update_check_asked: bool,
+    /// The tab of each host that was active last, to go back to with the host.
+    recent_tabs: HashMap<HostId, u64>,
+    /// A tab of the header on its way to another place among those of its host.
+    strip_reorder: Option<crate::widgets::reorder::Reorder>,
+    /// Where each tab of the header was last drawn while nothing moved.
+    strip_bounds: Rc<std::cell::RefCell<HashMap<u64, gpui::Bounds<gpui::Pixels>>>>,
     next_tab_id: u64,
     focus: FocusHandle,
     /// Waiting for the next automatic attempt to connect a host again.
@@ -135,6 +153,8 @@ pub(crate) struct Workspace {
     /// Hosts whose tabs are in step with the server. Until then what is here may be old, and must
     /// not overwrite what is there.
     surveyed: HashSet<HostId>,
+    /// What the window was last told to show behind the app: blurred desktop with glass on.
+    background: gpui::WindowBackgroundAppearance,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -150,7 +170,10 @@ impl Workspace {
         let subscriptions = vec![
             cx.subscribe_in(&sidebar, window, Self::on_sidebar_event),
             cx.subscribe_in(&state, window, Self::on_core_event),
-            cx.observe(&state, |_, _, cx| cx.notify()),
+            cx.observe(&state, |this, _, cx| {
+                this.report_update_check(cx);
+                cx.notify();
+            }),
             cx.observe(&modals, |_, _, cx| cx.notify()),
             // The selected host decides what the Ports grid shows.
             cx.observe(&sidebar, |_, _, cx| cx.notify()),
@@ -168,6 +191,8 @@ impl Workspace {
                 crate::theme::apply(&settings, &engine, cx);
             }),
         ];
+        // As `main` opens the window.
+        let background = theme::window_background(&state.read(cx).settings);
         let workspace = Self {
             state,
             sidebar,
@@ -179,6 +204,14 @@ impl Workspace {
             dock_visible: false,
             resizing_sidebar: false,
             tab_menu: None,
+            chrome_menu: None,
+            chrome_menu_closed: None,
+            menu_anchor: MenuAnchor::default(),
+            host_anchor: MenuAnchor::default(),
+            update_check_asked: false,
+            recent_tabs: HashMap::new(),
+            strip_reorder: None,
+            strip_bounds: Rc::default(),
             next_tab_id: 1,
             focus: cx.focus_handle(),
             reconnect_timers: HashMap::new(),
@@ -202,6 +235,7 @@ impl Workspace {
             shared: HashMap::new(),
             pending_shared: HashMap::new(),
             surveyed: HashSet::new(),
+            background,
             _subscriptions: subscriptions,
         };
         let this = cx.weak_entity();
@@ -209,8 +243,17 @@ impl Workspace {
             this.update(cx, |this, cx| this.on_close_requested(window, cx))
                 .unwrap_or(true)
         });
-        window.focus(&workspace.sidebar.focus_handle(cx));
+        window.focus(&workspace.idle_focus(cx));
         workspace
+    }
+
+    /// Where the keyboard goes without a tab: the sidebar, when it shows.
+    fn idle_focus(&self, cx: &App) -> FocusHandle {
+        if self.sidebar_shown(cx) {
+            self.sidebar.focus_handle(cx)
+        } else {
+            self.focus.clone()
+        }
     }
 
     // ---- closing ----
@@ -782,13 +825,7 @@ impl Workspace {
                     s.connect_host(host, cx);
                 });
             }
-            SidebarEvent::NewHost => self.new_host(window, cx),
-            SidebarEvent::OpenSettings => self.open_settings(window, cx),
-            SidebarEvent::RestartForUpdate => self.confirm_update_restart(window, cx),
-            SidebarEvent::HideSidebar => {
-                self.arm_sidebar(cx);
-                self.toggle_sidebar(window, cx);
-            }
+            SidebarEvent::GoToHost(host) => self.go_to_host(host.clone(), window, cx),
             SidebarEvent::ActivateTab(id) => {
                 if let Some(index) = self.tab_index(*id) {
                     self.activate(index, window, cx);
@@ -800,23 +837,16 @@ impl Workspace {
                 }
             }
             SidebarEvent::TabMenu(id, position) => tabs::tab_menu(self, *id, *position, cx),
-            SidebarEvent::MoveTab(id, target, after) => {
-                let at = |wanted: u64| self.tab_index(wanted);
-                if let (Some(from), Some(target)) = (at(*id), at(*target)) {
-                    let place = target + usize::from(*after);
-                    // Once the tab is out, what follows it is one place back.
-                    self.move_tab(*id, if from < place { place - 1 } else { place }, cx);
-                }
-            }
+            SidebarEvent::ReorderTab(id, place) => self.reorder_tab(*id, *place, cx),
         }
     }
 
     /// From one of the app's themes to the other, leaving the system's light and dark out of it.
     fn toggle_theme(&mut self, cx: &mut Context<Self>) {
-        let target = if cx.theme().name == theme::builtin::PRUNE {
-            theme::builtin::NOCTURNE
+        let target = if cx.theme().name == theme::builtin::TERRACOTTA {
+            theme::builtin::BLACK
         } else {
-            theme::builtin::PRUNE
+            theme::builtin::TERRACOTTA
         };
         self.state.update(cx, |state, cx| {
             let mut settings = state.settings.clone();
@@ -1446,7 +1476,7 @@ impl Workspace {
                 Some(files) if tab.files_alone(cx) => files.focus_handle(cx),
                 _ => tab.panes.focus_handle(cx),
             },
-            None => self.sidebar.focus_handle(cx),
+            None => self.idle_focus(cx),
         };
         window.focus(&handle);
     }
@@ -1502,17 +1532,40 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Moves a tab to `to`, keeping the same tab active.
-    fn move_tab(&mut self, id: u64, to: usize, cx: &mut Context<Self>) {
+    /// Puts a tab at `place` among the tabs of its host, keeping the same tab active. The tabs of
+    /// the other hosts keep their places between them.
+    pub(crate) fn reorder_tab(&mut self, id: u64, place: usize, cx: &mut Context<Self>) {
         let Some(from) = self.tab_index(id) else {
             return;
         };
-        if from == to || to >= self.tabs.len() {
-            return;
-        }
+        let host = self.tabs[from].host.clone();
+        let places: Vec<usize> = (0..self.tabs.len())
+            .filter(|index| self.tabs[*index].host == host)
+            .collect();
+        let mut order: Vec<u64> = places.iter().map(|index| self.tabs[*index].id).collect();
+        order.retain(|other| *other != id);
+        order.insert(place.min(order.len()), id);
+        let index_of: HashMap<u64, usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| (tab.id, index))
+            .collect();
         let active_id = self.active_tab().map(|t| t.id);
-        let tab = self.tabs.remove(from);
-        self.tabs.insert(to, tab);
+        let mut old: Vec<Option<Tab>> = std::mem::take(&mut self.tabs)
+            .into_iter()
+            .map(Some)
+            .collect();
+        let mut wanted = order.into_iter();
+        for index in 0..old.len() {
+            let source = if places.contains(&index) {
+                wanted.next().and_then(|id| index_of.get(&id).copied())
+            } else {
+                Some(index)
+            };
+            self.tabs
+                .extend(source.and_then(|source| old.get_mut(source)?.take()));
+        }
         self.active = active_id.and_then(|id| self.tab_index(id));
         cx.notify();
     }
@@ -1739,10 +1792,10 @@ impl Workspace {
             Some("Ctrl+Shift+N"),
             handler(this.clone(), Workspace::new_host),
         );
-        let (title, icon) = if cx.theme().name == theme::builtin::PRUNE {
-            ("Switch to Nocturne", IconName::Moon)
+        let (title, icon) = if cx.theme().name == theme::builtin::TERRACOTTA {
+            ("Switch to Black", IconName::Moon)
         } else {
-            ("Switch to Prune", IconName::Sun)
+            ("Switch to Terracotta", IconName::Sun)
         };
         command(
             title,
@@ -1751,11 +1804,19 @@ impl Workspace {
             handler(this.clone(), |w, _, cx| w.toggle_theme(cx)),
         );
         command(
-            "Toggle sidebar",
-            IconName::PanelLeft,
-            Some("Ctrl+Shift+B"),
-            handler(this.clone(), Workspace::toggle_sidebar),
+            "Toggle tab style",
+            IconName::Menu,
+            Some("Ctrl+Shift+L"),
+            handler(this.clone(), Workspace::toggle_tab_style),
         );
+        if self.tab_style(cx) == shcp_core::TabStyle::Vertical {
+            command(
+                "Toggle sidebar",
+                IconName::PanelLeft,
+                Some("Ctrl+Shift+B"),
+                handler(this.clone(), Workspace::toggle_sidebar),
+            );
+        }
         command(
             "Toggle transfers",
             IconName::Swap,
@@ -1767,7 +1828,7 @@ impl Workspace {
         command(
             "Toggle ports",
             IconName::Link,
-            None,
+            Some("Ctrl+Shift+O"),
             handler(this.clone(), |w, _, cx| w.toggle_dock(DockTab::Ports, cx)),
         );
         command(
@@ -1781,6 +1842,10 @@ impl Workspace {
     }
 
     fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // With the tabs across the window there is no sidebar to show.
+        if self.tab_style(cx) == shcp_core::TabStyle::Horizontal {
+            return;
+        }
         self.sidebar_visible = !self.sidebar_visible;
         if self.sidebar_visible {
             window.focus(&self.sidebar.focus_handle(cx));
@@ -1871,79 +1936,13 @@ impl Workspace {
 
     // ---- rendering ----
 
-    /// Under the panel: the connection of this tab, what the folder holds, and the dock's buttons.
-    fn status_bar(&self, sidebar_amount: f32, cx: &Context<Self>) -> Option<AnyElement> {
-        let tab = self.active_tab()?;
-        let state = self.state.read(cx);
-        let theme = cx.theme();
-        let session = state.host_session(&tab.host);
-        let reconnecting = state.reconnect_attempt(&tab.host).is_some();
-        let text = if reconnecting {
-            "Reconnecting"
-        } else {
-            match session.map(|session| &session.state) {
-                Some(SessionState::Connected) => "Connected",
-                Some(SessionState::Failed { .. }) => "Failed",
-                Some(SessionState::Disconnected { .. }) | None => "Not connected",
-                Some(SessionState::Connecting { .. }) => "Connecting",
-                Some(_) => "Waiting for you",
-            }
-        };
-        let target = state.host(&tab.host).map(HostConfig::target);
-        let (summary, hint) = match (&tab.files, tab.face.shows_files()) {
-            (Some(view), true) => {
-                let view = view.read(cx);
-                (view.summary(), view.summary_hint())
-            }
-            _ => (None, None),
-        };
-        Some(
-            div()
-                .h(px(STATUS_BAR_HEIGHT))
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap(px(12.))
-                .pl(px(6. + 8. * (1. - sidebar_amount)))
-                .pr(px(10.))
-                .text_size(crate::theme::ui_px(13.))
-                .text_color(theme.text_disabled)
-                .child(
-                    div()
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .gap(px(7.))
-                        .text_color(theme.text_muted)
-                        .child(status_dot(theme, session.map(|session| &session.state)))
-                        .child(text),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        // A file selected stands out from the hint after it.
-                        .when(hint.is_some(), |this| this.text_color(theme.text_muted))
-                        .child(summary.or(target).unwrap_or_default()),
-                )
-                .children(hint.map(|hint| {
-                    div()
-                        .flex_none()
-                        .text_color(theme.text_disabled)
-                        .child(hint)
-                }))
-                .child(div().flex_1().min_w_0())
-                .child(self.dock_buttons(&tab.host, cx))
-                .into_any_element(),
-        )
-    }
-
     /// The buttons that show the dock's tabs.
-    fn dock_buttons(&self, host: &HostId, cx: &Context<Self>) -> impl IntoElement {
+    pub(crate) fn dock_buttons(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
+        let host = self.current_host(cx);
         let state = self.state.read(cx);
         let theme = cx.theme();
         let dock_tab = self.dock.read(cx).tab();
-        let session = state.host_session(host);
+        let session = host.as_ref().and_then(|host| state.host_session(host));
         let open_tunnels = session.map_or(0, |session| {
             session
                 .forwards
@@ -1956,8 +1955,8 @@ impl Workspace {
             div()
                 .id(id)
                 .h(px(24.))
-                .min_w(px(26.))
-                .px(px(6.))
+                .min_w(px(24.))
+                .px(px(5.))
                 .justify_center()
                 .flex()
                 .flex_none()
@@ -1983,7 +1982,7 @@ impl Workspace {
         let percent = state.transfers_percent();
         let leading = match percent {
             Some(percent) if running > 0 => ProgressRing::new(percent, px(14.)).into_any_element(),
-            _ => Icon::new(IconName::Swap).size(px(13.)).into_any_element(),
+            _ => Icon::new(IconName::Swap).size(px(14.)).into_any_element(),
         };
         let figure = match (running, percent) {
             (0, _) => None,
@@ -1997,12 +1996,16 @@ impl Workspace {
             .gap(px(4.))
             .child(
                 pill("toggle-ports", ports_shown)
-                    .tooltip(tooltip("Ports"))
+                    .tooltip(tooltip(if ports_shown {
+                        "Hide the ports (Ctrl+Shift+O)"
+                    } else {
+                        "Ports (Ctrl+Shift+O)"
+                    }))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.arm_dock(cx);
                         this.toggle_dock(DockTab::Ports, cx)
                     }))
-                    .child(Icon::new(IconName::Link).size(px(13.)))
+                    .child(Icon::new(IconName::Link).size(px(14.)))
                     .when(open_tunnels > 0, |this| {
                         this.child(count(open_tunnels.to_string()))
                     }),
@@ -2076,6 +2079,8 @@ impl Workspace {
             .style(ButtonStyle::Ghost)
             .on_click(cx.listener(move |this, _, window, cx| this.toggle_files(index, window, cx)))
             .into_any_element();
+        // Always at the right: under the caption buttons when the cards reach the top.
+        let caption_room = title_bar::caption_room();
         let header = panel::header(
             tools_shown,
             vec![
@@ -2083,11 +2088,12 @@ impl Workspace {
                 crumbs,
             ],
             vec![nav, tools, close],
-        );
+        )
+        .when(caption_room > px(0.), |this| this.pr(caption_room));
         // Alone, a card has nothing to stand out from.
-        let focused =
-            !self.tabs[index].files_alone(cx) && files.read(cx).contains_focus(window, cx);
-        panel::frame(&theme, theme.bg, focused)
+        let dimmed =
+            !self.tabs[index].files_alone(cx) && !files.read(cx).contains_focus(window, cx);
+        panel::frame(&theme, theme.bg)
             .id("files-card")
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                 let animated = this.animated(cx);
@@ -2096,8 +2102,11 @@ impl Workspace {
             }))
             .size_full()
             .overflow_hidden()
-            .child(header)
-            .child(div().flex_1().min_h_0().w_full().child(files))
+            .child(
+                panel::contents(dimmed)
+                    .child(header)
+                    .child(div().flex_1().min_h_0().w_full().child(files)),
+            )
             .into_any_element()
     }
 
@@ -2147,10 +2156,18 @@ impl Workspace {
                 element.into_any_element()
             }
         };
+        let horizontal = self.tab_style(cx) == shcp_core::TabStyle::Horizontal;
         let hint = if no_hosts {
             "Add your first server, or bring in the Host entries of ~/.ssh/config"
+        } else if horizontal {
+            "Pick a host at the top to open a terminal on it"
         } else {
             "Click a host to open a terminal, or right-click it for more"
+        };
+        let (layout_keys, layout_label) = if horizontal {
+            ("Ctrl+Shift+L", "Toggle tab style")
+        } else {
+            ("Ctrl+Shift+B", "Toggle sidebar")
         };
         div()
             .size_full()
@@ -2221,13 +2238,13 @@ impl Workspace {
             // Only what works with no tab open; the rest is on the tooltips and in the palette.
             .child(beat(
                 div()
-                    .child(shortcut("Ctrl+Shift+K", "Search everything"))
+                    .child(shortcut("Ctrl+Shift+P", "Search everything"))
                     .child(shortcut("Ctrl+Shift+N", "New host"))
                     .when(!no_hosts, |this| {
                         this.child(shortcut("Ctrl+Shift+T", "New terminal"))
                             .child(shortcut("Ctrl+Shift+E", "Browse files"))
                     })
-                    .child(shortcut("Ctrl+Shift+B", "Toggle sidebar"))
+                    .child(shortcut(layout_keys, layout_label))
                     .child(shortcut("Ctrl+,", "Settings")),
                 "empty-shortcuts",
                 SHORTCUTS,
@@ -2361,68 +2378,6 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// In the middle of the top of the window: leads to the palette, where typing happens. Around
-    /// it the strip still moves the window. Only words at rest, so the top stays quiet; the
-    /// capsule shows under the pointer.
-    fn search_field(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let theme = cx.theme().clone();
-        let keys = short_keys(&crate::actions::with_current_keys("Ctrl+Shift+K", cx));
-        let (hover, pressed, edge) = (theme.hover, theme.active, theme.border);
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .right_0()
-            .h(px(title_bar::HEIGHT))
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(
-                div()
-                    .id("window-search")
-                    .occlude()
-                    .max_w(relative(0.4))
-                    .h(px(26.))
-                    .px(px(10.))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    // A way to go somewhere: a capsule, as the rows of the sidebar, once the
-                    // pointer is on it. The edge is there all along, unseen, so nothing moves.
-                    .rounded_full()
-                    .border_1()
-                    .border_color(gpui::transparent_black())
-                    .cursor_pointer()
-                    .text_size(crate::theme::ui_px(12.5))
-                    .text_color(theme.text_muted)
-                    .hover(move |style| style.bg(hover).border_color(edge))
-                    .active(move |style| style.bg(pressed).border_color(edge))
-                    .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx)))
-                    .child(
-                        Icon::new(IconName::Search)
-                            .size(px(13.))
-                            .color(theme.text_muted),
-                    )
-                    .child(div().min_w_0().truncate().child("Go to anything"))
-                    .child(
-                        div()
-                            .flex_none()
-                            .ml(px(4.))
-                            .h(px(17.))
-                            .px(px(5.))
-                            .flex()
-                            .items_center()
-                            .rounded(px(4.))
-                            .border_1()
-                            .border_color(theme.border)
-                            .font_family(crate::theme::mono_font())
-                            .text_size(crate::theme::ui_px(11.))
-                            .text_color(theme.text_disabled)
-                            .child(keys),
-                    ),
-            )
-    }
-
     /// The divider follows the pointer. A button let go where nothing listens ends the drag here.
     fn drag_both_divider(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         if event.pressed_button != Some(MouseButton::Left) {
@@ -2522,15 +2477,6 @@ fn link_bridge(
         .into_any_element()
 }
 
-/// Keys as the search field shows them, short: `Ctrl+Shift+K` is `Ctrl ⇧ K`, Shift taking its
-/// symbol, every key apart.
-fn short_keys(keys: &str) -> String {
-    keys.split('+')
-        .map(|key| if key == "Shift" { "⇧" } else { key })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// The place of the window now, in the form the settings keep.
 fn saved_window(window: &Window) -> SavedWindow {
     let (bounds, maximized) = match window.window_bounds() {
@@ -2554,7 +2500,10 @@ impl Focusable for Workspace {
 
 impl Workspace {
     /// Plain data for the sidebar, which draws right after this.
-    fn sync_open_tabs(&self, cx: &mut Context<Self>) {
+    fn sync_open_tabs(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active_tab() {
+            self.recent_tabs.insert(tab.host.clone(), tab.id);
+        }
         let active_id = self.active_tab().map(|t| t.id);
         let open: Vec<OpenTab> = self
             .tabs
@@ -2665,6 +2614,28 @@ impl Workspace {
             cx.listener(|this, _: &ToggleSidebar, window, cx| this.toggle_sidebar(window, cx)),
         )
         .on_action(
+            cx.listener(|this, _: &ToggleTabStyle, window, cx| this.toggle_tab_style(window, cx)),
+        )
+        // Escape closes the menu of the top of the window, wherever the keyboard is.
+        // And puts back a tab on its way to another place.
+        .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+            if event.keystroke.key != "escape" {
+                return;
+            }
+            let strip = this.strip_reorder.take().is_some();
+            let side = this
+                .sidebar
+                .update(cx, |sidebar, cx| sidebar.cancel_reorder(cx));
+            if strip || side {
+                cx.stop_active_drag(window);
+            }
+            if strip || side || this.chrome_menu.take().is_some() {
+                cx.stop_propagation();
+                cx.notify();
+            }
+        }))
+        .on_action(cx.listener(|this, _: &TogglePorts, _, cx| this.toggle_dock(DockTab::Ports, cx)))
+        .on_action(
             cx.listener(|this, _: &ToggleTransfers, _, cx| {
                 this.toggle_dock(DockTab::Transfers, cx)
             }),
@@ -2737,20 +2708,40 @@ impl Workspace {
                     .h_full()
                     .w(px(sidebar_size))
                     .flex()
-                    .child(self.sidebar.clone())
                     .child(
-                        // Drag handle on the sidebar edge; double-click resets the width.
+                        div()
+                            .h_full()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(self.sidebar_header(theme, cx))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .pt(px(self.sidebar_list_drop(cx)))
+                                    .child(self.sidebar.clone()),
+                            )
+                            .child(self.sidebar_footer(cx)),
+                    )
+                    .child(
+                        // Drag handle on the sidebar edge; double-click resets the width. The gap
+                        // is narrow: the handle reaches over the edge of the sidebar too.
                         div()
                             .id("sidebar-resize")
                             .group("sidebar-resize")
-                            .w(px(8.))
+                            .relative()
+                            .ml(px(-RESIZE_REACH))
+                            .w(px(title_bar::CONTENT_INSET + RESIZE_REACH))
                             .h_full()
                             .flex_none()
-                            .flex()
-                            .justify_center()
                             .cursor(CursorStyle::ResizeLeftRight)
                             .child(
                                 div()
+                                    .absolute()
+                                    .top_0()
+                                    .left(px(RESIZE_REACH + (title_bar::CONTENT_INSET - 2.) / 2.))
                                     .w(px(2.))
                                     .h_full()
                                     .when(self.resizing_sidebar, |this| this.bg(theme.accent))
@@ -2777,42 +2768,30 @@ impl Workspace {
             )
     }
 
-    /// The title strip, the cards with the notices over them, the dock and the status bar.
+    /// The top of the window, then the cards with the notices over them and the dock.
     fn main_column(
         &self,
         theme: &theme::Theme,
         content: AnyElement,
-        status_bar: Option<AnyElement>,
         sidebar_amount: f32,
         dock_amount: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let has_status_bar = status_bar.is_some();
         div()
             .flex_1()
             .min_w_0()
             .flex()
             .flex_col()
-            .child(
-                div()
-                    .id("title-strip")
-                    .occlude()
-                    .h(px(title_bar::HEIGHT))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .pr(px(title_bar::captions_width() + 8.))
-                    .window_control_area(WindowControlArea::Drag),
-            )
+            .child(self.top_of_main(theme, cx))
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
                     .flex()
                     .flex_col()
-                    .pr(px(8.))
-                    .when(!has_status_bar, |this| this.pb(px(8.)))
-                    .pl(px(8. * (1. - sidebar_amount)))
+                    .pr(px(title_bar::CONTENT_INSET))
+                    .pb(px(title_bar::CONTENT_INSET))
+                    .pl(px(title_bar::CONTENT_INSET * (1. - sidebar_amount)))
                     .child(
                         // The cards, and the notices over them.
                         div()
@@ -2827,13 +2806,12 @@ impl Workspace {
                         this.child(self.dock_card(theme, dock_amount))
                     }),
             )
-            .children(status_bar)
     }
 
     /// A card of its own under the others.
     fn dock_card(&self, theme: &theme::Theme, dock_amount: f32) -> impl IntoElement + use<> {
         let measured = self.dock_height.clone();
-        let inner = panel::frame(theme, theme.bg, false)
+        let inner = panel::frame(theme, theme.bg)
             .flex_none()
             .overflow_hidden()
             .child(self.dock.clone())
@@ -2855,40 +2833,38 @@ impl Workspace {
             })
             .child(inner)
     }
-
-    fn sidebar_toggle(cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        div()
-            .id("window-sidebar-toggle")
-            .absolute()
-            .top_0()
-            .left(px(16. + (19. - 28.) / 2.))
-            .h(px(title_bar::HEIGHT))
-            .flex()
-            .items_center()
-            .occlude()
-            .child(
-                Button::new("toggle-sidebar")
-                    .icon(IconName::PanelLeft)
-                    .tooltip("Show sidebar (Ctrl+Shift+B)")
-                    .style(ButtonStyle::Ghost)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.arm_sidebar(cx);
-                        this.toggle_sidebar(window, cx)
-                    })),
-            )
-    }
 }
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Glass turned on or off: the window follows, once per change.
+        let background = theme::window_background(&self.state.read(cx).settings);
+        if background != self.background {
+            window.set_background_appearance(background);
+            self.background = background;
+        }
         self.follow_terminal(cx);
         self.sync_open_tabs(cx);
         self.sync_shared(window, cx);
         self.sync_notices(window, cx);
 
         let theme = cx.theme().clone();
-        self.sidebar_reveal.set(self.sidebar_visible);
+        self.sidebar_reveal.set(self.sidebar_shown(cx));
+        // A drag let go anywhere ends here too: the header's tabs stay as they were.
+        if !cx.has_active_drag() {
+            self.strip_reorder = None;
+        }
+        if self
+            .strip_reorder
+            .as_ref()
+            .is_some_and(|reorder| reorder.moving())
+        {
+            window.request_animation_frame();
+        }
         self.dock_reveal.set(self.dock_visible);
+        // Before the cards draw: the one in the top right corner leaves room for the captions.
+        let cards_at_top = self.top(cx) == chrome::Top::Cards;
+        title_bar::set_caption_room(cards_at_top && self.active.is_some());
         let moving = self.sidebar_reveal.moving() || self.dock_reveal.moving();
         motion::set_layout_moving(moving);
         if moving {
@@ -2896,9 +2872,8 @@ impl Render for Workspace {
         }
         let sidebar_amount = self.sidebar_reveal.value();
         let dock_amount = self.dock_reveal.value();
-        let sidebar_size = self.state.read(cx).settings.sidebar_width + 8.;
+        let sidebar_size = self.state.read(cx).settings.sidebar_width + title_bar::CONTENT_INSET;
         let content = self.faded_tab_content(window, cx);
-        let status_bar = self.status_bar(sidebar_amount, cx);
         div()
             .id("workspace")
             .key_context("Workspace")
@@ -2921,11 +2896,7 @@ impl Render for Workspace {
             .when(sidebar_amount > 0., |this| {
                 this.child(self.sidebar_column(&theme, sidebar_size, sidebar_amount, cx))
             })
-            .child(self.main_column(&theme, content, status_bar, sidebar_amount, dock_amount, cx))
-            // With the sidebar hidden, at the left of the top strip. Open, it has its own.
-            .when(!self.sidebar_visible, |this| {
-                this.child(Self::sidebar_toggle(cx))
-            })
+            .child(self.main_column(&theme, content, sidebar_amount, dock_amount, cx))
             .children(self.tab_menu.clone().map(|menu| {
                 let this = cx.entity().downgrade();
                 ContextMenu::new(
@@ -2934,20 +2905,19 @@ impl Render for Workspace {
                     crate::widgets::context_menu::dismiss(this, |view| &mut view.tab_menu),
                 )
             }))
-            .child(self.search_field(cx))
+            .children(self.chrome_menu.clone().map(|(_, menu)| {
+                ContextMenu::new("chrome-menu", menu, self.chrome_menu_dismiss(cx))
+            }))
             .child(self.modals.clone())
-            .child(WindowControls)
-    }
-}
-
-#[cfg(test)]
-mod short_keys_tests {
-    use super::short_keys;
-
-    #[test]
-    fn shift_takes_its_symbol() {
-        assert_eq!(short_keys("Ctrl+Shift+K"), "Ctrl ⇧ K");
-        assert_eq!(short_keys("Ctrl+Alt+K"), "Ctrl Alt K");
-        assert_eq!(short_keys("Shift+F1"), "⇧ F1");
+            .child(match self.top(cx) {
+                chrome::Top::Cards if self.active.is_some() => WindowControls::fused(),
+                chrome::Top::Cards => {
+                    WindowControls::flush(title_bar::HEIGHT + title_bar::CONTENT_INSET)
+                }
+                chrome::Top::Tabs => {
+                    WindowControls::flush(title_bar::HEIGHT + chrome::HEADER_TOP_GAP)
+                }
+                chrome::Top::Strip => WindowControls::flush(title_bar::HEIGHT),
+            })
     }
 }

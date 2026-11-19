@@ -16,7 +16,9 @@ actions!(
         NextTab,
         PrevTab,
         ToggleSidebar,
+        ToggleTabStyle,
         ToggleTransfers,
+        TogglePorts,
         CycleFace,
         NewHost,
         OpenSettings,
@@ -68,7 +70,7 @@ pub(crate) const SHORTCUTS: &[Shortcut] = &[
         "palette",
         "Command palette",
         OpenPalette,
-        &[("ctrl-shift-k", ANYWHERE), ("ctrl-k", NOT_IN_TERMINAL)]
+        &[("ctrl-shift-p", ANYWHERE), ("ctrl-p", NOT_IN_TERMINAL)]
     ),
     shortcut!(
         "new_terminal",
@@ -152,11 +154,24 @@ pub(crate) const SHORTCUTS: &[Shortcut] = &[
         ToggleSidebar,
         &[("ctrl-shift-b", ANYWHERE), ("ctrl-b", NOT_IN_TERMINAL)]
     ),
+    // Ctrl+Shift+S, as other terminals have it, already splits down.
+    shortcut!(
+        "tab_style",
+        "Toggle tab style",
+        ToggleTabStyle,
+        &[("ctrl-shift-l", ANYWHERE)]
+    ),
     shortcut!(
         "transfers",
         "Toggle transfers",
         ToggleTransfers,
         &[("ctrl-shift-j", ANYWHERE), ("ctrl-j", NOT_IN_TERMINAL)]
+    ),
+    shortcut!(
+        "ports",
+        "Toggle ports",
+        TogglePorts,
+        &[("ctrl-shift-o", ANYWHERE), ("ctrl-o", NOT_IN_TERMINAL)]
     ),
     shortcut!(
         "cycle_face",
@@ -471,12 +486,12 @@ mod tests {
 
     #[test]
     fn swapped_keys_are_not_replaced_twice() {
-        let mut settings = with("new_terminal", "ctrl-shift-k");
+        let mut settings = with("new_terminal", "ctrl-shift-p");
         settings
             .keybindings
             .insert("palette".into(), "ctrl-shift-t".into());
         let hints = KeyHints::new(&settings);
-        assert_eq!(hints.apply("Ctrl+Shift+T"), "Ctrl+Shift+K");
-        assert_eq!(hints.apply("Ctrl+Shift+K"), "Ctrl+Shift+T");
+        assert_eq!(hints.apply("Ctrl+Shift+T"), "Ctrl+Shift+P");
+        assert_eq!(hints.apply("Ctrl+Shift+P"), "Ctrl+Shift+T");
     }
 }

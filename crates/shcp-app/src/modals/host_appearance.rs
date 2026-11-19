@@ -50,7 +50,7 @@ impl Render for AppearancePicker {
                     .flex_none()
                     .items_center()
                     .justify_center()
-                    .rounded(px(7.))
+                    .rounded(px(crate::theme::RADIUS_SMALL))
                     .bg(color.hsla())
                     .cursor_pointer()
                     .focusable()

@@ -5,6 +5,7 @@ pub(crate) mod host_color;
 pub(crate) mod icon;
 pub(crate) mod pill;
 pub(crate) mod progress;
+pub(crate) mod reorder;
 pub(crate) mod scrollbar;
 pub(crate) mod status;
 pub(crate) mod text_input;

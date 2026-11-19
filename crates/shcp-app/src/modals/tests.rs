@@ -12,9 +12,8 @@ impl Render for TestWorkspace {
 fn setup(cx: &mut TestAppContext) -> (Entity<ModalLayer>, &mut VisualTestContext) {
     cx.update(|cx| {
         cx.set_global(crate::theme::builtin::build(
-            crate::theme::builtin::NOCTURNE,
+            crate::theme::builtin::BLACK,
             shcp_core::Accent::default(),
-            true,
         ));
     });
     let (root, cx) = cx.add_window_view(|_, cx| TestWorkspace(cx.new(|_| ModalLayer::default())));

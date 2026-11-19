@@ -212,7 +212,7 @@ impl Render for HostCommandsModal {
             })
             .child(label("Run in every new terminal"))
             .child(div().child(self.startup.clone()))
-            .child(label("Saved commands. Ctrl+Shift+K finds and runs them"))
+            .child(label("Saved commands. Ctrl+Shift+P finds and runs them"))
             .child(
                 div()
                     .id("command-rows")

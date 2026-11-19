@@ -819,7 +819,7 @@ fn check_row(theme: &Theme, state: RowState, label: String, detail: Option<Strin
         RowState::Pending => div()
             .size(px(8.))
             .mx(px(3.))
-            .rounded(px(4.))
+            .rounded_full()
             .border_1()
             .border_color(theme.text_disabled)
             .into_any_element(),

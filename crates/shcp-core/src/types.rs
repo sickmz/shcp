@@ -154,6 +154,8 @@ pub struct Settings {
     pub use_ssh_agent: bool,
     /// Width of the host sidebar in pixels.
     pub sidebar_width: f32,
+    /// Tabs in the sidebar, or across the top of the window.
+    pub tab_style: TabStyle,
     /// Name of the active theme.
     pub theme: String,
     /// Follow the system light/dark mode, using `dark_theme` and `light_theme`.
@@ -163,11 +165,12 @@ pub struct Settings {
     /// Name of the file icon theme; empty uses the app's own icons.
     pub icon_theme: String,
     pub density: Density,
-    /// In the app's own themes, the cards are lighter than the window around them; otherwise
-    /// darker, sunk into it.
-    pub raised_cards: bool,
     /// The color of what is on or chosen, in the app's own themes.
     pub accent: Accent,
+    /// The window around the cards lets the desktop show through, blurred.
+    pub glass: bool,
+    /// How much of the desktop shows through, with `glass` on.
+    pub glass_level: GlassLevel,
     /// Which look the rest of these settings were last brought up to. Missing in older files.
     #[serde(default)]
     pub style_version: u32,
@@ -262,7 +265,7 @@ impl Settings {
             return;
         }
         let renamed = |name: &mut String| match name.as_str() {
-            "Dark" | "Light" => *name = "Nocturne".into(),
+            "Dark" | "Light" => *name = "Black".into(),
             _ => {}
         };
         renamed(&mut self.theme);
@@ -570,11 +573,40 @@ pub enum Density {
     Default,
     Comfortable,
 }
+/// How see-through the window around the cards is, with glass on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GlassLevel {
+    Subtle,
+    #[default]
+    Medium,
+    Clear,
+}
+/// Where the open tabs are listed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TabStyle {
+    /// In the sidebar, one row each, above the hosts.
+    #[default]
+    Vertical,
+    /// Across the top of the window, without the sidebar.
+    Horizontal,
+}
+impl TabStyle {
+    pub fn toggled(self) -> Self {
+        match self {
+            TabStyle::Vertical => TabStyle::Horizontal,
+            TabStyle::Horizontal => TabStyle::Vertical,
+        }
+    }
+}
 /// The accents on offer in the app's own themes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Accent {
+    /// The one each theme brings.
     #[default]
+    Theme,
     Blue,
     Violet,
     Pink,
@@ -587,7 +619,8 @@ pub enum Accent {
     Mono,
 }
 impl Accent {
-    pub const ALL: [Accent; 9] = [
+    pub const ALL: [Accent; 10] = [
+        Accent::Theme,
         Accent::Blue,
         Accent::Violet,
         Accent::Pink,
@@ -601,6 +634,7 @@ impl Accent {
 
     pub fn label(self) -> &'static str {
         match self {
+            Accent::Theme => "The theme's own",
             Accent::Blue => "Blue",
             Accent::Violet => "Violet",
             Accent::Pink => "Pink",
@@ -624,14 +658,16 @@ impl Default for Settings {
             confirm_on_delete: true,
             use_ssh_agent: true,
             sidebar_width: 248.,
-            theme: "Nocturne".into(),
+            tab_style: TabStyle::Vertical,
+            theme: "Black".into(),
             sync_theme: false,
-            dark_theme: "Nocturne".into(),
-            light_theme: "Nocturne".into(),
+            dark_theme: "Black".into(),
+            light_theme: "Black".into(),
             icon_theme: String::new(),
             density: Density::Default,
-            raised_cards: true,
-            accent: Accent::Blue,
+            accent: Accent::Theme,
+            glass: false,
+            glass_level: GlassLevel::Medium,
             style_version: STYLE_VERSION,
             animated_selection: true,
             auto_open_forwards: false,
@@ -1057,7 +1093,7 @@ mod tests {
         .unwrap();
         assert_eq!(old.style_version, 0);
         old.migrate_style();
-        assert_eq!(old.theme, "Nocturne");
+        assert_eq!(old.theme, "Black");
         assert_eq!(old.light_theme, "Solarized");
         assert_eq!(old.ui_font_size, 14.);
         assert_eq!(old.terminal_font_family, "Geist Mono");
@@ -1138,6 +1174,9 @@ mod tests {
         assert!(read.auto_reconnect);
         assert!(read.animated_selection);
         assert!(read.restore_tabs);
+        assert_eq!(read.tab_style, TabStyle::Vertical);
+        assert!(!read.glass);
+        assert_eq!(read.glass_level, GlassLevel::Medium);
     }
 
     #[test]
@@ -1161,8 +1200,14 @@ mod tests {
         settings
             .extra_forwards
             .insert("db".into(), vec![spec(5432)]);
+        settings.tab_style = TabStyle::Horizontal;
+        settings.glass = true;
+        settings.glass_level = GlassLevel::Clear;
         let text = toml::to_string_pretty(&settings).unwrap();
         let read: Settings = toml::from_str(&text).unwrap();
+        assert_eq!(read.tab_style, TabStyle::Horizontal);
+        assert!(read.glass);
+        assert_eq!(read.glass_level, GlassLevel::Clear);
         assert_eq!(read.snippets, settings.snippets);
         assert_eq!(read.host_groups, settings.host_groups);
         assert_eq!(read.startup_commands, settings.startup_commands);

@@ -74,6 +74,10 @@ icons! {
     Swap => "swap",
     Sun => "sun",
     Moon => "moon",
+    Menu => "menu",
+    Command => "command",
+    Server => "server",
+    ServerAdd => "server_add",
 }
 
 #[derive(IntoElement)]

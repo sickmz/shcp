@@ -129,9 +129,11 @@ fn main() {
                 state
             });
             let window_bounds = initial_bounds(state.read(cx).settings.window, cx);
+            let window_background = theme::window_background(&state.read(cx).settings);
             let opened = cx.open_window(
                 WindowOptions {
                     window_bounds: Some(window_bounds),
+                    window_background,
                     titlebar: Some(TitlebarOptions {
                         title: Some("shcp".into()),
                         // Our own title bar, with the caption buttons inside it.

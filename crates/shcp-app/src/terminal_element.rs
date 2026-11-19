@@ -50,6 +50,8 @@ pub(crate) struct TerminalElement {
     pub theme: Theme,
     /// The cells of the link under the pointer.
     pub hovered_link: Option<(GridPoint, GridPoint)>,
+    /// Keep the size it has, as while a panel glides: its card is being moved about.
+    pub hold_size: bool,
 }
 
 pub(crate) struct Prepaint {
@@ -221,7 +223,7 @@ impl Element for TerminalElement {
         );
         let mut wanted = None;
         let (cols, rows) = match previous {
-            Some(metrics) if layout_moving => (metrics.cols, metrics.rows),
+            Some(metrics) if layout_moving || self.hold_size => (metrics.cols, metrics.rows),
             // The same goes for a window being dragged: one resize, once it has stopped.
             Some(metrics) if fit != (metrics.cols, metrics.rows) => {
                 let since = metrics

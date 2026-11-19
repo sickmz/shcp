@@ -894,6 +894,13 @@ impl AppState {
         cx.notify();
     }
 
+    /// Tabs from the sidebar to the top of the window or back, and persists the choice.
+    pub(crate) fn toggle_tab_style(&mut self, cx: &mut Context<Self>) {
+        self.settings.tab_style = self.settings.tab_style.toggled();
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
     /// Live sidebar resize; `persist` writes the final width.
     pub(crate) fn set_sidebar_width(&mut self, width: f32, persist: bool, cx: &mut Context<Self>) {
         self.settings.sidebar_width = width.clamp(180., 560.);

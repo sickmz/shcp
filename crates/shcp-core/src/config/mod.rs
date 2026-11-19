@@ -49,7 +49,8 @@ fn keep_local(settings: &mut Settings, local: &Settings) {
     settings.saved_passwords.clone_from(&local.saved_passwords);
 }
 
-/// Settings and backups saved before the bundled themes were renamed still use the old names.
+/// Settings and backups saved before the bundled themes were renamed or replaced still use the
+/// old names. Nocturne gives way to Black, the warm Prune to Terracotta.
 fn rename_old_themes(settings: &mut Settings) {
     for name in [
         &mut settings.theme,
@@ -59,6 +60,8 @@ fn rename_old_themes(settings: &mut Settings) {
         match name.as_str() {
             "shcp Dark" => *name = "Dark".into(),
             "shcp Light" => *name = "Light".into(),
+            "Nocturne" => *name = "Black".into(),
+            "Prune" => *name = "Terracotta".into(),
             _ => {}
         }
     }
@@ -323,9 +326,25 @@ mod tests {
         )
         .unwrap();
         store.load_settings().unwrap();
-        assert_eq!(store.settings.theme, "Nocturne");
-        assert_eq!(store.settings.dark_theme, "Nocturne");
+        assert_eq!(store.settings.theme, "Black");
+        assert_eq!(store.settings.dark_theme, "Black");
         assert_eq!(store.settings.light_theme, "Solarized");
+    }
+
+    #[test]
+    fn replaced_themes_give_way_to_their_successors() {
+        let scratch = Scratch::new("replaced-themes");
+        let mut store = scratch_store(&scratch, "store");
+        fs::write(
+            store.paths.config_dir.join("settings.toml"),
+            "style_version = 1\ntheme = \"Prune\"\ndark_theme = \"Prune\"\n\
+             light_theme = \"Nocturne\"\nraised_cards = true\n",
+        )
+        .unwrap();
+        store.load_settings().unwrap();
+        assert_eq!(store.settings.theme, "Terracotta");
+        assert_eq!(store.settings.dark_theme, "Terracotta");
+        assert_eq!(store.settings.light_theme, "Black");
     }
 
     #[test]

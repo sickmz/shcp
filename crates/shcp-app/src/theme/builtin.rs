@@ -1,45 +1,139 @@
-//! Built-in themes: cool Nocturne and warm Prune.
-//! All keep the user's configurable accent.
+//! Built-in themes: dark, each grown from one color, the base of its content. The sidebar is that
+//! color a little lighter in OKLCH, with the same chroma and hue; the rest follows from the base.
+//! They take the user's accent, or bring their own.
+use super::oklab::Oklch;
 use super::{Theme, to_rgb};
 use gpui::{Hsla, Rgba};
 use shcp_core::Accent;
 use shcp_core::term::Palette;
 
-/// The hue of the grays, and of the blue accent.
+/// The hue of the blue accent.
 const HUE: f32 = 268.;
-/// How much of that hue the grays take.
-const TINT: f32 = 0.18;
 
-pub(crate) const NOCTURNE: &str = "Nocturne";
-pub(crate) const PRUNE: &str = "Prune";
+/// How much lighter than the content the sidebar and the window around the cards are, in OKLCH
+/// lightness from 0 to 1.
+pub(crate) const SIDEBAR_LIFT: f32 = 0.009;
+
+pub(crate) const BLACK: &str = "Black";
+pub(crate) const TERRACOTTA: &str = "Terracotta";
 
 /// Lightness and chroma of the accent, and lightness of what is written on it.
 pub(super) const DARK_LIT: (f32, f32, f32) = (0.80, 0.135, 0.17);
 pub(super) const LIGHT_LIT: (f32, f32, f32) = (0.50, 0.15, 0.985);
 
+/// One of the app's themes.
+struct Spec {
+    name: &'static str,
+    /// The terminals and the files, `0xRRGGBB`.
+    base: u32,
+    /// The theme's own accent, in OKLCH.
+    accent: (f32, f32, f32),
+}
+
+/// In the order they are offered: Black first, then around the hues.
+const SPECS: [Spec; 12] = [
+    // Near-black neutral, a clear azure.
+    Spec {
+        name: BLACK,
+        base: 0x0e0e0e,
+        accent: (0.80, 0.10, 255.),
+    },
+    // Neutral gray with a breath of blue, a warm orange.
+    Spec {
+        name: "Graphite",
+        base: 0x181a1b,
+        accent: (0.78, 0.12, 55.),
+    },
+    // Cool blue-gray, a pale sky.
+    Spec {
+        name: "Slate",
+        base: 0x141a1f,
+        accent: (0.80, 0.09, 225.),
+    },
+    // Deep blue, brass.
+    Spec {
+        name: "Navy",
+        base: 0x0e1625,
+        accent: (0.86, 0.11, 90.),
+    },
+    // Blue-violet, lavender.
+    Spec {
+        name: "Ink",
+        base: 0x131322,
+        accent: (0.80, 0.10, 290.),
+    },
+    // Dusky purple, orchid.
+    Spec {
+        name: "Plum",
+        base: 0x1e131d,
+        accent: (0.80, 0.11, 335.),
+    },
+    // Burgundy, rose.
+    Spec {
+        name: "Wine",
+        base: 0x221013,
+        accent: (0.78, 0.11, 12.),
+    },
+    // Dark fired clay, terracotta.
+    Spec {
+        name: TERRACOTTA,
+        base: 0x221510,
+        accent: (0.74, 0.12, 40.),
+    },
+    // Coffee brown, caramel.
+    Spec {
+        name: "Espresso",
+        base: 0x1c1610,
+        accent: (0.82, 0.09, 72.),
+    },
+    // Dark olive, citron.
+    Spec {
+        name: "Olive",
+        base: 0x181910,
+        accent: (0.84, 0.11, 112.),
+    },
+    // Pine green, sage.
+    Spec {
+        name: "Forest",
+        base: 0x101a13,
+        accent: (0.82, 0.11, 155.),
+    },
+    // Deep teal, aqua.
+    Spec {
+        name: "Lagoon",
+        base: 0x0b1b1c,
+        accent: (0.82, 0.09, 195.),
+    },
+];
+
+/// The names of the app's themes, in the order they are offered.
+pub(crate) fn names() -> impl Iterator<Item = &'static str> {
+    SPECS.iter().map(|spec| spec.name)
+}
+
+fn spec(name: &str) -> Option<&'static Spec> {
+    SPECS.iter().find(|spec| spec.name == name)
+}
+
+fn hsla(rgb: [f32; 3], a: f32) -> Hsla {
+    let [r, g, b] = rgb;
+    Rgba { r, g, b, a }.into()
+}
+
 /// An OKLCH color, as sRGB in gpui's terms. What falls outside sRGB is clipped.
 pub(crate) fn oklch(l: f32, c: f32, h: f32, a: f32) -> Hsla {
-    let radians = h.to_radians();
-    let (ca, cb) = (c * radians.cos(), c * radians.sin());
-    let cube = |v: f32| v * v * v;
-    let lms_l = cube(l + 0.396_337_78 * ca + 0.215_803_76 * cb);
-    let lms_m = cube(l - 0.105_561_346 * ca - 0.063_854_17 * cb);
-    let lms_s = cube(l - 0.089_484_18 * ca - 1.291_485_5 * cb);
-    let gamma = |v: f32| {
-        let v = v.clamp(0., 1.);
-        if v <= 0.003_130_8 {
-            12.92 * v
-        } else {
-            1.055 * v.powf(1. / 2.4) - 0.055
-        }
-    };
-    Rgba {
-        r: gamma(4.076_741_7 * lms_l - 3.307_711_6 * lms_m + 0.230_969_94 * lms_s),
-        g: gamma(-1.268_438 * lms_l + 2.609_757_4 * lms_m - 0.341_319_38 * lms_s),
-        b: gamma(-0.004_196_086_3 * lms_l - 0.703_418_6 * lms_m + 1.707_614_7 * lms_s),
-        a,
-    }
-    .into()
+    hsla(Oklch::new(l, c, h).to_srgb().map(|v| v.clamp(0., 1.)), a)
+}
+
+/// An OKLCH color brought into sRGB with its lightness and hue.
+fn fit(color: Oklch, a: f32) -> Hsla {
+    hsla(color.to_srgb_in_gamut(), a)
+}
+
+/// The sidebar and the window around the cards for a content of `base`: `SIDEBAR_LIFT` lighter,
+/// with the same chroma and hue.
+pub(crate) fn sidebar_of(base: Oklch) -> Oklch {
+    base.lighter(SIDEBAR_LIFT)
 }
 
 /// An accent as a theme draws it, and what is written on it.
@@ -51,8 +145,21 @@ struct Lit {
     on_c: f32,
 }
 
-fn lit(accent: Accent, is_light: bool) -> Lit {
+/// `own`: the accent the theme brings, for `Accent::Theme`.
+fn lit(accent: Accent, is_light: bool, own: Option<(f32, f32, f32)>) -> Lit {
     let h = match accent {
+        Accent::Theme => match own {
+            Some((l, c, h)) => {
+                return Lit {
+                    l,
+                    c,
+                    h,
+                    on_l: DARK_LIT.2,
+                    on_c: 0.03,
+                };
+            }
+            None => HUE,
+        },
         Accent::Blue | Accent::Mono => HUE,
         Accent::Violet => 305.,
         Accent::Pink => 350.,
@@ -86,147 +193,107 @@ fn lit(accent: Accent, is_light: bool) -> Lit {
     }
 }
 
-/// The color of an accent, for showing the choice.
-pub(crate) fn accent_color(accent: Accent, is_light: bool) -> Hsla {
-    let lit = lit(accent, is_light);
+/// The color of an accent on `theme`, for showing the choice. A theme's own accent is the one
+/// of the app's theme by that name; a theme from a file shows the one it has.
+pub(crate) fn accent_color(accent: Accent, theme: &Theme) -> Hsla {
+    if accent == Accent::Theme && theme.file.is_some() {
+        return theme.accent;
+    }
+    let lit = lit(
+        accent,
+        theme.is_light,
+        spec(&theme.name).map(|spec| spec.accent),
+    );
     oklch(lit.l, lit.c, lit.h, 1.)
 }
 
-/// `raised`: the cards are lighter than the window around them; otherwise darker, sunk into it.
-pub(crate) fn build(name: &str, accent: Accent, raised: bool) -> Theme {
-    match name {
-        PRUNE => prune(accent, raised),
-        _ => nocturne(accent, raised),
-    }
+/// The app's theme `name` in `accent`. A name that is not one of them gives Black.
+pub(crate) fn build(name: &str, accent: Accent) -> Theme {
+    from_spec(spec(name).unwrap_or(&SPECS[0]), accent)
 }
 
-/// Warm charcoal, brown shadows and a restrained copper in the muted text.
-fn prune(accent: Accent, raised: bool) -> Theme {
-    let mut theme = nocturne(accent, raised);
-    let color = |hex| -> Hsla { gpui::rgb(hex).into() };
-    let ink = color(0xece3df);
-    theme.name = PRUNE.into();
-    // The terminals' warm charcoal, at three depths: a modal's side column, on `surface`, and
-    // its content, on `elevated`, read as two shades of one color. The cards, terminals and
-    // files alike, a step above the window or a step below it.
-    let (window, card) = if raised {
-        (color(0x1f1d1b), color(0x2b2927))
-    } else {
-        (color(0x2b2927), color(0x22201e))
-    };
-    theme.bg = card;
-    theme.surface = color(0x282624);
-    theme.elevated = color(0x312f2c);
-    theme.input_bg = color(0x1f1d1b);
-    theme.border = Hsla { a: 0.095, ..ink };
-    theme.strong_border = Hsla { a: 0.17, ..ink };
-    theme.text = ink;
-    theme.text_muted = color(0xc2b2ac);
-    theme.text_disabled = color(0xa59690);
-    theme.hover = Hsla { a: 0.055, ..ink };
-    theme.active = color(0x38322e);
-    theme.scrim = Hsla {
-        a: 0.46,
-        ..color(0x1f1d1b)
-    };
-    theme.window_bg = window;
-    theme.track = color(0x312f2c);
-    theme.terminal_bg = card;
-    // Keep the engine's default background exactly aligned with the UI: default cells must
-    // remain transparent to the card they are on.
-    theme.palette.bg = to_rgb(theme.terminal_bg);
-    theme.palette.fg = to_rgb(ink);
-    theme.terminal_cursor = ink;
-    theme.palette.cursor = to_rgb(ink);
-    theme.palette.ansi[0] = to_rgb(color(0x514443));
-    theme.palette.ansi[7] = to_rgb(color(0xc2b2ac));
-    theme.palette.ansi[8] = to_rgb(color(0x9a8279));
-    theme.palette.ansi[15] = to_rgb(ink);
-    theme
-}
-
-fn nocturne(accent: Accent, raised: bool) -> Theme {
-    let (tint, h) = (TINT, HUE);
-    let n = 0.015 * tint;
+fn from_spec(spec: &Spec, accent: Accent) -> Theme {
+    let base = Oklch::from_hex(spec.base);
+    let Oklch { c, h, .. } = base;
+    // The base at another lightness: what stands on the content or the sidebar.
+    let shade = |dl: f32| fit(base.lighter(dl), 1.);
+    let content: Hsla = gpui::rgb(spec.base).into();
+    let sidebar = fit(sidebar_of(base), 1.);
+    // Text takes a little of the base's color, the quieter grays a little more.
+    let ink_c = (c * 0.35).min(0.012);
+    let gray_c = (c * 0.6).min(0.022);
+    let ink = fit(Oklch::new(0.95, ink_c, h), 1.);
+    let muted = fit(Oklch::new(0.82, gray_c, h), 1.);
+    let raise = shade(0.065);
     let Lit {
         l: lit_l,
         c: lit_c,
-        h: accent,
+        h: lit_h,
         on_l,
         on_c,
-    } = lit(accent, false);
-    // The cards a step above the window or a step below it, and what floats above both. The
-    // fields stay the darkest, sunk into whatever holds them.
-    let stage = oklch(0.132, n, h, 1.);
-    let (window, card) = if raised {
-        (oklch(0.150, n, h, 1.), oklch(0.200, n, h, 1.))
-    } else {
-        (oklch(0.178, n, h, 1.), stage)
-    };
-    let raise = oklch(0.232, n, h, 1.);
-    let ink = oklch(0.97, 0.006 * tint, h, 1.);
-    let green = oklch(0.82, 0.13, 152., 1.);
-    let red = oklch(0.74, 0.15, 25., 1.);
-    let amber = oklch(0.84, 0.12, 85., 1.);
-    let blue = oklch(0.78, 0.1, 250., 1.);
-    let magenta = oklch(0.78, 0.11, 320., 1.);
-    let cyan = oklch(0.82, 0.09, 195., 1.);
-    let lit = oklch(lit_l, lit_c, accent, 1.);
-    let foreground = oklch(0.96, 0.006 * tint, h, 1.);
+    } = lit(accent, false, Some(spec.accent));
+    let lit = |a: f32| fit(Oklch::new(lit_l, lit_c, lit_h), a);
+    let color = |l: f32, c: f32, h: f32| fit(Oklch::new(l, c, h), 1.);
+    let green = color(0.82, 0.13, 152.);
+    let red = color(0.74, 0.15, 25.);
+    let amber = color(0.84, 0.12, 85.);
+    let line = |a: f32| fit(Oklch::new(0.95, c.min(0.012), h), a);
     Theme {
-        name: NOCTURNE.into(),
+        name: spec.name.into(),
         origin: None,
         file: None,
         is_light: false,
-        bg: card,
-        surface: window,
+        bg: content,
+        surface: sidebar,
         elevated: raise,
-        input_bg: stage,
-        border: oklch(0.95, 0.012, h, 0.095),
-        strong_border: oklch(0.95, 0.012, h, 0.17),
+        input_bg: shade(-0.025),
+        border: line(0.095),
+        strong_border: line(0.17),
         text: ink,
-        text_muted: oklch(0.84, 0.01 * tint, h, 1.),
-        text_disabled: oklch(0.72, 0.012 * tint, h, 1.),
-        accent: lit,
-        primary: lit,
-        on_primary: oklch(on_l, on_c, accent, 1.),
+        text_muted: muted,
+        text_disabled: fit(Oklch::new(0.70, gray_c, h), 1.),
+        accent: lit(1.),
+        primary: lit(1.),
+        on_primary: fit(Oklch::new(on_l, on_c, lit_h), 1.),
         success: green,
         warning: amber,
         error: red,
         hover: Hsla { a: 0.055, ..ink },
-        active: oklch(0.28, n, h, 1.),
-        selected: oklch(lit_l, lit_c, accent, 0.15),
-        lit_line: oklch(lit_l, lit_c, accent, 0.42),
-        scrim: oklch(0.1, 0.01, h, 0.46),
-        window_bg: window,
+        active: shade(0.1),
+        selected: lit(0.15),
+        lit_line: lit(0.42),
+        scrim: fit(Oklch::new(0.1, c * 0.5, h), 0.46),
+        window_bg: sidebar,
         track: raise,
-        terminal_bg: card,
-        terminal_selection: oklch(lit_l, lit_c, accent, 0.3),
+        // Terminals and files alike sit on the base.
+        terminal_bg: content,
+        terminal_selection: lit(0.3),
         // White in any accent: the accent colors the app, not what is typed.
         terminal_cursor: ink,
         lit_l: DARK_LIT.0,
         lit_c,
         palette: Palette {
             ansi: [
-                to_rgb(oklch(0.32, n, h, 1.)),
+                to_rgb(shade(0.17)),
                 to_rgb(red),
                 to_rgb(green),
                 to_rgb(amber),
-                to_rgb(blue),
-                to_rgb(magenta),
-                to_rgb(cyan),
-                to_rgb(oklch(0.82, 0.01 * tint, h, 1.)),
-                to_rgb(oklch(0.6, 0.014 * tint, h, 1.)),
-                to_rgb(oklch(0.8, 0.14, 25., 1.)),
-                to_rgb(oklch(0.88, 0.13, 152., 1.)),
-                to_rgb(oklch(0.9, 0.12, 85., 1.)),
-                to_rgb(oklch(0.85, 0.09, 250., 1.)),
-                to_rgb(oklch(0.85, 0.1, 320., 1.)),
-                to_rgb(oklch(0.88, 0.08, 195., 1.)),
+                to_rgb(color(0.78, 0.1, 250.)),
+                to_rgb(color(0.78, 0.11, 320.)),
+                to_rgb(color(0.82, 0.09, 195.)),
+                to_rgb(muted),
+                to_rgb(fit(Oklch::new(0.62, gray_c, h), 1.)),
+                to_rgb(color(0.8, 0.14, 25.)),
+                to_rgb(color(0.88, 0.13, 152.)),
+                to_rgb(color(0.9, 0.12, 85.)),
+                to_rgb(color(0.85, 0.09, 250.)),
+                to_rgb(color(0.85, 0.1, 320.)),
+                to_rgb(color(0.88, 0.08, 195.)),
                 to_rgb(ink),
             ],
-            fg: to_rgb(foreground),
-            bg: to_rgb(card),
+            fg: to_rgb(fit(Oklch::new(0.94, ink_c, h), 1.)),
+            // Exactly the card: default cells stay transparent to it.
+            bg: to_rgb(content),
             cursor: to_rgb(ink),
         },
     }
@@ -235,6 +302,7 @@ fn nocturne(accent: Accent, raised: bool) -> Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shcp_core::term::Rgb;
 
     fn close(a: f32, b: f32) -> bool {
         (a - b).abs() < 0.01
@@ -269,22 +337,106 @@ mod tests {
         (a.max(b) + 0.05) / (a.min(b) + 0.05)
     }
 
+    fn rgb(color: Rgb) -> Hsla {
+        gpui::rgb(super::super::rgb_hex(color)).into()
+    }
+
+    fn oklch_of(color: Hsla) -> Oklch {
+        let Rgba { r, g, b, .. } = color.to_rgb();
+        Oklch::from_srgb([r, g, b])
+    }
+
+    /// The color as the screen shows it: 8 bits a channel.
+    fn bytes(color: Hsla) -> [u8; 3] {
+        let Rgb(r, g, b) = to_rgb(color);
+        [r, g, b]
+    }
+
+    #[test]
+    fn there_are_twelve_dark_themes_black_first() {
+        let names: Vec<_> = names().collect();
+        assert_eq!(names.len(), 12);
+        assert_eq!(names[0], BLACK);
+        assert!(names.contains(&TERRACOTTA));
+        for (index, name) in names.iter().enumerate() {
+            assert!(!names[index + 1..].contains(name), "{name} twice");
+            let theme = build(name, Accent::Theme);
+            assert_eq!(theme.name.as_ref(), *name);
+            assert!(!theme.is_light);
+        }
+        assert_eq!(build("Nocturne", Accent::Theme).name.as_ref(), BLACK);
+    }
+
+    /// The rule the themes are made by: the content is the base; the sidebar is the base in
+    /// OKLCH with 0.009 more lightness and the same chroma and hue.
+    #[test]
+    fn the_sidebar_is_the_base_a_little_lighter() {
+        for spec in &SPECS {
+            let base = Oklch::from_hex(spec.base);
+            assert!(sidebar_of(base).in_gamut(), "{}", spec.name);
+            for accent in Accent::ALL {
+                let theme = build(spec.name, accent);
+                let name = spec.name;
+                assert_eq!(theme.bg, Hsla::from(gpui::rgb(spec.base)), "{name}");
+                assert_eq!(theme.terminal_bg, theme.bg, "{name}");
+                assert_eq!(theme.palette.bg, to_rgb(theme.bg), "{name}");
+                assert_eq!(theme.window_bg, theme.surface, "{name}");
+                // Exactly, before the screen rounds it.
+                let sidebar = oklch_of(theme.surface);
+                assert!((sidebar.l - base.l - 0.009).abs() < 1e-4, "{name}");
+                assert!((sidebar.c - base.c).abs() < 1e-4, "{name}");
+                if base.c > 0.002 {
+                    assert!((sidebar.h - base.h).abs() < 0.1, "{name}");
+                }
+                // And as the screen shows it, 8 bits a channel.
+                let expected = hsla(sidebar_of(base).to_srgb_in_gamut(), 1.);
+                assert_eq!(bytes(theme.surface), bytes(expected), "{name}");
+                let shown = oklch_of(rgb(to_rgb(theme.surface)));
+                assert!((shown.l - base.l - 0.009).abs() < 0.0025, "{name}");
+                assert!((shown.c - base.c).abs() < 0.0025, "{name}");
+                if base.c > 0.01 {
+                    assert!((shown.h - base.h).abs() < 3., "{name}");
+                }
+                assert_ne!(bytes(theme.surface), bytes(theme.bg), "{name}");
+            }
+        }
+    }
+
     #[test]
     fn text_stays_readable() {
-        for name in [NOCTURNE, PRUNE] {
-            for (accent, raised) in Accent::ALL
-                .into_iter()
-                .flat_map(|accent| [(accent, true), (accent, false)])
-            {
-                let theme = build(name, accent, raised);
+        for name in names() {
+            for accent in Accent::ALL {
+                let theme = build(name, accent);
                 assert!(contrast(theme.text, theme.bg) >= 7., "{name}");
+                assert!(contrast(theme.text, theme.surface) >= 7., "{name}");
                 assert!(contrast(theme.text_muted, theme.surface) >= 4.5, "{name}");
+                assert!(contrast(theme.text_muted, theme.elevated) >= 4.5, "{name}");
                 assert!(contrast(theme.text_disabled, theme.bg) >= 4.5, "{name}");
                 assert!(contrast(theme.accent, theme.bg) >= 4.5, "{name} {accent:?}");
                 assert!(
                     contrast(theme.on_primary, theme.primary) >= 4.5,
                     "{name} {accent:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_colors_stay_readable() {
+        for name in names() {
+            let theme = build(name, Accent::Theme);
+            let Palette { ansi, fg, bg, .. } = theme.palette;
+            let bg = rgb(bg);
+            assert!(contrast(rgb(fg), bg) >= 7., "{name}");
+            for (index, color) in ansi.into_iter().enumerate() {
+                let ratio = contrast(rgb(color), bg);
+                match index {
+                    // Black is meant to sit close to the background.
+                    0 => assert!(ratio >= 1.4, "{name} black {ratio}"),
+                    // Bright black: the dim text of prompts and suggestions.
+                    8 => assert!(ratio >= 3., "{name} bright black {ratio}"),
+                    _ => assert!(ratio >= 4.5, "{name} color {index} {ratio}"),
+                }
             }
         }
     }

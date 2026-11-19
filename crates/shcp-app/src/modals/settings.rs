@@ -25,7 +25,9 @@ use gpui::{
     KeyDownEvent, PathPromptOptions, ScrollHandle, SharedString, Subscription, Task, Window,
     anchored, deferred, div, img, px, relative,
 };
-use shcp_core::{Accent, CursorStyle, Density, HostId, KnownHost, NoticeLevel, Settings};
+use shcp_core::{
+    Accent, CursorStyle, Density, GlassLevel, HostId, KnownHost, NoticeLevel, Settings,
+};
 use std::{
     path::{Path, PathBuf},
     rc::Rc,
@@ -196,7 +198,7 @@ impl SettingsModal {
                     window,
                     |this, input, event: &TextInputEvent, _, cx| match event {
                         TextInputEvent::Cancel if this.open_dropdown.is_some() => {
-                            this.open_dropdown = None;
+                            this.close_dropdown(cx);
                             cx.notify();
                         }
                         TextInputEvent::Cancel if !input.read(cx).text().is_empty() => {
@@ -225,6 +227,8 @@ impl SettingsModal {
                 ),
             ];
         subscriptions.push(cx.observe(&state, |_, _, cx| cx.notify()));
+        // However the settings go away, a preview goes with them.
+        subscriptions.push(cx.on_release(|this: &mut Self, cx| this.end_preview(cx)));
         Self {
             state,
             modals,
@@ -507,9 +511,27 @@ impl SettingsModal {
     }
 
     fn close(&mut self, cx: &mut Context<Self>) {
+        self.end_preview(cx);
         self.commit_editor(cx);
         self.commit_skip_folders(cx);
         cx.emit(DismissEvent);
+    }
+
+    /// Shows a theme or an accent all over the app while the pointer is on it. Nothing is saved.
+    fn preview(&self, next: crate::theme::ThemePreview, cx: &mut App) {
+        let state = self.state.read(cx);
+        let (settings, engine) = (state.settings.clone(), state.engine.clone());
+        crate::theme::preview(next, &settings, &engine, cx);
+    }
+
+    /// Back to the chosen theme and accent.
+    fn end_preview(&self, cx: &mut App) {
+        self.preview(crate::theme::ThemePreview::default(), cx);
+    }
+
+    fn close_dropdown(&mut self, cx: &mut Context<Self>) {
+        self.open_dropdown = None;
+        self.end_preview(cx);
     }
 
     fn toggle_dropdown(&mut self, which: Dropdown, cx: &mut Context<Self>) {
@@ -518,6 +540,7 @@ impl SettingsModal {
         } else {
             Some(which)
         };
+        self.end_preview(cx);
         if self.open_dropdown == Some(Dropdown::Font) && self.monospace_fonts.is_none() {
             self.monospace_fonts = Some(Rc::new(monospace_fonts(&self.installed_fonts, cx)));
         }
@@ -547,8 +570,14 @@ impl SettingsModal {
                         // The trigger closes it by itself: closing here too would reopen it.
                         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                             if !this.dropdown_trigger_hovered {
-                                this.open_dropdown = None;
+                                this.close_dropdown(cx);
                                 cx.notify();
+                            }
+                        }))
+                        // A preview lasts from row to row, and ends on leaving the list.
+                        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                            if !*hovered {
+                                this.end_preview(cx);
                             }
                         }))
                         .children(items),
@@ -615,7 +644,7 @@ impl SettingsModal {
                             name.eq_ignore_ascii_case(&family),
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.open_dropdown = None;
+                            this.close_dropdown(cx);
                             let chosen = chosen.clone();
                             this.change(|s| s.terminal_font_family = chosen, cx);
                         }))
@@ -1101,7 +1130,7 @@ fn pick_icon_theme(
     cx: &mut Context<SettingsModal>,
 ) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
     cx.listener(move |this, _, _, cx| {
-        this.open_dropdown = None;
+        this.close_dropdown(cx);
         let name = name.clone();
         this.change(|s| s.icon_theme = name, cx);
     })
@@ -1144,7 +1173,7 @@ fn theme_preview(item: &Theme) -> impl IntoElement + use<> {
         .gap(px(2.))
         .px(px(5.))
         .py(px(4.))
-        .rounded(px(5.))
+        .rounded(px(crate::theme::RADIUS_SMALL))
         .border_1()
         .border_color(item.border)
         .bg(item.terminal_bg)
@@ -1254,16 +1283,33 @@ impl SettingsModal {
             ),
         );
         add(
-            "Cards",
-            "Terminals and files lighter or darker than the window, in the app's own themes",
-            segmented(
+            "Glass",
+            "The desktop shows blurred behind the sidebar. Windows may drop it in battery saver or \
+             without transparency effects, and moving the window can lag",
+            switch(
                 theme,
-                "cards",
-                &[(true, "Raised"), (false, "Sunken")],
-                settings.raised_cards,
-                self.setter(|s, v| s.raised_cards = v, cx),
+                "glass",
+                settings.glass,
+                self.setter(|s, v| s.glass = v, cx),
             ),
         );
+        if settings.glass {
+            add(
+                "Glass strength",
+                "How much of the desktop shows through",
+                segmented(
+                    theme,
+                    "glass-level",
+                    &[
+                        (GlassLevel::Subtle, "Subtle"),
+                        (GlassLevel::Medium, "Medium"),
+                        (GlassLevel::Clear, "Clear"),
+                    ],
+                    settings.glass_level,
+                    self.setter(|s, v| s.glass_level = v, cx),
+                ),
+            );
+        }
         add(
             "Animations",
             "Panels, views and the highlight glide when you use the mouse, instead of jumping",
@@ -1623,7 +1669,9 @@ impl SettingsModal {
             .map(|item| crate::theme::with_accent(item.clone(), &settings))
             .collect();
         let themes_dir = self.themes_dir(cx);
-        let current = dropdown_value(theme_preview(&theme), theme.name.clone());
+        // What is chosen, not what a preview shows over it.
+        let chosen = crate::theme::chosen(&settings, cx);
+        let current = dropdown_value(theme_preview(&chosen), chosen.name.clone());
         let picker = self.dropdown(
             Dropdown::Theme,
             "theme",
@@ -1635,9 +1683,19 @@ impl SettingsModal {
                     .enumerate()
                     .map(|(index, item)| {
                         let (name, is_light) = (item.name.to_string(), item.is_light);
-                        dropdown_item(&ui, ("theme-item", index), item.name == ui.name)
+                        let shown = item.name.clone();
+                        dropdown_item(&ui, ("theme-item", index), item.name == chosen.name)
+                            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                if *hovered {
+                                    let next = crate::theme::ThemePreview {
+                                        theme: Some(shown.clone()),
+                                        accent: None,
+                                    };
+                                    this.preview(next, cx);
+                                }
+                            }))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.open_dropdown = None;
+                                this.close_dropdown(cx);
                                 let name = name.clone();
                                 this.change(
                                     |s| {
@@ -1660,7 +1718,7 @@ impl SettingsModal {
                 items.push(
                     dropdown_action(&ui, "browse-themes", IconName::Search, "Browse themes…")
                         .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_dropdown = None;
+                            this.close_dropdown(cx);
                             this.open_theme_browser(ThemeKind::Color, window, cx);
                         }))
                         .into_any_element(),
@@ -1671,7 +1729,7 @@ impl SettingsModal {
                             "Drop VS Code theme .json files here, then reload the themes",
                         ))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.open_dropdown = None;
+                            this.close_dropdown(cx);
                             match std::fs::create_dir_all(&themes_dir) {
                                 Ok(()) => cx.open_with_system(&themes_dir),
                                 Err(error) => {
@@ -1687,7 +1745,7 @@ impl SettingsModal {
                 items.push(
                     dropdown_action(&ui, "reload-themes", IconName::Refresh, "Reload themes")
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.open_dropdown = None;
+                            this.close_dropdown(cx);
                             this.reload_themes(cx);
                         }))
                         .into_any_element(),
@@ -1707,8 +1765,14 @@ impl SettingsModal {
         // A theme from a file brings its own accent.
         let open = theme.file.is_none();
         let chosen = self.state.read(cx).settings.accent;
+        // From swatch to swatch the preview goes on; it ends on leaving them all.
+        let leave = cx.listener(|this, hovered: &bool, _, cx| {
+            if !*hovered {
+                this.end_preview(cx);
+            }
+        });
         let swatches = Accent::ALL.into_iter().enumerate().map(|(index, accent)| {
-            let color = crate::theme::builtin::accent_color(accent, theme.is_light);
+            let color = crate::theme::builtin::accent_color(accent, &theme);
             let set = self.setter(|s, v| s.accent = v, cx);
             div()
                 .id(("accent", index))
@@ -1726,14 +1790,25 @@ impl SettingsModal {
                 .when(open, |this| {
                     this.cursor_pointer()
                         .tooltip(tooltip(accent.label()))
+                        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                            if *hovered {
+                                let next = crate::theme::ThemePreview {
+                                    theme: None,
+                                    accent: Some(accent),
+                                };
+                                this.preview(next, cx);
+                            }
+                        }))
                         .on_click(move |_, window, cx| set(accent, window, cx))
                 })
                 .child(div().size(px(14.)).rounded_full().bg(color))
         });
         let control = div()
+            .id("accents")
             .flex()
             .gap(px(2.))
             .when(!open, |this| this.opacity(0.4))
+            .on_hover(leave)
             .children(swatches);
         let help = (!open).then(|| SharedString::from("This theme brings its own"));
         Some(row(&theme, "Accent", help, control))
@@ -1785,7 +1860,7 @@ impl SettingsModal {
                         "Browse file icon themes…",
                     )
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_dropdown = None;
+                        this.close_dropdown(cx);
                         this.open_theme_browser(ThemeKind::Icon, window, cx);
                     }))
                     .into_any_element(),
@@ -2372,7 +2447,7 @@ impl super::ModalView for SettingsModal {
     }
     fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.open_dropdown.is_some() {
-            self.open_dropdown = None;
+            self.close_dropdown(cx);
             cx.notify();
         } else {
             self.cancel_key_login(window, cx);

@@ -4,7 +4,8 @@ use super::icon::{Icon, IconName};
 use super::tooltip::tooltip;
 use crate::theme::{Theme, row_px};
 use gpui::prelude::*;
-use gpui::{AnyElement, Div, ElementId, Hsla, Pixels, SharedString, div, px};
+use gpui::{AnyElement, App, Div, ElementId, Hsla, Pixels, SharedString, div, px};
+use std::{cell::RefCell, collections::HashMap};
 
 const WIDTH: f32 = 22.;
 const HEIGHT: f32 = 18.;
@@ -18,29 +19,53 @@ const GAP: f32 = 1.;
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum Mark {
     Icon(IconName),
-    /// A few characters, as a prompt shows them.
-    Glyph(&'static str),
     /// A short label, like the type of a file: the tile widens for one of three or four letters.
     Label(SharedString),
 }
 
-/// What the tile of a session says of its shell: `#` for root whatever the shell, the prompt of a
-/// shell it knows, the terminal icon for any other or none. `shell` is the login shell the server
-/// named, not what the user started later.
-fn shell_mark(shell: Option<&str>, user: &str) -> Mark {
-    if user == "root" {
-        return Mark::Glyph("#");
+thread_local! {
+    /// What `text_lift` found, by font family and size.
+    static LIFTS: RefCell<HashMap<(String, u32), Pixels>> = RefCell::default();
+}
+
+/// How far text in `family` at `size`, beside an icon or a tile, goes up to look centred on it.
+/// gpui centres a line on the font's ascent and descent: the middle of the line is half their
+/// difference above the baseline, while the middle of lowercase letters is half the x-height
+/// above it. Icons are centred on their box, so the text is lifted by the difference, from the
+/// font's own metrics. In whole pixels, rounded down: gpui puts glyphs on whole pixels by
+/// rounding their position down, so a lift of 1.4 would show as 2.
+pub(crate) fn text_lift(family: &str, size: Pixels, cx: &App) -> Pixels {
+    let key = (family.to_string(), f32::from(size).to_bits());
+    if let Some(lift) = LIFTS.with(|lifts| lifts.borrow().get(&key).copied()) {
+        return lift;
     }
-    match shell {
-        Some("bash") => Mark::Glyph("$"),
-        Some("zsh") => Mark::Glyph("%"),
-        Some("fish") => Mark::Glyph("~>"),
-        Some("pwsh" | "powershell") => Mark::Glyph("PS"),
-        _ => Mark::Icon(IconName::Terminal),
+    let system = cx.text_system();
+    let font = system.resolve_font(&gpui::font(family.to_string()));
+    let ascent = f32::from(system.ascent(font, size));
+    // Below the baseline, whichever sign the platform gives it.
+    let descent = f32::from(system.descent(font, size)).abs();
+    let x_height = f32::from(system.x_height(font, size));
+    let lift = if x_height > 0. {
+        px(((ascent - descent) / 2. - x_height / 2.).max(0.).floor())
+    } else {
+        px(0.)
+    };
+    LIFTS.with(|lifts| lifts.borrow_mut().insert(key, lift));
+    lift
+}
+
+/// What the tooltip of a session's tile says: the shell the server named, and root when it is.
+fn shell_tip(shell: Option<&str>, user: &str) -> Option<String> {
+    match (shell, user == "root") {
+        (Some(shell), true) => Some(format!("root · {shell}")),
+        (None, true) => Some("root".to_string()),
+        (Some(shell), false) => Some(shell.to_string()),
+        (None, false) => None,
     }
 }
 
-/// The tile of a session, saying its shell when known.
+/// The tile of a session: the terminal prompt, whatever the shell. The tooltip names the shell,
+/// and root. `shell` is the login shell the server named, not what the user started later.
 pub(crate) fn shell_tile(
     id: impl Into<ElementId>,
     shell: Option<&str>,
@@ -49,12 +74,9 @@ pub(crate) fn shell_tile(
     deck: Option<Hsla>,
     theme: &Theme,
 ) -> AnyElement {
-    let tile = tile(shell_mark(shell, user), color, deck, theme);
-    match shell {
-        Some(shell) => tile
-            .id(id)
-            .tooltip(tooltip(shell.to_string()))
-            .into_any_element(),
+    let tile = tile(Mark::Icon(IconName::Terminal), color, deck, theme);
+    match shell_tip(shell, user) {
+        Some(tip) => tile.id(id).tooltip(tooltip(tip)).into_any_element(),
         None => tile.into_any_element(),
     }
 }
@@ -77,12 +99,6 @@ pub(crate) fn tile(mark: Mark, color: Hsla, deck: Option<Hsla>, theme: &Theme) -
         .bg(colors.fill);
     let face = match mark {
         Mark::Icon(icon) => face.child(Icon::new(icon).size(row_px(13.)).color(color)),
-        Mark::Glyph(glyph) => face
-            .font_family(crate::theme::mono_font())
-            .font_weight(gpui::FontWeight::SEMIBOLD)
-            .text_size(crate::theme::ui_px(11.))
-            .text_color(color)
-            .child(glyph),
         Mark::Label(label) => face
             .px(px(4.))
             .font_family(crate::theme::mono_font())
@@ -128,25 +144,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_known_shell_shows_its_prompt() {
-        assert_eq!(shell_mark(Some("bash"), "deploy"), Mark::Glyph("$"));
-        assert_eq!(shell_mark(Some("zsh"), "deploy"), Mark::Glyph("%"));
-        assert_eq!(shell_mark(Some("fish"), "deploy"), Mark::Glyph("~>"));
-        assert_eq!(shell_mark(Some("pwsh"), "deploy"), Mark::Glyph("PS"));
-        assert_eq!(shell_mark(Some("powershell"), "deploy"), Mark::Glyph("PS"));
-    }
-
-    #[test]
-    fn root_is_root_whatever_the_shell() {
-        assert_eq!(shell_mark(Some("zsh"), "root"), Mark::Glyph("#"));
-        assert_eq!(shell_mark(None, "root"), Mark::Glyph("#"));
-    }
-
-    #[test]
-    fn any_other_shell_keeps_the_icon() {
-        let icon = Mark::Icon(IconName::Terminal);
-        assert_eq!(shell_mark(Some("sh"), "deploy"), icon);
-        assert_eq!(shell_mark(Some("dash"), "deploy"), icon);
-        assert_eq!(shell_mark(None, "deploy"), icon);
+    fn the_tooltip_names_the_shell_and_root() {
+        assert_eq!(shell_tip(Some("bash"), "deploy").as_deref(), Some("bash"));
+        assert_eq!(
+            shell_tip(Some("zsh"), "root").as_deref(),
+            Some("root · zsh")
+        );
+        assert_eq!(shell_tip(None, "root").as_deref(), Some("root"));
+        assert_eq!(shell_tip(None, "deploy"), None);
     }
 }

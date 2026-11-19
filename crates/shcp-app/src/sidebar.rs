@@ -1,28 +1,32 @@
-//! Left column: the open sessions, one row each in the order of the tabs, then the hosts in the
-//! user's order, settings and the state of an update. A tile in the host's color says which host
-//! a session is on, a dot how a host is.
+//! Left column: the hosts in the user's order, by group, each with its open sessions under it in
+//! the order of the tabs. A tile in the host's color says what a session shows; the name of a
+//! host is bright while it is connected.
 use crate::motion::Reveal;
 use crate::state::AppState;
 use crate::tabs::Face;
 use crate::theme::{ActiveTheme as _, Theme, row_px};
-use crate::title_bar;
-use crate::updater::UpdateStatus;
 use crate::widgets::button::{Button, ButtonStyle};
 use crate::widgets::context_menu::{ContextMenu, MenuEntry, OpenMenu, handler};
-use crate::widgets::host_color::color_dot;
 use crate::widgets::icon::{Icon, IconName};
 use crate::widgets::pill::SlidingPill;
-use crate::widgets::progress::ProgressRing;
-use crate::widgets::tile::shell_tile;
+use crate::widgets::reorder::{TabChip, on_release};
+use crate::widgets::tile::{Mark, shell_tile, text_lift, tile};
 use crate::widgets::tooltip::tooltip;
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, Context, Div, DragMoveEvent, Entity, EventEmitter,
-    FocusHandle, Focusable, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point,
-    SharedString, Stateful, Subscription, Window, WindowControlArea, div, px,
+    AnyElement, App, Bounds, Context, Div, DragMoveEvent, Entity, EventEmitter, FocusHandle,
+    Focusable, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, SharedString,
+    Stateful, Subscription, Window, div, px,
 };
+use moving::{Moving, RowKey};
 use shcp_core::{HostConfig, HostId, HostSource, SessionState};
-use std::collections::HashMap;
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
+
+mod moving;
 
 pub(crate) enum SidebarEvent {
     OpenTerminal(HostId),
@@ -33,16 +37,13 @@ pub(crate) enum SidebarEvent {
     NewGroup(HostId),
     RenameGroup(String),
     Connect(HostId),
-    NewHost,
-    OpenSettings,
-    RestartForUpdate,
-    /// From its own button: the sidebar goes.
-    HideSidebar,
+    /// To the tab of a host used last, or a terminal on it when it has none.
+    GoToHost(HostId),
     ActivateTab(u64),
     CloseTab(u64),
     TabMenu(u64, Point<Pixels>),
-    /// A tab goes right before another one of its host, or right after it with `true`.
-    MoveTab(u64, u64, bool),
+    /// A tab goes to this place among the tabs of its host.
+    ReorderTab(u64, usize),
 }
 
 /// What the sidebar needs to know of an open tab. The workspace owns the tabs.
@@ -62,39 +63,10 @@ pub(crate) struct OpenTab {
     pub active: bool,
 }
 
-/// A tab on its way to another place among the sessions.
-#[derive(Clone)]
-struct TabDrag {
-    id: u64,
-    title: String,
-}
-
-impl Render for TabDrag {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        drag_chip(theme, theme.strong_border, true, self.title.clone())
-            .h(px(30.))
-            .flex()
-            .items_center()
-    }
-}
-
-/// What follows the pointer while something is dragged: a capsule with its name.
-fn drag_chip(theme: &Theme, border: Hsla, ui_font: bool, text: String) -> Div {
-    div()
-        .px(px(10.))
-        .rounded_full()
-        .map(|this| crate::panel::floating(this, theme, border))
-        .shadow(crate::theme::float_shadow())
-        .when(ui_font, |this| this.font_family(crate::theme::ui_font()))
-        .text_size(crate::theme::ui_px(13.))
-        .text_color(theme.text)
-        .child(text)
-}
-
 /// The title of a part of the list. `first` has nothing above to keep away from.
 fn section_label(text: &'static str, first: bool, theme: &Theme) -> Div {
     div()
+        .relative()
         .flex()
         .flex_none()
         .items_center()
@@ -106,60 +78,20 @@ fn section_label(text: &'static str, first: bool, theme: &Theme) -> Div {
         .child(text)
 }
 
-/// A host on its way to a group, and what follows the pointer meanwhile.
+/// A host being dragged to another place.
 #[derive(Clone)]
 struct HostDrag {
     id: HostId,
     alias: String,
 }
 
-/// A group on its way to another place.
+/// A group being dragged to another place.
 #[derive(Clone)]
 struct GroupDrag {
     name: String,
 }
 
-/// The row a drag would land next to.
-#[derive(Clone, PartialEq)]
-enum DropRow {
-    Host(HostId),
-    Tab(u64),
-    Group(String),
-}
-
-/// What can be dragged along the list: each comes from a row of its own.
-trait Dragged: 'static {
-    fn row(&self) -> DropRow;
-}
-
-impl Dragged for HostDrag {
-    fn row(&self) -> DropRow {
-        DropRow::Host(self.id.clone())
-    }
-}
-
-impl Dragged for TabDrag {
-    fn row(&self) -> DropRow {
-        DropRow::Tab(self.id)
-    }
-}
-
-impl Dragged for GroupDrag {
-    fn row(&self) -> DropRow {
-        DropRow::Group(self.name.clone())
-    }
-}
-
-/// Where a drag would land if let go now.
-#[derive(Clone, PartialEq)]
-struct DropLine {
-    row: DropRow,
-    after: bool,
-    /// The row under the pointer: the line stays while the pointer does.
-    over: Bounds<Pixels>,
-}
-
-/// The space between the rows of the list, where the line goes.
+/// The space between the rows of the list.
 const ROW_GAP: Pixels = px(2.);
 /// How tall the title of a part of the list is, and the room above it.
 const LABEL_HEIGHT: f32 = 26.;
@@ -167,8 +99,16 @@ const LABEL_SPACE: f32 = 10.;
 /// Where the titles and the dots of the hosts start.
 const LABEL_INSET: Pixels = px(13.);
 const SESSION_HEIGHT: f32 = 32.;
+/// From the top of the list to the middle of its first row, a section's title: to line that title
+/// up with something beside the sidebar.
+pub(crate) fn first_title_middle() -> f32 {
+    f32::from(ROW_GAP) + LABEL_HEIGHT / 2.
+}
+
+/// Where the sessions under a host start: in from the host, which heads them.
+const SESSION_INSET: Pixels = px(24.);
 const HOST_HEIGHT: f32 = 30.;
-/// Buttons and whatever else is a control. The rows you go somewhere with are capsules.
+/// Buttons and whatever else is a control. The rows of the list are rounded alike.
 const CONTROL_RADIUS: Pixels = px(crate::theme::RADIUS_CONTROL);
 
 /// A row of what folds, in the list: as tall as `open` says of `height`. With its gap too, so that
@@ -184,44 +124,12 @@ fn folding(row: impl IntoElement, height: Pixels, open: f32) -> Div {
                 .mb(-ROW_GAP * (1. - open))
                 .opacity(open.sqrt())
         })
-        // Clipped only on its way: at rest the drop line goes past the row.
+        // Clipped only on its way.
         .child(
             div()
                 .when(moving, |this| this.h_full().overflow_hidden())
                 .child(row),
         )
-}
-
-/// A straight line in the gap above or below a row.
-fn insertion_line(after: bool, color: Hsla) -> Div {
-    div()
-        .absolute()
-        .left_0()
-        .right_0()
-        .h(ROW_GAP)
-        .map(|this| {
-            if after {
-                this.bottom(-ROW_GAP)
-            } else {
-                this.top(-ROW_GAP)
-            }
-        })
-        .bg(color)
-}
-
-impl Render for GroupDrag {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        drag_chip(theme, theme.border, true, self.name.clone()).py(px(4.))
-    }
-}
-
-impl Render for HostDrag {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        // Without the UI font of the other chips, as it always was.
-        drag_chip(theme, theme.border, false, self.alias.clone()).py(px(4.))
-    }
 }
 
 pub(crate) struct Sidebar {
@@ -235,7 +143,14 @@ pub(crate) struct Sidebar {
     keyboard: bool,
     /// What folds under each group, by its name, for it to glide open and closed.
     folds: HashMap<String, Reveal>,
-    drop_line: Option<DropLine>,
+    /// A session, a host or a group on its way to another place.
+    moving: Option<Moving>,
+    /// Where each row was last drawn while nothing moved: the places a drag starts from.
+    row_bounds: Rc<RefCell<HashMap<RowKey, Bounds<Pixels>>>>,
+    /// For this frame, while something moves: how far each row is drawn from its place, and the
+    /// rows of what moves, which stay faint where they were.
+    shifts: HashMap<RowKey, f32>,
+    lifted: HashSet<RowKey>,
     focus: FocusHandle,
     menu: Option<OpenMenu>,
     _subscription: Subscription,
@@ -263,7 +178,10 @@ impl Sidebar {
             show_hidden: false,
             keyboard: false,
             folds: HashMap::new(),
-            drop_line: None,
+            moving: None,
+            row_bounds: Rc::default(),
+            shifts: HashMap::new(),
+            lifted: HashSet::new(),
             state,
             focus: cx.focus_handle(),
             menu: None,
@@ -348,138 +266,6 @@ impl Sidebar {
         cx.notify();
     }
 
-    /// Whether a row let go on this side of `target` would stay exactly where it is on screen: right
-    /// next to itself, or on itself. A move between sections always changes something.
-    fn lands_where_it_is(
-        &self,
-        dragged: &DropRow,
-        target: &DropRow,
-        after: bool,
-        cx: &App,
-    ) -> bool {
-        let siblings: Vec<DropRow> = match target {
-            DropRow::Host(id) => self
-                .sections(cx)
-                .into_iter()
-                .map(|(_, hosts)| hosts)
-                .find(|hosts| hosts.iter().any(|host| host.id == *id))
-                .unwrap_or_default()
-                .into_iter()
-                .map(|host| DropRow::Host(host.id))
-                .collect(),
-            DropRow::Tab(_) => self.open.iter().map(|tab| DropRow::Tab(tab.id)).collect(),
-            DropRow::Group(_) => self
-                .sections(cx)
-                .into_iter()
-                .filter_map(|(group, _)| group.map(DropRow::Group))
-                .collect(),
-        };
-        let at = |row: &DropRow| siblings.iter().position(|sibling| sibling == row);
-        let (Some(from), Some(to)) = (at(dragged), at(target)) else {
-            return false;
-        };
-        let place = to + usize::from(after);
-        place == from || place == from + 1
-    }
-
-    /// Moves the line to this row while a drag of `T` is over it. `side` gets what is dragged and
-    /// whether the pointer is on the lower half, and says where it would land, if anywhere.
-    fn track_row<T: Dragged>(
-        element: Stateful<Div>,
-        side: impl Fn(&T, bool) -> Option<(DropRow, bool)> + 'static,
-        cx: &Context<Self>,
-    ) -> Stateful<Div> {
-        element.on_drag_move(cx.listener(move |this, event: &DragMoveEvent<T>, _, cx| {
-            let pointer = event.event.position;
-            // Half the gap each: no spot between two rows is without a line.
-            if !event.bounds.dilate(ROW_GAP / 2.).contains(&pointer) {
-                return;
-            }
-            let lower = pointer.y > event.bounds.center().y;
-            let dragged = event.drag(cx);
-            let line = side(dragged, lower)
-                .filter(|(row, after)| !this.lands_where_it_is(&dragged.row(), row, *after, cx))
-                .map(|(row, after)| {
-                    let (row, after) = this.one_spot_between_groups(row, after, cx);
-                    DropLine {
-                        row,
-                        after,
-                        over: event.bounds,
-                    }
-                });
-            if this.drop_line != line {
-                this.drop_line = line;
-                cx.notify();
-            }
-        }))
-    }
-
-    /// Past a group and before the next one are the same place: it gets one line, above the next.
-    fn one_spot_between_groups(&self, row: DropRow, after: bool, cx: &App) -> (DropRow, bool) {
-        let next = match &row {
-            DropRow::Group(name) if after => {
-                let sections = self.sections(cx);
-                let mut groups = sections.iter().filter_map(|(group, _)| group.as_ref());
-                groups.find(|group| *group == name);
-                groups.next().cloned()
-            }
-            _ => None,
-        };
-        match next {
-            Some(next) => (DropRow::Group(next), false),
-            None => (row, after),
-        }
-    }
-
-    /// The line goes once the pointer is off its row, and not onto another one.
-    fn leave_row<T: 'static>(
-        &mut self,
-        event: &DragMoveEvent<T>,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let pointer = event.event.position;
-        let left = self
-            .drop_line
-            .as_ref()
-            .is_some_and(|line| !line.over.dilate(ROW_GAP / 2.).contains(&pointer));
-        if left {
-            self.drop_line = None;
-            cx.notify();
-        }
-    }
-
-    /// A group dragged over a row of another one lands past that one, whichever row it is.
-    fn track_past_group(
-        &self,
-        element: Stateful<Div>,
-        host: &HostId,
-        cx: &Context<Self>,
-    ) -> Stateful<Div> {
-        let state = self.state.read(cx);
-        let group = state
-            .host(host)
-            .and_then(|_| state.host_group(host))
-            .map(str::to_string);
-        Self::track_row(
-            element,
-            move |_: &GroupDrag, _| group.clone().map(|group| (DropRow::Group(group), true)),
-            cx,
-        )
-    }
-
-    /// Whether the line past the group of this host is up, for the last row of that group.
-    fn line_past_group(&self, host: &HostId, cx: &App) -> Option<bool> {
-        let group = self.state.read(cx).host_group(host)?.to_string();
-        self.line_on(&DropRow::Group(group)).filter(|after| *after)
-    }
-
-    /// Whether the line is on this row and, if so, on which side.
-    fn line_on(&self, row: &DropRow) -> Option<bool> {
-        let line = self.drop_line.as_ref()?;
-        (line.row == *row).then_some(line.after)
-    }
-
     /// The selection cannot stay on a row that is gone.
     fn keep_selection_listed(&mut self, cx: &mut Context<Self>) {
         let listed = self.listed_hosts(cx);
@@ -491,39 +277,34 @@ impl Sidebar {
     /// `first` is the first row of the list: it has nothing above to keep away from.
     fn render_group_header(&self, group: &str, first: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
-        let accent = theme.accent;
         let dragged = GroupDrag {
             name: group.to_string(),
         };
-        let target = group.to_string();
+        let chip_color = theme.text_muted;
+        let view = cx.entity().downgrade();
         let collapsed = self
             .state
             .read(cx)
             .settings
             .collapsed_groups
             .contains(group);
-        // Past an open group is under its last row.
-        let line = self
-            .line_on(&DropRow::Group(target.clone()))
-            .filter(|after| !after || collapsed);
         let name = group.to_string();
         let menu_group = group.to_string();
         let brighter = theme.text_muted;
-        div()
+        let header = div()
             .id(SharedString::from(format!("group-{group}")))
-            .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
-            .map(|this| {
-                Self::track_row(
-                    this,
-                    // An open group goes on past its title: the rows under it take that side.
-                    move |_: &GroupDrag, lower| {
-                        Some((DropRow::Group(target.clone()), lower && collapsed))
-                    },
-                    cx,
-                )
+            .on_drag(dragged, move |dragged, grabbed, _, cx| {
+                view.update(cx, |this, cx| this.start_group_drag(&dragged.name, cx))
+                    .ok();
+                cx.new(|_| TabChip {
+                    id: 0,
+                    icon: IconName::Folder,
+                    color: chip_color,
+                    title: dragged.name.clone().into(),
+                    grabbed,
+                })
             })
             .relative()
-            .children(line.map(|after| insertion_line(after, accent)))
             .flex()
             .flex_none()
             .items_center()
@@ -532,7 +313,7 @@ impl Sidebar {
             .when(!first, |this| this.mt(px(LABEL_SPACE)))
             .pl(LABEL_INSET)
             .pr(px(8.))
-            .rounded_full()
+            .rounded(CONTROL_RADIUS)
             .cursor_pointer()
             .text_size(crate::theme::ui_px(12.))
             .text_color(theme.text_disabled)
@@ -566,7 +347,8 @@ impl Sidebar {
                     IconName::ChevronDown
                 })
                 .size(px(12.)),
-            )
+            );
+        self.place_row(RowKey::Title(Some(group.to_string())), header)
             .into_any_element()
     }
 
@@ -581,12 +363,9 @@ impl Sidebar {
         cx.notify();
     }
 
-    /// To the first session of a host, or a terminal on it when it has none.
+    /// To the session of a host used last, or a terminal on it when it has none.
     fn go_to_host(&mut self, host: &HostId, cx: &mut Context<Self>) {
-        match self.open.iter().find(|tab| tab.host == *host) {
-            Some(tab) => cx.emit(SidebarEvent::ActivateTab(tab.id)),
-            None => cx.emit(SidebarEvent::OpenTerminal(host.clone())),
-        }
+        cx.emit(SidebarEvent::GoToHost(host.clone()));
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -748,40 +527,6 @@ impl Sidebar {
         }
     }
 
-    /// How a host is: filled in its color while it is connected, with tabs or without (closing
-    /// the last tab keeps the connection), faint while it connects, a plain ring when it is not
-    /// connected. What needs the user takes the color of what says so.
-    fn host_dot(&self, id: &HostId, color: Hsla, cx: &App) -> Div {
-        if let Some((_, alert)) = self.host_alert(id, cx) {
-            return color_dot(alert, true);
-        }
-        let state = self.state.read(cx);
-        let session = state.host_session(id).map(|s| &s.state);
-        let connected = matches!(session, Some(SessionState::Connected));
-        let waiting = state.reconnect_attempt(id).is_some()
-            || matches!(
-                session,
-                Some(
-                    SessionState::Connecting { .. }
-                        | SessionState::AwaitingHostKey { .. }
-                        | SessionState::AwaitingPassphrase { .. }
-                        | SessionState::AwaitingPassword { .. }
-                        | SessionState::AwaitingAnswer { .. }
-                )
-            );
-        if !connected && !waiting {
-            return color_dot(cx.theme().text_disabled, false);
-        }
-        color_dot(
-            if waiting {
-                Hsla { a: 0.45, ..color }
-            } else {
-                color
-            },
-            true,
-        )
-    }
-
     fn status_text(&self, id: &HostId, cx: &App) -> String {
         let state = self.state.read(cx);
         if let Some(attempt) = state.reconnect_attempt(id) {
@@ -799,12 +544,7 @@ impl Sidebar {
 
     /// A host's row, at its place in the list. A click goes to its first session, or opens one.
     /// `ends_section` is the last host of its section: a group dropped past it lands under it.
-    fn render_host(
-        &self,
-        host: &HostConfig,
-        ends_section: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_host(&self, host: &HostConfig, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let state = self.state.read(cx);
         let id = host.id.clone();
@@ -831,33 +571,37 @@ impl Sidebar {
             (None, Some(route)) => Some(text_note(route.clone(), theme.text_disabled)),
             (None, None) => None,
         };
-        let accent = theme.accent;
-        let lit = theme.host_color(state.host_color(&id));
+        // Bright while connected, dim otherwise; what needs the user says so in its note.
+        let connected = matches!(
+            state.host_session(&id).map(|session| &session.state),
+            Some(SessionState::Connected)
+        );
         let dragged = HostDrag {
             id: id.clone(),
             alias: host.alias.clone(),
         };
-        let (click, add, target) = (id.clone(), id.clone(), id.clone());
-        let line = self
-            .line_on(&DropRow::Host(id.clone()))
-            .or_else(|| self.line_past_group(&id, cx).filter(|_| ends_section));
+        let (click, add) = (id.clone(), id.clone());
         let group = SharedString::from(format!("host-row-{}", id.0));
         let menu = host.clone();
         let hover = theme.hover;
-        div()
+        let chip_color = theme.host_color(state.host_color(&id));
+        let view = cx.entity().downgrade();
+        let row = div()
             .id(SharedString::from(format!("host-row-{}", id.0)))
             .group(group.clone())
             .relative()
-            .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
-            .map(|this| {
-                Self::track_row(
-                    this,
-                    move |_: &HostDrag, lower| Some((DropRow::Host(target.clone()), lower)),
-                    cx,
-                )
+            // The chip shows the host alone; its sessions come along.
+            .on_drag(dragged, move |dragged, grabbed, _, cx| {
+                view.update(cx, |this, cx| this.start_host_drag(&dragged.id, cx))
+                    .ok();
+                cx.new(|_| TabChip {
+                    id: 0,
+                    icon: IconName::Server,
+                    color: chip_color,
+                    title: dragged.alias.clone().into(),
+                    grabbed,
+                })
             })
-            .map(|this| self.track_past_group(this, &id, cx))
-            .children(line.map(|after| insertion_line(after, accent)))
             .flex()
             .flex_none()
             .items_center()
@@ -866,7 +610,7 @@ impl Sidebar {
             .h(row_px(HOST_HEIGHT))
             .pl(LABEL_INSET)
             .pr(px(6.))
-            .rounded_full()
+            .rounded(CONTROL_RADIUS)
             .cursor_pointer()
             .when(hidden, |this| this.opacity(0.55))
             .map(|this| {
@@ -897,16 +641,18 @@ impl Sidebar {
                     this.host_menu(&menu, event.position, cx);
                 }),
             )
-            .child(self.host_dot(&id, lit, cx))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_color(if has_tabs {
+                    .text_color(if connected {
                         theme.text
                     } else {
                         theme.text_muted
+                    })
+                    .when(connected && has_tabs, |this| {
+                        this.font_weight(gpui::FontWeight::MEDIUM)
                     })
                     .child(host.alias.clone()),
             )
@@ -949,13 +695,13 @@ impl Sidebar {
                                     })),
                             ),
                     ),
-            )
-            .into_any_element()
+            );
+        self.place_row(RowKey::Host(id), row).into_any_element()
     }
 
-    /// A session: its tile, the name of its host and where it is. Rows of every host, in the
-    /// order of the tabs, and dragged anywhere among them.
-    fn render_session(&self, tab: &OpenTab, cx: &mut Context<Self>) -> AnyElement {
+    /// A session: its tile and where it is, under its host and moved among its tabs. `with_host`:
+    /// it is not under its host, gone from the config, so the row names it.
+    fn render_session(&self, tab: &OpenTab, with_host: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let state = self.state.read(cx);
         // A tab can outlive its host, removed from the config meanwhile.
@@ -971,30 +717,36 @@ impl Sidebar {
         let id = tab.id;
         let group = SharedString::from(format!("sidebar-tab-{id}"));
         let (hover, press, text) = (theme.hover, theme.active, theme.text);
-        let accent = theme.accent;
-        let line = self.line_on(&DropRow::Tab(id));
-        let dragged = TabDrag {
-            id,
-            title: tab.title.clone(),
-        };
         // A tab without a name or a known folder still has its title.
         let (place, in_mono) = match (&tab.name, &tab.folder) {
             (Some(name), _) => (name.clone(), false),
             (None, Some(folder)) => (folder.clone(), true),
             (None, None) => (tab.title.clone(), false),
         };
-        div()
+        let chip = TabChip {
+            id,
+            icon: tab.face.icon(),
+            color,
+            title: place.clone().into(),
+            grabbed: Point::default(),
+        };
+        let moving = self.moving.is_some();
+        let view = cx.entity().downgrade();
+        let row = div()
             .id(("sidebar-tab", id as usize))
             .group(group.clone())
             .relative()
+            // The pill stays put during a drag: the current row carries its own fill.
+            .when(moving && tab.active, |this| this.bg(press))
             .flex()
             .flex_none()
             .items_center()
             .gap(px(9.))
+            .w_full()
             .h(row_px(SESSION_HEIGHT))
-            .pl(px(5.))
+            .pl(if with_host { px(5.) } else { SESSION_INSET })
             .pr(px(6.))
-            .rounded_full()
+            .rounded(CONTROL_RADIUS)
             .cursor_pointer()
             .text_color(if tab.active {
                 theme.text
@@ -1007,15 +759,14 @@ impl Sidebar {
                     .active(move |style| style.bg(press))
             })
             .tooltip(tooltip(format!("{}\n{}", tab.detail, tab.face.label())))
-            .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
-            .map(|this| {
-                Self::track_row(
-                    this,
-                    move |_: &TabDrag, lower| Some((DropRow::Tab(id), lower)),
-                    cx,
-                )
+            .on_drag(chip, move |chip, grabbed, _, cx| {
+                view.update(cx, |this, cx| this.start_tab_drag(chip.id, cx))
+                    .ok();
+                cx.new(|_| TabChip {
+                    grabbed,
+                    ..chip.clone()
+                })
             })
-            .children(line.map(|after| insertion_line(after, accent)))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.pill.arm(&this.state.read(cx).settings);
                 cx.emit(SidebarEvent::ActivateTab(id));
@@ -1031,27 +782,48 @@ impl Sidebar {
                     cx.emit(SidebarEvent::TabMenu(id, event.position));
                 }),
             )
-            .child(shell_tile(
-                ("session-tile", id as usize),
-                shell.as_deref(),
-                &user,
-                color,
-                tab.split.then(|| theme.row_fill(tab.active)),
-                &theme,
-            ))
+            // The prompt for terminals, the folder for a tab that shows its files.
+            .child(if tab.face.shows_files() {
+                tile(Mark::Icon(tab.face.icon()), color, None, &theme).into_any_element()
+            } else {
+                shell_tile(
+                    ("session-tile", id as usize),
+                    shell.as_deref(),
+                    &user,
+                    color,
+                    tab.split.then(|| theme.row_fill(tab.active)),
+                    &theme,
+                )
+            })
+            .when(with_host, |this| {
+                this.child(
+                    div()
+                        .relative()
+                        .top(-text_lift(
+                            crate::theme::ui_font(),
+                            crate::theme::ui_px(13.),
+                            cx,
+                        ))
+                        .min_w_0()
+                        .truncate()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .child(host),
+                )
+            })
             .child(
                 div()
-                    .min_w_0()
-                    .truncate()
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .child(host),
-            )
-            .child(
-                div()
+                    .relative()
+                    // A path is tall marks, a slash and descenders: its line is already centred
+                    // on the tile, and a lift would put it above.
+                    .top(-if in_mono {
+                        px(0.)
+                    } else {
+                        text_lift(crate::theme::ui_font(), crate::theme::ui_px(13.), cx)
+                    })
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_color(theme.text_disabled)
+                    .when(with_host, |this| this.text_color(theme.text_disabled))
                     .when(in_mono, |this| {
                         this.font_family(crate::theme::mono_font())
                             .text_size(crate::theme::ui_px(12.))
@@ -1073,100 +845,22 @@ impl Sidebar {
                     })
                     .hover(move |style| style.bg(press).text_color(text))
                     .tooltip(tooltip("Close (Ctrl+Shift+W, middle-click)"))
+                    // A press here stays a press, not the start of a drag of the row.
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |_, _, _, cx| {
                         cx.stop_propagation();
                         cx.emit(SidebarEvent::CloseTab(id));
                     }))
                     .child(Icon::new(IconName::Close).size(px(12.))),
-            )
-            .into_any_element()
-    }
-
-    /// Says where an update stands, and takes it to the next step. Nothing while up to date.
-    fn update_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        type Click = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
-        let theme = cx.theme().clone();
-        let icon = |name: IconName, color| Icon::new(name).color(color).into_any_element();
-        let install = |cx: &mut Context<Self>| -> Click {
-            Box::new(cx.listener(|this, _, _, cx| {
-                this.state.update(cx, AppState::install_update);
-            }))
-        };
-        let (leading, label, tooltip_text, color, click): (_, _, _, _, Option<Click>) =
-            match self.state.read(cx).update.clone() {
-                UpdateStatus::Available(release) => (
-                    icon(IconName::Download, theme.text_muted),
-                    release.version.clone(),
-                    format!("Download shcp {}", release.version),
-                    theme.text_muted,
-                    Some(install(cx)),
-                ),
-                UpdateStatus::Downloading { version, percent } => (
-                    match percent {
-                        Some(percent) => ProgressRing::new(percent, px(14.)).into_any_element(),
-                        None => Icon::new(IconName::Spinner)
-                            .color(theme.accent)
-                            .spin()
-                            .into_any_element(),
-                    },
-                    percent.map_or(String::new(), |percent| format!("{percent}%")),
-                    format!("Downloading shcp {version}"),
-                    theme.text_muted,
-                    None,
-                ),
-                UpdateStatus::Ready { version, .. } => (
-                    icon(IconName::Refresh, theme.text_muted),
-                    "Restart".to_string(),
-                    format!(
-                        "shcp {version} is ready. It also starts the next time you open the app"
-                    ),
-                    theme.text_muted,
-                    Some(Box::new(cx.listener(|_, _, _, cx| {
-                        cx.emit(SidebarEvent::RestartForUpdate)
-                    }))),
-                ),
-                UpdateStatus::DownloadFailed { release, error } => (
-                    icon(IconName::Alert, theme.error),
-                    "Retry".to_string(),
-                    format!("Could not download shcp {}: {error}", release.version),
-                    theme.error,
-                    Some(install(cx)),
-                ),
-                UpdateStatus::Idle
-                | UpdateStatus::Checking
-                | UpdateStatus::UpToDate
-                | UpdateStatus::Failed(_) => return None,
-            };
-        let (hover, press) = (theme.hover, theme.active);
-        Some(
-            div()
-                .id("update-button")
-                .h(px(26.))
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap(px(5.))
-                .px(px(8.))
-                .rounded(CONTROL_RADIUS)
-                .text_size(crate::theme::ui_px(13.))
-                .text_color(color)
-                .tooltip(tooltip(tooltip_text))
-                .when_some(click, |this, click| {
-                    this.cursor_pointer()
-                        .hover(move |style| style.bg(hover))
-                        .active(move |style| style.bg(press))
-                        .on_click(click)
-                })
-                .child(leading)
-                .when(!label.is_empty(), |this| this.child(label))
-                .into_any_element(),
-        )
+            );
+        self.place_row(RowKey::Session(id), row).into_any_element()
     }
 }
 
 impl Sidebar {
-    /// The open sessions, then each group with its hosts. With the place of the active session
-    /// among the children of the list.
+    /// Each group with its hosts, and under each host its open sessions in the order of the tabs.
+    /// Sessions whose host is gone from the config come last. With the place of the active
+    /// session among the children of the list.
     fn list_rows(
         &mut self,
         sections: &[(Option<String>, Vec<HostConfig>)],
@@ -1176,21 +870,14 @@ impl Sidebar {
     ) -> (Vec<AnyElement>, Option<usize>) {
         let mut rows: Vec<AnyElement> = Vec::new();
         let mut current_child = None;
-        if !open.is_empty() {
-            rows.push(section_label("Sessions", true, theme).into_any_element());
-        }
-        for tab in open {
-            // Among the children of the list, the pill comes first.
-            if tab.active {
-                current_child = Some(rows.len() + 1);
-            }
-            rows.push(self.render_session(tab, cx));
-        }
         for (group, hosts) in sections {
             let first = rows.is_empty();
             match group {
                 Some(group) => rows.push(self.render_group_header(group, first, cx)),
-                None => rows.push(section_label("Hosts", first, theme).into_any_element()),
+                None => rows.push(
+                    self.place_row(RowKey::Title(None), section_label("Hosts", first, theme))
+                        .into_any_element(),
+                ),
             }
             // Closing, what folds is still there until it is gone.
             let shows_hosts = self.shows_host(group.as_deref(), cx);
@@ -1201,52 +888,41 @@ impl Sidebar {
             if group_open == 0. {
                 continue;
             }
-            for (at_host, host) in hosts.iter().enumerate() {
-                let ends_section = at_host + 1 == hosts.len();
-                let row = self.render_host(host, ends_section, cx);
+            for host in hosts {
+                let row = self.render_host(host, cx);
                 rows.push(folding(row, row_px(HOST_HEIGHT), group_open).into_any_element());
+                for tab in open.iter().filter(|tab| tab.host == host.id) {
+                    // Among the children of the list, the pill comes first.
+                    if tab.active {
+                        current_child = Some(rows.len() + 1);
+                    }
+                    let row = self.render_session(tab, false, cx);
+                    rows.push(folding(row, row_px(SESSION_HEIGHT), group_open).into_any_element());
+                }
+            }
+        }
+        let listed: HashSet<&HostId> = sections
+            .iter()
+            .flat_map(|(_, hosts)| hosts.iter().map(|host| &host.id))
+            .collect();
+        let others: Vec<&OpenTab> = open
+            .iter()
+            .filter(|tab| !listed.contains(&tab.host))
+            .collect();
+        if !others.is_empty() {
+            let first = rows.is_empty();
+            rows.push(section_label("Other sessions", first, theme).into_any_element());
+            for tab in others {
+                if tab.active {
+                    current_child = Some(rows.len() + 1);
+                }
+                rows.push(self.render_session(tab, true, cx));
             }
         }
         (rows, current_child)
     }
 
-    /// The app's mark and the button that hides the sidebar, on a strip that moves the window.
-    fn header(theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        div()
-            .id("sidebar-header")
-            .occlude()
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_between()
-            .h(px(title_bar::HEIGHT))
-            .pl(px(6.))
-            .window_control_area(WindowControlArea::Drag)
-            // The app's mark: part of what moves the window.
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_size(crate::theme::ui_px(13.5))
-                    .text_color(theme.text)
-                    .child(title_bar::logo(px(18.), theme.text))
-                    .child("shcp"),
-            )
-            // Its own hitbox over the strip, or the press would move the window.
-            .child(
-                div().id("sidebar-hide").occlude().child(
-                    Button::new("hide-sidebar")
-                        .icon(IconName::PanelLeft)
-                        .tooltip("Hide sidebar (Ctrl+Shift+B)")
-                        .style(ButtonStyle::Ghost)
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::HideSidebar))),
-                ),
-            )
-    }
-
-    /// The scrolling list of sessions and hosts, where rows are dropped.
+    /// The scrolling list of sessions and hosts, where rows are moved.
     fn host_list(
         &self,
         rows: Vec<AnyElement>,
@@ -1260,7 +936,6 @@ impl Sidebar {
             .relative()
             .flex_1()
             .min_h_0()
-            // The drop line of the first and of the last row needs a gap there too.
             .pt(ROW_GAP)
             .mb(px(8.) - ROW_GAP)
             .pb(ROW_GAP)
@@ -1268,51 +943,26 @@ impl Sidebar {
             .flex()
             .flex_col()
             .gap(ROW_GAP)
-            .on_drag_move(cx.listener(Self::leave_row::<HostDrag>))
-            .on_drag_move(cx.listener(Self::leave_row::<TabDrag>))
-            .on_drag_move(cx.listener(Self::leave_row::<GroupDrag>))
-            // Here and not on the rows: the line can also be in the gap between two.
-            .on_drop(cx.listener(|this, dragged: &HostDrag, _, cx| {
-                if let Some(DropLine {
-                    row: DropRow::Host(target),
-                    after,
-                    ..
-                }) = this.drop_line.take()
-                {
-                    this.state.update(cx, |state, cx| {
-                        state.place_host(&dragged.id, &target, after, cx)
-                    });
-                    this.keep_selection_listed(cx);
-                    cx.notify();
-                }
+            // Whatever moves, the pointer over the list says where it would go.
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<TabChip>, _, cx| {
+                this.follow_pointer(event.event.position, event.bounds, cx)
             }))
-            .on_drop(cx.listener(|this, dragged: &TabDrag, _, cx| {
-                if let Some(DropLine {
-                    row: DropRow::Tab(target),
-                    after,
-                    ..
-                }) = this.drop_line.take()
-                {
-                    cx.emit(SidebarEvent::MoveTab(dragged.id, target, after));
-                }
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<HostDrag>, _, cx| {
+                this.follow_pointer(event.event.position, event.bounds, cx)
             }))
-            .on_drop(cx.listener(|this, dragged: &GroupDrag, _, cx| {
-                if let Some(DropLine {
-                    row: DropRow::Group(target),
-                    after,
-                    ..
-                }) = this.drop_line.take()
-                {
-                    this.state.update(cx, |state, cx| {
-                        state.place_group(&dragged.name, &target, after, cx)
-                    });
-                }
-            }))
-            .child(
-                self.pill
-                    .neutral(theme, f32::from(row_px(SESSION_HEIGHT)) / 2.),
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<GroupDrag>, _, cx| {
+                    this.follow_pointer(event.event.position, event.bounds, cx)
+                }),
             )
+            .child(self.pill.neutral(theme, crate::theme::RADIUS_CONTROL))
             .children(rows)
+            .when(self.moving.is_some(), |this| {
+                let view = cx.entity().downgrade();
+                this.child(on_release(move |_, cx| {
+                    view.update(cx, |this, cx| this.finish_moving(cx)).ok();
+                }))
+            })
     }
 
     fn hidden_toggle(
@@ -1349,39 +999,18 @@ impl Sidebar {
                 format!("{hidden} hidden hosts")
             })
     }
-
-    /// Settings, the update when there is one, and a new host.
-    fn footer(update: Option<AnyElement>, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(px(2.))
-            .child(
-                Button::new("settings")
-                    .icon(IconName::Settings)
-                    .tooltip("Settings (Ctrl+,)")
-                    .style(ButtonStyle::Ghost)
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenSettings))),
-            )
-            .child(div().flex_1())
-            .children(update)
-            .child(
-                Button::new("new-host")
-                    .icon(IconName::Plus)
-                    .tooltip("New host (Ctrl+Shift+N)")
-                    .style(ButtonStyle::Ghost)
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::NewHost))),
-            )
-    }
 }
 
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // A drag let go anywhere ends here too, with or without a drop.
         if !cx.has_active_drag() {
-            self.drop_line = None;
+            self.moving = None;
         }
+        if self.moving.as_ref().is_some_and(Moving::gliding) {
+            window.request_animation_frame();
+        }
+        self.measure_moves(cx);
         let theme = cx.theme().clone();
         let state = self.state.read(cx);
         let width = state.settings.sidebar_width;
@@ -1396,10 +1025,11 @@ impl Render for Sidebar {
         let hosts_empty = sections.is_empty() && open.is_empty();
         let show_hidden = self.show_hidden;
         let (rows, current_child) = self.list_rows(&sections, &open, &theme, cx);
+        // The pill stays put while a session moves: the rows carry their own fill meanwhile.
+        let current_child = current_child.filter(|_| self.moving.is_none());
         if self.folds.values().any(Reveal::moving) {
             window.request_animation_frame();
         }
-        let update = self.update_button(cx);
         div()
             .id("sidebar")
             .track_focus(&self.focus)
@@ -1411,9 +1041,7 @@ impl Render for Sidebar {
             .flex_col()
             .pl(px(10.))
             .pr(px(2.))
-            .pb(px(8.))
             .text_size(crate::theme::ui_px(13.))
-            .child(Self::header(&theme, cx))
             .child(
                 self.host_list(rows, current_child, &theme, cx)
                     .when(hosts_empty, |this| {
@@ -1423,7 +1051,6 @@ impl Render for Sidebar {
                         this.child(Self::hidden_toggle(&theme, hidden, show_hidden, cx))
                     }),
             )
-            .child(Self::footer(update, cx))
             .children(self.menu.clone().map(|menu| {
                 let this = cx.entity().downgrade();
                 ContextMenu::new(
@@ -1441,7 +1068,7 @@ fn empty_hint(theme: &Theme, all_hosts: usize) -> impl IntoElement + use<> {
         .p(px(8.))
         .text_color(theme.text_muted)
         .child(if all_hosts == 0 {
-            "No hosts. Add one with the + below, or define Host entries in ~/.ssh/config."
+            "No hosts. Add one with the button below, or define Host entries in ~/.ssh/config."
         } else {
             "All hosts are hidden."
         })

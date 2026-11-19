@@ -4,14 +4,14 @@ use gpui::prelude::*;
 use gpui::{AnyElement, Div, Hsla, div, px};
 
 /// The room between two cards, which is also where a drag resizes them.
-pub(crate) const CARD_GAP: f32 = 6.;
+pub(crate) const CARD_GAP: f32 = 4.;
 /// How tall the header of a card is, at default density.
-const HEADER_HEIGHT: f32 = 38.;
+pub(crate) const HEADER_HEIGHT: f32 = 38.;
 
-/// A rounded card. Children filling it up to its edge must round their own bottom corners with
-/// `PANEL_INNER_RADIUS`: gpui clips to rectangles only. `focused`: it has the keyboard among
-/// other cards, and its line is brighter, in the text's own color: never the accent's.
-pub(crate) fn frame(theme: &Theme, bg: Hsla, focused: bool) -> Div {
+/// A rounded card. Children filling it up to its
+/// edge must round their own bottom corners with `PANEL_INNER_RADIUS`: gpui clips to rectangles
+/// only.
+pub(crate) fn frame(theme: &Theme, bg: Hsla) -> Div {
     div()
         .relative()
         .flex()
@@ -19,19 +19,23 @@ pub(crate) fn frame(theme: &Theme, bg: Hsla, focused: bool) -> Div {
         .min_w_0()
         .rounded(px(RADIUS_CARD))
         .border_1()
-        .border_color(if focused {
-            Hsla {
-                a: FOCUSED_LINE,
-                ..theme.text
-            }
-        } else {
-            theme.border
-        })
+        .border_color(theme.border)
         .bg(bg)
 }
 
-/// How much of the text's color the line of the focused card takes.
-const FOCUSED_LINE: f32 = 0.35;
+/// What a card holds, stepping back while another card has the keyboard. The card itself keeps
+/// its fill and its line: only what is in it fades.
+pub(crate) fn contents(dimmed: bool) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .size_full()
+        .min_h_0()
+        .when(dimmed, |this| this.opacity(DIMMED))
+}
+
+/// How much of what a card holds shows while another one has the keyboard.
+const DIMMED: f32 = 0.55;
 
 /// The surface of what floats over the window or stands out of it: a menu, a tooltip, a dialog,
 /// a field. The raised fill and `border`.

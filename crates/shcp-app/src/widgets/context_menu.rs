@@ -125,6 +125,18 @@ impl OpenMenu {
         }
     }
 
+    /// Under a button, lined up with its left edge.
+    pub(crate) fn below_left(button: &MenuAnchor, entries: Vec<MenuEntry>) -> Self {
+        let position = button.0.get().map_or(Point::default(), |b| {
+            b.bottom_left() + point(px(0.), px(4.))
+        });
+        Self {
+            position,
+            corner: Corner::TopLeft,
+            entries,
+        }
+    }
+
     /// Under a button, lined up with its right edge.
     pub(crate) fn below(button: &MenuAnchor, entries: Vec<MenuEntry>) -> Self {
         let position = button.0.get().map_or(Point::default(), |b| {
@@ -143,6 +155,11 @@ impl OpenMenu {
 pub(crate) struct MenuAnchor(Rc<Cell<Option<Bounds<Pixels>>>>);
 
 impl MenuAnchor {
+    /// Whether the button was drawn over this point.
+    pub(crate) fn contains(&self, point: Point<Pixels>) -> bool {
+        self.0.get().is_some_and(|bounds| bounds.contains(&point))
+    }
+
     pub(crate) fn wrap(&self, button: impl IntoElement) -> Div {
         let bounds = self.0.clone();
         div()
