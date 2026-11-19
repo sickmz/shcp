@@ -126,6 +126,8 @@ pub(crate) struct Context {
     /// Its terminals should go on after the connection, if the server can do that.
     pub persist_terminals: bool,
     pub tmux: tmux::HostState,
+    /// What marks the tmux clients of this run, so the next run can tell those left over.
+    pub tag: Option<crate::client_tag::ClientTag>,
 }
 impl Context {
     /// A context that opens no tunnel, keeps no terminal and uses no agent: callers turn those on.
@@ -151,6 +153,7 @@ impl Context {
             open_forwards: false,
             persist_terminals: false,
             tmux: Default::default(),
+            tag: None,
         }
     }
     pub(crate) fn emit(&self, event: Event) {

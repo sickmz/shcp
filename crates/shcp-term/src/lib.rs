@@ -87,9 +87,20 @@ struct State {
     history_pending: bool,
 }
 impl State {
+    /// The grid has this size.
+    fn has_size(&self, cols: u16, rows: u16) -> bool {
+        self.term.columns() == cols as usize && self.term.screen_lines() == rows as usize
+    }
+    /// Managed, it has another size than the one it asked for.
+    fn disagrees(&self) -> bool {
+        self.managed
+            && self
+                .requested
+                .is_some_and(|(cols, rows)| !self.has_size(cols, rows))
+    }
     /// Gives the grid this size. Whether it had another.
     fn set_size(&mut self, cols: u16, rows: u16) -> bool {
-        if self.term.columns() == cols as usize && self.term.screen_lines() == rows as usize {
+        if self.has_size(cols, rows) {
             return false;
         }
         self.term.resize(Size(cols, rows));
@@ -217,7 +228,10 @@ impl TerminalHandle {
     pub fn resize(&self, cols: u16, rows: u16) {
         let (cols, rows) = (cols.max(2), rows.max(1));
         let mut state = self.0.state.lock();
-        let changed = state.requested != Some((cols, rows));
+        // The same size again is nothing new, unless the other side answered another one: then it
+        // is asked for again, as whatever held it smaller may be gone.
+        let changed =
+            state.requested != Some((cols, rows)) || (state.managed && !state.has_size(cols, rows));
         state.requested = Some((cols, rows));
         if state.managed {
             drop(state);
@@ -247,6 +261,26 @@ impl TerminalHandle {
     #[doc(hidden)]
     pub fn requested(&self) -> Option<(u16, u16)> {
         self.0.state.lock().requested
+    }
+    /// The other side keeps another size than the one asked for.
+    #[doc(hidden)]
+    pub fn size_disagrees(&self) -> bool {
+        self.0.state.lock().disagrees()
+    }
+    /// Asks the other side again for the size asked for, if it keeps another. Whether it asked.
+    #[doc(hidden)]
+    pub fn ask_size_again(&self) -> bool {
+        let requested = {
+            let state = self.0.state.lock();
+            state.requested.filter(|_| state.disagrees())
+        };
+        match requested {
+            Some((cols, rows)) => {
+                self.send(TerminalCommand::Resize(cols, rows));
+                true
+            }
+            None => false,
+        }
     }
     /// With no one else to decide its size any more, it goes back to the one it was asked for.
     #[doc(hidden)]
@@ -751,13 +785,41 @@ mod tests {
             Ok(TerminalCommand::Resize(120, 40))
         ));
         assert_eq!(terminal.dimensions(), (80, 24));
-        // The same again is nothing new, even when the answer was another size.
-        terminal.fit(100, 30);
+        // The same again is nothing new once the other side has it.
+        terminal.fit(120, 40);
         terminal.resize(120, 40);
         assert!(input.try_recv().is_err());
+        // But while the other side answered another size, it is asked for again.
+        terminal.fit(100, 30);
+        terminal.resize(120, 40);
+        assert!(matches!(
+            input.try_recv(),
+            Ok(TerminalCommand::Resize(120, 40))
+        ));
         assert_eq!(terminal.dimensions(), (100, 30));
         terminal.set_managed(false);
         assert_eq!(terminal.dimensions(), (120, 40));
+    }
+
+    #[test]
+    fn a_managed_terminal_can_ask_again_for_the_size_it_wants() {
+        let (terminal, _copied, input) = terminal();
+        // Not managed, or nothing asked for yet: there is nothing to ask again.
+        terminal.fit(100, 30);
+        assert!(!terminal.size_disagrees() && !terminal.ask_size_again());
+        terminal.set_managed(true);
+        assert!(!terminal.size_disagrees() && !terminal.ask_size_again());
+        terminal.resize(120, 40);
+        let _ = input.try_recv();
+        assert!(terminal.size_disagrees());
+        assert!(terminal.ask_size_again());
+        assert!(matches!(
+            input.try_recv(),
+            Ok(TerminalCommand::Resize(120, 40))
+        ));
+        terminal.fit(120, 40);
+        assert!(!terminal.size_disagrees() && !terminal.ask_size_again());
+        assert!(input.try_recv().is_err());
     }
 
     #[test]

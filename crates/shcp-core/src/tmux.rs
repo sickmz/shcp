@@ -11,7 +11,9 @@
 //! A terminal shows what is on its screen first, and the history above it once that is there too:
 //! over a slow link it can take a while.
 use crate::{
-    Event, NoticeLevel, Persistence, SharedTabs, files,
+    Event, NoticeLevel, Persistence, SharedTabs,
+    client_tag::{ClientTag, valid_id},
+    files,
     session::{Context, OpenTerminal, Ssh},
     session_log::SessionLog,
     term::TerminalCommand,
@@ -55,6 +57,10 @@ const LAYOUT_SUBSCRIPTION: &str = "shcp-layout";
 const FOLDER_SUBSCRIPTION: &str = "shcp-folder";
 /// Time for tmux to end a closed terminal before its channel goes away.
 const KILL_WAIT: Duration = Duration::from_secs(2);
+/// How long a terminal that is let go waits for tmux to let its client go, and then for its
+/// channel to close: closing the app must not wait on a slow server.
+const DETACH_WAIT: Duration = Duration::from_millis(400);
+const CLOSE_WAIT: Duration = Duration::from_millis(100);
 const RENAME_WAIT: Duration = Duration::from_millis(300);
 const MAX_HISTORY: usize = 50_000;
 const KEYS_PER_LINE: usize = 512;
@@ -183,24 +189,70 @@ fn decode_tabs(hex: &[u8]) -> Option<SharedTabs> {
 /// What the survey prints, with how many, when it closed clients left over.
 const SURVEY_LEFTOVERS: &str = "SHCP_LEFTOVERS";
 
-/// Closes the clients of this app's tmux whose connection is gone: their SSH session ended without
-/// them, so the system adopted them. tmux waits for every client before it exits, and while it
-/// waits it takes no one else, so one left over after a restart of tmux keeps every terminal out.
-/// The clients of live connections still have their SSH session above them. Only where `/proc` is.
-const CLOSE_LEFTOVERS: &str = "N=0; for P in $(pgrep -u \"$(id -u)\" -x \"tmux: client\" \
-     2>/dev/null); do case \"$(tr \"\\0\" \" \" < /proc/$P/cmdline 2>/dev/null)\" in \
-     *\" -L shcp \"*\" -C \"*) ;; *) continue;; esac; \
-     Q=$(ps -o ppid= -p $P 2>/dev/null | tr -d \" \"); \
-     [ \"$Q\" = 1 ] || [ \"$(cat /proc/$Q/comm 2>/dev/null)\" = systemd ] || continue; \
-     kill $P 2>/dev/null && N=$((N+1)); done; \
-     [ $N -gt 0 ] && { echo SHCP_LEFTOVERS $N; sleep 1; };";
+/// The variables that mark a client with the installation and the run of the copy that started it.
+const INSTALL_VAR: &str = "SHCP_INSTALL";
+const RUN_VAR: &str = "SHCP_RUN";
+
+/// Closes the clients of this app's tmux that were left over. Those whose SSH session ended
+/// without them were adopted by the system. tmux waits for every client before it exits, and while
+/// it waits it takes no one else, so one left over after a restart of tmux keeps every terminal
+/// out. The clients of live connections still have their SSH session above them, but that session
+/// may only look alive: a connection whose end never reached the server stays until TCP gives up,
+/// and its clients keep a terminal as small as they were. With `tag`, this installation and its
+/// runs that are on: a client of this installation and of a run that is over goes too, whatever is
+/// above it. Only where `/proc` is; without it, or without the tools, nothing is closed.
+fn close_leftovers(tag: Option<(&str, &[String])>) -> String {
+    let tagged = match tag {
+        Some((install, live)) if valid_id(install) && live.iter().all(|run| valid_id(run)) => {
+            format!(
+                "E=\" $(tr \"\\0\" \" \" < /proc/$P/environ 2>/dev/null) \"; {}",
+                stale_rule(install, live)
+            )
+        }
+        _ => String::new(),
+    };
+    format!(
+        "N=0; for P in $(pgrep -u \"$(id -u)\" -x \"tmux: client\" 2>/dev/null); do \
+         case \"$(tr \"\\0\" \" \" < /proc/$P/cmdline 2>/dev/null)\" in \
+         *\" -L shcp \"*\" -C \"*) ;; *) continue;; esac; {tagged}\
+         Q=$(ps -o ppid= -p $P 2>/dev/null | tr -d \" \"); \
+         [ \"$Q\" = 1 ] || [ \"$(cat /proc/$Q/comm 2>/dev/null)\" = systemd ] || continue; \
+         kill $P 2>/dev/null && N=$((N+1)); done; \
+         [ $N -gt 0 ] && {{ echo {SURVEY_LEFTOVERS} $N; sleep 1; }};"
+    )
+}
+
+/// For the client `$P` whose environment is `$E`, its variables between spaces: closes it when it
+/// is marked with `install` and a run that is not among `live`. One without a mark, or with
+/// another installation's, goes on to the other rules.
+fn stale_rule(install: &str, live: &[String]) -> String {
+    let live = live.join(" ");
+    format!(
+        "R=; case \"$E\" in *\" {INSTALL_VAR}={install} \"*) \
+         R=${{E##*\" {RUN_VAR}=\"}}; R=${{R%% *}};; esac; \
+         if [ -n \"$R\" ]; then case \" {live} \" in *\" $R \"*) ;; \
+         *) kill $P 2>/dev/null && N=$((N+1)); continue;; esac; fi; "
+    )
+}
+
+/// The installation and run ids, when they can go into a command as they are.
+fn tag_ids(ctx: &Context) -> Option<(&str, &str)> {
+    let tag = ctx.tag.as_ref()?;
+    (valid_id(&tag.install) && valid_id(&tag.run)).then_some((&tag.install, &tag.run))
+}
 
 /// Reads what runs on the server, before any terminal of this connection attaches: one that
 /// should be there and is not was closed from elsewhere, and one that attached first would have
-/// started tmux and make the server look in use. Clients left over by lost connections go first.
+/// started tmux and make the server look in use. Clients left over go first.
 pub(crate) async fn survey(ctx: &Context, ssh: &Ssh) {
+    let ids = tag_ids(ctx);
+    let live = ids.and(ctx.tag.as_ref()).and_then(ClientTag::live_runs);
+    let close = close_leftovers(
+        ids.zip(live.as_deref())
+            .map(|((install, _), live)| (install, live)),
+    );
     let command = format!(
-        "sh -c '{FIND_TMUX} [ -x \"$T\" ] || exit 0; {CLOSE_LEFTOVERS} \
+        "sh -c '{FIND_TMUX} [ -x \"$T\" ] || exit 0; {close} \
          \"$T\" -u -L shcp list-sessions -F \"#{{session_name}}\" 2>/dev/null || exit 0; \
          echo {SURVEY_TABS}; \"$T\" -L shcp show-options -gqv @shcp_layout'"
     );
@@ -277,7 +329,8 @@ fn quoted_folder(folder: &str) -> Option<String> {
 /// Runs under any login shell: all of it goes through `sh`, on one line and with no `'` inside.
 /// The shell starts without tmux's own variables, so `tmux` in it reaches the user's server, not
 /// this one, and programs behave as on a plain connection. A new one starts in `folder`, if it is
-/// still there.
+/// still there. `tag`, the ids of the installation and of the run, mark the client, but not the
+/// shell.
 fn start_command(
     name: &str,
     cols: u16,
@@ -285,7 +338,11 @@ fn start_command(
     history: usize,
     agent: bool,
     folder: Option<&str>,
+    tag: Option<(&str, &str)>,
 ) -> String {
+    let tag = tag
+        .map(|(install, run)| format!("export {INSTALL_VAR}={install} {RUN_VAR}={run}; "))
+        .unwrap_or_default();
     let (link, agent) = if agent {
         (
             "S=\"$HOME/.ssh/shcp-agent-$(uname -n).sock\"; [ -n \"$SSH_AUTH_SOCK\" ] && \
@@ -304,11 +361,12 @@ fn start_command(
     format!(
         "sh -c '{FIND_TMUX} [ -x \"$T\" ] || {{ echo {NO_TMUX}; exit 0; }}; \
          case \"$(\"$T\" -V 2>/dev/null)\" in {OLD_TMUX}) \
-         echo {NO_TMUX}; exit 0;; esac; {link}exec \"$T\" -u -L shcp -f /dev/null -C \
+         echo {NO_TMUX}; exit 0;; esac; {tag}{link}exec \"$T\" -u -L shcp -f /dev/null -C \
          set -g status off \\; set -g automatic-rename off \\; set -g window-size smallest \\; \
          set -g history-limit {history} \\; set -g update-environment \"{ENVIRONMENT}\" \\; \
          new-session -A -s {name} -x {cols} -y {rows}{folder}{agent} \
-         env -u TMUX -u TMUX_PANE -u TERM_PROGRAM -u TERM_PROGRAM_VERSION TERM=xterm-256color \
+         env -u TMUX -u TMUX_PANE -u TERM_PROGRAM -u TERM_PROGRAM_VERSION \
+         -u {INSTALL_VAR} -u {RUN_VAR} TERM=xterm-256color \
          \"${{SHELL:-/bin/sh}}\" -l'"
     )
 }
@@ -749,10 +807,93 @@ pub(crate) enum Outcome {
     Closed,
 }
 
+/// How long after tmux keeps another size than the terminal asked for it is asked again, at first.
+/// A client left by a lost connection can hold a terminal smaller until tmux gives up on it, and
+/// nothing tells when it has.
+const RETRY_FIRST: Duration = Duration::from_secs(2);
+/// The longest wait between two tries, which they double up to: another PC keeping a terminal
+/// smaller is asked rarely.
+const RETRY_LAST: Duration = Duration::from_secs(60);
+/// A size asked for this recently may still be on its way: no need to ask again at once.
+const RETRY_QUIET: Duration = Duration::from_secs(1);
+/// How often the time of a try is looked at.
+const RETRY_TICK: Duration = Duration::from_secs(1);
+
+/// When to ask tmux again for the size the terminal wants, while tmux keeps another.
+#[derive(Debug)]
+struct SizeRetry {
+    /// When the next try is due, while the sizes disagree.
+    due: Option<Instant>,
+    /// How long after the next try the one after it waits.
+    delay: Duration,
+    /// When a size last went to tmux.
+    sent: Option<Instant>,
+}
+
+impl SizeRetry {
+    fn new() -> Self {
+        Self {
+            due: None,
+            delay: RETRY_FIRST,
+            sent: None,
+        }
+    }
+
+    /// A size went to tmux.
+    fn sent(&mut self, now: Instant) {
+        self.sent = Some(now);
+    }
+
+    /// tmux said what size it keeps, which `disagrees` with the one asked for or not. Whether to
+    /// ask again now.
+    fn reported(&mut self, disagrees: bool, now: Instant) -> bool {
+        if !disagrees {
+            self.settle();
+            return false;
+        }
+        self.due.get_or_insert(now + self.delay);
+        let quiet = self
+            .sent
+            .is_none_or(|sent| now.duration_since(sent) >= RETRY_QUIET);
+        if quiet {
+            self.sent = Some(now);
+        }
+        quiet
+    }
+
+    /// Time went by. Whether to ask again now.
+    fn tick(&mut self, disagrees: bool, now: Instant) -> bool {
+        if !disagrees {
+            self.settle();
+            return false;
+        }
+        match self.due {
+            Some(due) if now >= due => {
+                self.delay = (self.delay * 2).min(RETRY_LAST);
+                self.due = Some(now + self.delay);
+                self.sent = Some(now);
+                true
+            }
+            Some(_) => false,
+            None => {
+                self.due = Some(now + self.delay);
+                false
+            }
+        }
+    }
+
+    /// The sizes agree: a later disagreement starts over.
+    fn settle(&mut self) {
+        self.due = None;
+        self.delay = RETRY_FIRST;
+    }
+}
+
 /// What comes from tmux once the terminal is showing.
 struct Live<'a> {
     ctx: &'a Context,
     terminal: &'a crate::TerminalHandle,
+    retry: &'a Mutex<SizeRetry>,
     log: Option<SessionLog>,
     closing: Vec<u8>,
     closed: bool,
@@ -767,7 +908,10 @@ impl Live<'_> {
             Message::Output(data) => {
                 terminal::show(self.ctx, self.terminal, &mut self.log, &data);
             }
-            Message::Resized(cols, rows) => self.terminal.fit(cols, rows),
+            Message::Resized(cols, rows) => {
+                self.terminal.fit(cols, rows);
+                self.check_size();
+            }
             Message::Tabs(hex) => {
                 // Nothing written yet, as on a tmux that just started: not a PC that closed
                 // every tab.
@@ -806,6 +950,14 @@ impl Live<'_> {
         }
     }
 
+    /// tmux said its size: asks again for the one wanted, if it is another.
+    fn check_size(&self) {
+        let disagrees = self.terminal.size_disagrees();
+        if self.retry.lock().reported(disagrees, Instant::now()) {
+            self.terminal.ask_size_again();
+        }
+    }
+
     /// Everything again, with the history the server kept above the screen.
     fn show_history(&self, replies: &[(bool, Vec<u8>)]) {
         let [info, path, title, history, screen, primary, pending] = replies else {
@@ -817,6 +969,7 @@ impl Live<'_> {
             return;
         };
         self.terminal.fit(info.width, info.height);
+        self.check_size();
         let pending = decode_output(&pending.1);
         let stream = restore_stream(
             &info,
@@ -878,6 +1031,7 @@ pub(crate) async fn run(
             command.history,
             ctx.host.forward_agent,
             persist.folder.as_deref(),
+            tag_ids(ctx),
         );
         if writer.exec(true, start).await.is_err() {
             return Ok(Outcome::Unavailable);
@@ -988,6 +1142,17 @@ pub(crate) async fn run(
         if let Some((cols, rows)) = restored_size {
             terminal.fit(cols, rows);
         }
+        // What tmux kept, against what was asked for. A size that came with the attach was the
+        // first try, and the next one waits.
+        let retry = Mutex::new(SizeRetry::new());
+        let now = Instant::now();
+        if sized {
+            retry.lock().sent(now);
+        }
+        let ask = retry.lock().reported(terminal.size_disagrees(), now);
+        if ask {
+            terminal.ask_size_again();
+        }
         // The history is asked for before anything else, so its answers come back first.
         let history = info.existing && info.history > 0;
         if history {
@@ -1006,6 +1171,7 @@ pub(crate) async fn run(
         let mut live = Live {
             ctx,
             terminal,
+            retry: &retry,
             log: terminal::open_log(ctx, command.log_dir.clone()),
             closing: closing.clone().into_bytes(),
             closed: false,
@@ -1019,6 +1185,7 @@ pub(crate) async fn run(
                     TerminalCommand::Write(bytes) => send_keys(&bytes),
                     TerminalCommand::Paste(text) => paste_commands(&name, &text),
                     TerminalCommand::Resize(cols, rows) => {
+                        retry.lock().sent(Instant::now());
                         format!("refresh-client -C {cols}x{rows}\n").into_bytes()
                     }
                     TerminalCommand::Publish(hex) => {
@@ -1063,9 +1230,22 @@ pub(crate) async fn run(
                 }
             }
         };
+        // While tmux keeps another size than the one asked for, it is asked again now and then:
+        // whatever held it smaller may have gone without tmux saying so.
+        let retry_task = async {
+            loop {
+                sleep(RETRY_TICK).await;
+                let disagrees = terminal.size_disagrees();
+                let ask = retry.lock().tick(disagrees, Instant::now());
+                if ask {
+                    terminal.ask_size_again();
+                }
+            }
+        };
         tokio::select! {
             result = write_task => result?,
             () = read_task => tracing::debug!(session = ctx.id.0, "tmux session channel closed"),
+            _ = retry_task => {}
         }
         // A history that never came leaves the terminal as it is.
         if live.history.is_some() {
@@ -1082,9 +1262,10 @@ pub(crate) async fn run(
         _ = cancel.cancelled() => Ok(Outcome::Ended),
         result = session => result,
     };
-    // An empty control-mode command detaches this client, leaving its shell alive.
-    // Wait for the remote channel to end before letting the SSH connection go away.
-    let _ = timeout(Duration::from_secs(2), async {
+    // An empty control-mode command detaches this client, leaving its shell alive. The channel
+    // ends once tmux has let it go, which is waited for a little before the SSH connection goes
+    // away, as when the app closes. A client that missed it is closed by the next connection.
+    let _ = timeout(DETACH_WAIT, async {
         let _ = writer.data_bytes(&b"\n"[..]).await;
         let _ = writer.eof().await;
         while let Some(message) = reader.wait().await {
@@ -1094,7 +1275,7 @@ pub(crate) async fn run(
         }
     })
     .await;
-    let _ = timeout(Duration::from_secs(1), writer.close()).await;
+    let _ = timeout(CLOSE_WAIT, writer.close()).await;
     result
 }
 
@@ -1222,8 +1403,20 @@ mod tests {
 
     #[test]
     fn closing_leftovers_fits_in_the_survey_and_is_counted() {
-        assert!(!CLOSE_LEFTOVERS.contains('\'') && !CLOSE_LEFTOVERS.contains('\n'));
-        assert!(CLOSE_LEFTOVERS.contains(SURVEY_LEFTOVERS));
+        let (install, live) = ("ab".repeat(16), vec!["cd".repeat(16), "ef".repeat(16)]);
+        let tagged = close_leftovers(Some((&install, &live)));
+        let plain = close_leftovers(None);
+        for text in [&tagged, &plain] {
+            assert!(!text.contains('\'') && !text.contains('\n'));
+            assert!(text.contains(SURVEY_LEFTOVERS));
+        }
+        assert!(tagged.contains(&format!("{INSTALL_VAR}={install} ")));
+        assert!(tagged.contains(&format!(" {} {} ", live[0], live[1])));
+        assert!(!plain.contains(INSTALL_VAR));
+        // Ids that could mean something to the shell leave the marks out.
+        let odd = vec!["x; reboot".to_string()];
+        assert!(!close_leftovers(Some((&install, &odd))).contains(INSTALL_VAR));
+        assert!(!close_leftovers(Some(("x y", &live))).contains(INSTALL_VAR));
         assert_eq!(leftovers(b"Welcome!\nSHCP_LEFTOVERS 2\nshcp-a\n"), Some(2));
         assert_eq!(leftovers(b"shcp-a\n"), None);
         // The survey still reads its sessions after it.
@@ -1261,7 +1454,7 @@ mod tests {
 
     #[test]
     fn the_start_command_has_no_quote_of_its_own() {
-        let command = start_command("shcp-1", 80, 24, 1_000_000, true, None);
+        let command = start_command("shcp-1", 80, 24, 1_000_000, true, None, None);
         let inner = command
             .strip_prefix("sh -c '")
             .and_then(|rest| rest.strip_suffix('\''))
@@ -1269,8 +1462,142 @@ mod tests {
         assert!(!inner.contains('\'') && !inner.contains('\n'));
         assert!(inner.contains(&format!("history-limit {MAX_HISTORY} ")));
         assert!(inner.contains("-s shcp-1 -x 80 -y 24 -e "));
-        let command = start_command("shcp-1", 80, 24, 100, false, Some("~/my work"));
+        assert!(!inner.contains("export"));
+        let command = start_command("shcp-1", 80, 24, 100, false, Some("~/my work"), None);
         assert!(command.contains("-y 24 -c \"$HOME/my work\" env -u "));
+    }
+
+    #[test]
+    fn the_client_is_marked_but_not_its_shell() {
+        let command = start_command("shcp-1", 80, 24, 100, false, None, Some(("aa", "bb")));
+        assert!(!command.contains('\n'));
+        let marked = format!("export {INSTALL_VAR}=aa {RUN_VAR}=bb; ");
+        let at = command.find(&marked).unwrap();
+        assert!(at < command.find("exec \"$T\"").unwrap());
+        assert!(command.contains(&format!("-u {INSTALL_VAR} -u {RUN_VAR} TERM=")));
+    }
+
+    /// Runs the rule for a stale client on each environment, as the survey does with `/proc`, and
+    /// says which it would close. `None` without a POSIX shell on this PC.
+    fn closed_by_stale_rule(install: &str, live: &[String], environs: &[&str]) -> Option<String> {
+        let mut script = String::from("kill() { echo \"kill $1\"; }; N=0; for P in");
+        for index in 0..environs.len() {
+            script.push_str(&format!(" {index}"));
+        }
+        script.push_str("; do case $P in ");
+        for (index, environ) in environs.iter().enumerate() {
+            script.push_str(&format!("{index}) E=\" {environ} \";; "));
+        }
+        script.push_str("esac; ");
+        script.push_str(&stale_rule(install, live));
+        script.push_str("echo \"keep $P\"; done");
+        let output = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .output()
+            .ok()?;
+        assert!(output.status.success(), "{output:?}");
+        Some(String::from_utf8(output.stdout).unwrap())
+    }
+
+    #[test]
+    fn what_goes_to_the_server_is_good_sh() {
+        let live = vec!["cd".repeat(16)];
+        let start = start_command("shcp-1", 80, 24, 100, true, None, Some(("aa", "bb")));
+        let start = start
+            .strip_prefix("sh -c '")
+            .and_then(|rest| rest.strip_suffix('\''))
+            .unwrap()
+            .to_string();
+        let install = "ab".repeat(16);
+        for script in [start, close_leftovers(Some((&install, &live)))] {
+            // Only read, not run.
+            let Ok(output) = std::process::Command::new("sh")
+                .args(["-n", "-c", &script])
+                .output()
+            else {
+                eprintln!("no sh on this PC: the syntax was not checked");
+                return;
+            };
+            assert!(output.status.success(), "{script}\n{output:?}");
+        }
+    }
+
+    #[test]
+    fn only_clients_of_this_installation_and_of_a_run_that_is_over_are_closed() {
+        let (install, other) = ("aa".repeat(16), "bb".repeat(16));
+        let (this_run, live_run, dead_run) = ("11".repeat(16), "22".repeat(16), "33".repeat(16));
+        let live = vec![this_run.clone(), live_run.clone()];
+        let environs = [
+            // This run, another copy still running, and one that is over, in any order.
+            format!("HOME=/h {INSTALL_VAR}={install} {RUN_VAR}={this_run} X=1"),
+            format!("{RUN_VAR}={live_run} {INSTALL_VAR}={install}"),
+            format!("{RUN_VAR}={dead_run} A=b c {INSTALL_VAR}={install} Z=1"),
+            // Another installation's, and one without marks or with half of them.
+            format!("{INSTALL_VAR}={other} {RUN_VAR}={dead_run}"),
+            "HOME=/h SHELL=/bin/sh".to_string(),
+            format!("{INSTALL_VAR}={install}"),
+            format!("{INSTALL_VAR}={install} {RUN_VAR}="),
+            // An installation id that only starts like this one.
+            format!("{INSTALL_VAR}={install}0 {RUN_VAR}={dead_run}"),
+        ];
+        let environs: Vec<&str> = environs.iter().map(String::as_str).collect();
+        let Some(output) = closed_by_stale_rule(&install, &live, &environs) else {
+            eprintln!("no sh on this PC: the rule was not run");
+            return;
+        };
+        let expected = "keep 0\nkeep 1\nkill 2\nkeep 3\nkeep 4\nkeep 5\nkeep 6\nkeep 7\n";
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn tmux_is_asked_again_for_the_size_at_once_then_less_and_less_often() {
+        let start = Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let mut retry = SizeRetry::new();
+        // tmux keeps another size than the one just asked for with the attach: the next try waits.
+        retry.sent(start);
+        assert!(!retry.reported(true, start));
+        assert!(!retry.tick(true, at(1)));
+        assert!(retry.tick(true, at(2)));
+        // Then twice as long each time, up to a minute.
+        assert!(!retry.tick(true, at(5)));
+        assert!(retry.tick(true, at(6)));
+        let mut now = 6;
+        let mut waits = Vec::new();
+        for _ in 0..8 {
+            let mut waited = 0;
+            loop {
+                now += 1;
+                waited += 1;
+                if retry.tick(true, at(now)) {
+                    break;
+                }
+            }
+            waits.push(waited);
+        }
+        assert_eq!(waits, [8, 16, 32, 60, 60, 60, 60, 60]);
+        // A size from tmux that still disagrees is answered at once, unless one just went.
+        assert!(retry.reported(true, at(now + 1)));
+        assert!(!retry.reported(true, at(now + 1)));
+        // Once they agree it starts over.
+        assert!(!retry.reported(false, at(now + 2)));
+        assert!(!retry.tick(true, at(now + 3)));
+        assert!(!retry.tick(true, at(now + 4)));
+        assert!(retry.tick(true, at(now + 5)));
+        assert!(!retry.tick(false, at(now + 6)));
+        assert!(retry.due.is_none());
+    }
+
+    #[test]
+    fn nothing_is_asked_again_while_the_sizes_agree() {
+        let start = Instant::now();
+        let mut retry = SizeRetry::new();
+        for second in 0..300 {
+            let now = start + Duration::from_secs(second);
+            assert!(!retry.tick(false, now) && !retry.reported(false, now));
+        }
+        // Not even asked once, a disagreement is tried at once.
+        assert!(retry.reported(true, start + Duration::from_secs(300)));
     }
 
     #[test]
@@ -1280,7 +1607,7 @@ mod tests {
         assert_eq!(quoted_folder("/tmp/$(reboot)"), None);
         assert_eq!(quoted_folder("/tmp/it's"), None);
         assert_eq!(quoted_folder("relative"), None);
-        let command = start_command("shcp-1", 80, 24, 100, false, Some("/a\"b"));
+        let command = start_command("shcp-1", 80, 24, 100, false, Some("/a\"b"), None);
         assert!(command.contains("-y 24 env -u "));
     }
 

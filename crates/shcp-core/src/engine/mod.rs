@@ -71,6 +71,9 @@ struct Inner {
     /// Remote files open in a local editor.
     edits: Arc<Mutex<EditRegistry>>,
     known_hosts_lock: Arc<Mutex<()>>,
+    /// What marks the tmux clients of this run, and what keeps the run known as on.
+    tag: Option<crate::client_tag::ClientTag>,
+    _run: Option<crate::client_tag::RunHold>,
 }
 impl Drop for Inner {
     fn drop(&mut self) {
@@ -103,6 +106,7 @@ pub fn start() -> Result<(EngineHandle, Receiver<Event>)> {
         });
     }
     let edit_copies = crate::edit::root(&store.paths.data_dir);
+    let (tag, run) = crate::client_tag::start(&store.paths.data_dir).unzip();
     let engine = EngineHandle(Arc::new(Inner {
         runtime: RuntimeOwner::new()?,
         store: Mutex::new(store),
@@ -115,6 +119,8 @@ pub fn start() -> Result<(EngineHandle, Receiver<Event>)> {
         searches: Arc::new(Mutex::new(HashMap::new())),
         edits: Arc::new(Mutex::new(HashMap::new())),
         known_hosts_lock: Arc::new(Mutex::new(())),
+        tag,
+        _run: run,
     }));
     engine
         .0
@@ -218,6 +224,7 @@ impl EngineHandle {
             use_agent: store.settings.use_ssh_agent,
             open_forwards: store.settings.auto_open_forwards,
             persist_terminals,
+            tag: self.0.tag.clone(),
             ..session::Context::new(
                 id,
                 config,

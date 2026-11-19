@@ -1,6 +1,7 @@
 //! Runtime-independent interface for the shcp desktop client.
 mod auth;
 mod check;
+mod client_tag;
 mod config;
 mod edit;
 mod engine;
