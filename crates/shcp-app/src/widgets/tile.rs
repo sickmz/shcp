@@ -1,5 +1,5 @@
 //! The tile that stands for a session wherever it shows: what runs there in the color of its
-//! host, on a neutral rounded rectangle slightly wider than tall.
+//! host, on a small neutral rounded square with a faint line around it.
 use super::icon::{Icon, IconName};
 use super::tooltip::tooltip;
 use crate::theme::{Theme, row_px};
@@ -7,12 +7,14 @@ use gpui::prelude::*;
 use gpui::{AnyElement, App, Div, ElementId, Hsla, Pixels, SharedString, div, px};
 use std::{cell::RefCell, collections::HashMap};
 
-const WIDTH: f32 = 22.;
-const HEIGHT: f32 = 18.;
+/// The side of the square, and of the icon in it: the icon sits on whole pixels, 1px in from the
+/// line.
+const SIZE: f32 = 18.;
+const ICON: f32 = 14.;
 const RADIUS: Pixels = px(crate::theme::RADIUS_SMALL);
-/// The deck of a split session: how far the card behind the tile is, up and to the right, and
+/// The deck of a split session: how far the card behind the tile is, down and to the right, and
 /// the line that parts the two.
-const DECK_STEP: f32 = 2.5;
+const DECK_STEP: f32 = 2.;
 const GAP: f32 = 1.;
 
 /// What a tile shows.
@@ -85,20 +87,25 @@ pub(crate) fn shell_tile(
 /// more card shows behind the tile, up and to the right, whatever the number of its terminals.
 /// The tile itself stays where and how it is on any other row, so the tiles of a list line up.
 pub(crate) fn tile(mark: Mark, color: Hsla, deck: Option<Hsla>, theme: &Theme) -> Div {
-    let (width, height) = (row_px(WIDTH), row_px(HEIGHT));
+    let size = row_px(SIZE);
     let colors = theme.tile_colors();
-    let face = div()
+    let card = |fill: Hsla| {
+        div()
+            .rounded(RADIUS)
+            .border_1()
+            .border_color(theme.border)
+            .bg(fill)
+    };
+    let face = card(colors.fill)
         .relative()
-        .min_w(width)
-        .h(height)
+        .min_w(size)
+        .h(size)
         .flex_none()
         .flex()
         .items_center()
-        .justify_center()
-        .rounded(RADIUS)
-        .bg(colors.fill);
+        .justify_center();
     let face = match mark {
-        Mark::Icon(icon) => face.child(Icon::new(icon).size(row_px(13.)).color(color)),
+        Mark::Icon(icon) => face.child(Icon::new(icon).size(row_px(ICON)).color(color)),
         Mark::Label(label) => face
             .px(px(4.))
             .font_family(crate::theme::mono_font())
@@ -110,20 +117,22 @@ pub(crate) fn tile(mark: Mark, color: Hsla, deck: Option<Hsla>, theme: &Theme) -
     let Some(under) = deck else {
         return face;
     };
+    // The card behind peeks out below and to the right. The two together are as tall as what
+    // holds them, so a row centres them as a whole and no edge of them leans to its top; the
+    // width stays the tile's, so what follows lines up with the other rows.
+    let step = px(DECK_STEP);
     div()
         .relative()
-        .w(width)
-        .h(height)
+        .w(size)
+        .h(size + step)
         .flex_none()
         .child(
-            div()
+            card(colors.back)
                 .absolute()
-                .left(px(DECK_STEP))
-                .top(px(-DECK_STEP))
-                .w(width)
-                .h(height)
-                .rounded(RADIUS)
-                .bg(colors.back),
+                .left(step)
+                .top(step)
+                .w(size)
+                .h(size),
         )
         // The tile hides the card behind it, and a line in the color of the row parts the two.
         // Over that color its see-through fill reads as it does on any other row.

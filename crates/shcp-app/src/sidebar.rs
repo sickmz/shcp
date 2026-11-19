@@ -741,7 +741,7 @@ impl Sidebar {
             .flex()
             .flex_none()
             .items_center()
-            .gap(px(9.))
+            .gap(px(10.))
             .w_full()
             .h(row_px(SESSION_HEIGHT))
             .pl(if with_host { px(5.) } else { SESSION_INSET })
